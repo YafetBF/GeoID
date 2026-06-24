@@ -126,17 +126,38 @@ class PolicyContributorPreset:
         entries: List[PresetPlanEntry] = []
 
         for pol in (contributor.get_policies() or []):
+            kind = "upsert_policy"
+            try:
+                if ctx.policy is not None:
+                    existing = await ctx.policy.get_policy(pol.id)
+                    if existing is not None:
+                        if existing.model_dump(mode="json") == pol.model_dump(mode="json"):
+                            kind = "noop"
+            except Exception:
+                pass
             entries.append(PresetPlanEntry(
-                kind="upsert_policy",
+                kind=kind,
                 target=pol.id,
                 detail={"effect": pol.effect, "actions": pol.actions},
             ))
 
+        # Build a map of role name → set of bound policy IDs for efficient lookup.
+        existing_role_policies: dict = {}
+        try:
+            if ctx.iam is not None:
+                for r in (await ctx.iam.list_roles() or []):
+                    existing_role_policies[r.name] = set(r.policies or [])
+        except Exception:
+            pass
+
         for role in (contributor.get_role_bindings() or []):
+            bound = existing_role_policies.get(role.name, set())
+            expected = set(role.policies or [])
+            kind = "noop" if expected.issubset(bound) else "upsert_role_binding"
             entries.append(PresetPlanEntry(
-                kind="upsert_role_binding",
+                kind=kind,
                 target=role.name,
-                detail={"policies": role.policies},
+                detail={"policies": list(role.policies or [])},
             ))
 
         return PresetPlan(
