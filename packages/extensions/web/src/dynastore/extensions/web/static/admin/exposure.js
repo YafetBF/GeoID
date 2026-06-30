@@ -63,6 +63,13 @@ import { getJSON, patchJSON, fetchCatalogOptions } from "../common/api.js";
 
   // Load configuration matrix (resolved and explicit)
   async function loadMatrix() {
+    if (state.scope === "catalog" && !state.catalog) {
+      state.resolved = {};
+      state.explicit = {};
+      state.dirty = {};
+      render();
+      return;
+    }
     const base = state.scope === "platform"
       ? "/configs"
       : `/configs/catalogs/${encodeURIComponent(state.catalog)}`;
