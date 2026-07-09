@@ -626,6 +626,7 @@ scope_maps = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,m
 # image — the cloud split (scope_catalog / scope_geoid / scope_worker / …)
 # is unchanged.
 scope_onprem = ["dynastore[scope_geoid,scope_worker]"]
+scope_onprem_catalog = ["dynastore[scope_catalog,scope_worker]"]
 
 # ==========================================================================
 # DEVELOPMENT & TESTING
