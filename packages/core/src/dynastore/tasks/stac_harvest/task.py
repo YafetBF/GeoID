@@ -25,9 +25,11 @@ protocols only (no direct module imports).
 import asyncio
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
 from dynastore.models.ogc import Feature
@@ -51,11 +53,51 @@ _MIN_PAGE_LIMIT = 20
 # Cap how many per-batch errors are recorded into the job result.
 _MAX_RECORDED_ERRORS = 5
 _STRIP_LINKS = frozenset({"links"})
+_SERVER_MANAGED_ITEM_LINK_RELS = frozenset(
+    {"self", "root", "parent", "collection", "items", "next", "prev"}
+)
+_RASTER_STAC_EXTENSION_MARKERS = (
+    "/raster/",
+)
+_RASTER_MEDIA_MARKERS = (
+    "image/tiff",
+    "image/geotiff",
+    "application/geotiff",
+    "application/x-geotiff",
+)
+_RASTER_ROLES = frozenset({"data", "coverage", "cloud-optimized"})
+_STAC_COLLECTION_SCHEMA_FIELDS = frozenset({
+    "type",
+    "stac_version",
+    "stac_extensions",
+    "id",
+    "title",
+    "description",
+    "keywords",
+    "license",
+    "providers",
+    "extent",
+    "summaries",
+    "assets",
+    "item_assets",
+    "links",
+    "extra_metadata",
+})
+_STAC_COLLECTION_FALLBACK_FIELDS = frozenset({
+    "assets",
+    "extent",
+    "item_assets",
+    "providers",
+    "stac_extensions",
+    "summaries",
+})
 # Concrete write language for collection create/update.  Source STAC
 # collections carry no language, and ``"*"`` is a *read-time* wildcard
 # (all translations) — passing it to a write throws, which previously
 # aborted the whole harvest before any item was written.
 _WRITE_LANG = "en"
+# geoid#2890: 10 min of unbroken zero-progress write failures aborts the harvest
+_STALL_ABORT_SECONDS = 600.0
 
 
 # ---------------------------------------------------------------------------
@@ -133,20 +175,63 @@ async def iter_collections(catalog_url: str) -> AsyncIterator[Dict[str, Any]]:
         url = _next_href(page)
 
 
-async def _iter_items_from(items_url: str, label: str) -> AsyncIterator[Dict[str, Any]]:
+@dataclass
+class PageCursor:
+    """Mutable holder updated by ``_iter_items_from`` as it walks source pages.
+
+    ``next_url`` always holds the URL of the page about to be fetched (or
+    just fetched, while its items are being consumed) — i.e. the STAC
+    ``rel=next`` resume point a caller should persist once the items already
+    consumed are durably written (#3034). Re-fetching this URL after a
+    resume may re-yield a few items from the in-flight page again, which is
+    safe since item upserts are idempotent.
+
+    ``truncated`` is set when the walk gave up on a page fetch (source error,
+    after exhausting the limit-shrink retry on the first page) instead of
+    reaching a page with no ``rel=next`` link. A caller must not treat a
+    truncated walk as "collection fully harvested" — doing so would make a
+    resume skip the still-unfetched tail forever; the last page-boundary
+    cursor already persisted by a prior successful batch remains the correct
+    resume point.
+    """
+
+    next_url: Optional[str] = None
+    truncated: bool = False
+
+
+async def _iter_items_from(
+    items_url: str, label: str, *, cursor: Optional[PageCursor] = None,
+    resume_from_href: bool = False,
+) -> AsyncIterator[Dict[str, Any]]:
     """Walk a source items URL with rel=next cursor pagination.
 
-    ``items_url`` is the items endpoint base (it may already carry query params).
-    If the very first page fetch fails (a source may reject the requested page
-    size with e.g. HTTP 502), retry the first page with a halved limit down to
-    ``_MIN_PAGE_LIMIT`` before giving up — otherwise an over-large default would
-    silently harvest zero items.
+    ``items_url`` is the items endpoint base (it may already carry query
+    params) — a ``limit`` is appended and the first page's fetch is retried
+    with a halved limit down to ``_MIN_PAGE_LIMIT`` on failure (a source may
+    reject the requested page size with e.g. HTTP 502); otherwise an
+    over-large default would silently harvest zero items.
+
+    ``resume_from_href=True`` treats ``items_url`` as an already-complete
+    page URL instead — a persisted ``rel=next`` cursor (#3034) — fetched
+    exactly as-is with no ``limit`` appended (it carries its own) and no
+    limit-shrink retry (that already ran, if needed, on the original first
+    page of this same walk).
+
+    ``cursor``, when given, is updated to the current page's URL before each
+    fetch so a caller can read ``cursor.next_url`` after a batch write commits
+    and persist it as the resume point (see ``PageCursor``).
     """
-    limit = _PAGE_LIMIT
-    sep = "&" if "?" in items_url else "?"
-    url: Optional[str] = f"{items_url}{sep}limit={limit}"
-    first_page = True
+    if resume_from_href:
+        url: Optional[str] = items_url
+        first_page = False
+    else:
+        limit = _PAGE_LIMIT
+        sep = "&" if "?" in items_url else "?"
+        url = f"{items_url}{sep}limit={limit}"
+        first_page = True
     while url:
+        if cursor is not None:
+            cursor.next_url = url
         try:
             page = await asyncio.to_thread(_http_get_json, url)
         except Exception as exc:
@@ -162,6 +247,8 @@ async def _iter_items_from(items_url: str, label: str) -> AsyncIterator[Dict[str
             logger.warning(
                 "stac_harvest: GET items for %s failed: %s", label, exc
             )
+            if cursor is not None:
+                cursor.truncated = True
             return
         first_page = False
         for feat in page.get("features") or []:
@@ -169,10 +256,13 @@ async def _iter_items_from(items_url: str, label: str) -> AsyncIterator[Dict[str
         url = _next_href(page)
 
 
-def iter_items(catalog_url: str, collection_id: str) -> AsyncIterator[Dict[str, Any]]:
+def iter_items(
+    catalog_url: str, collection_id: str, *, cursor: Optional[PageCursor] = None,
+) -> AsyncIterator[Dict[str, Any]]:
     """Walk source /collections/{id}/items with rel=next cursor pagination."""
     return _iter_items_from(
-        f"{catalog_url}/collections/{collection_id}/items", collection_id
+        f"{catalog_url}/collections/{collection_id}/items", collection_id,
+        cursor=cursor,
     )
 
 
@@ -190,13 +280,32 @@ def map_collection(coll: Dict[str, Any]) -> Dict[str, Any]:
     """Map a source STAC collection dict to a dynastore collection payload.
 
     - Drops ``links`` (server-managed navigation).
-    - Drops ``assets`` at collection level (can cause 409 on STAC item writes;
-      per-item assets pass through unaffected).
     - Lowercases the ``id`` (dynastore normalises ids; mismatched case between
       collection creation and item writes causes 409 collisions).
     - Ensures required ``extent``.
+    - Mirrors source STAC extras into ``extra_metadata`` so rich collection
+      metadata survives generic CatalogsProtocol writes even when the
+      collection_stac sidecar is not active.
     """
-    out = {k: v for k, v in coll.items() if k not in _STRIP_LINKS and k != "assets"}
+    out = {k: v for k, v in coll.items() if k not in _STRIP_LINKS}
+
+    extras: Dict[str, Any] = {}
+    for key, value in out.items():
+        if key == "extra_metadata":
+            continue
+        if key not in _STAC_COLLECTION_SCHEMA_FIELDS:
+            extras[key] = value
+    for key in _STAC_COLLECTION_FALLBACK_FIELDS:
+        if key in out and out[key] is not None:
+            extras[key] = out[key]
+
+    if extras:
+        existing = out.get("extra_metadata")
+        if isinstance(existing, dict):
+            existing.update(extras)
+        else:
+            out["extra_metadata"] = extras
+
     out.setdefault("type", "Collection")
     out["id"] = str(out.get("id", "")).lower()
     out.setdefault("description", out.get("title") or out["id"])
@@ -204,12 +313,111 @@ def map_collection(coll: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _filter_source_item_links(feature: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Keep provider style/legend/data links while dropping navigation links."""
+    kept: List[Dict[str, Any]] = []
+    for link in feature.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        rel = str(link.get("rel") or "").lower()
+        if rel in _SERVER_MANAGED_ITEM_LINK_RELS:
+            continue
+        if link.get("href"):
+            kept.append(dict(link))
+    return kept
+
+
 def map_item(feature: Dict[str, Any], target_collection: str) -> Dict[str, Any]:
-    """Map a source STAC item; strip navigation links, fix collection reference."""
+    """Map a source STAC item; strip navigation links, keep provider links."""
     out = {k: v for k, v in feature.items() if k not in _STRIP_LINKS}
+    links = _filter_source_item_links(feature)
+    if links:
+        out["links"] = links
     out["type"] = "Feature"
     out["collection"] = target_collection
     return out
+
+
+def _has_raster_extension(doc: Dict[str, Any]) -> bool:
+    return any(
+        any(marker in str(uri).lower() for marker in _RASTER_STAC_EXTENSION_MARKERS)
+        for uri in doc.get("stac_extensions") or []
+    )
+
+
+def _asset_dicts(doc: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    for container_name in ("assets", "item_assets"):
+        container = doc.get(container_name) or {}
+        if isinstance(container, dict):
+            for asset in container.values():
+                if isinstance(asset, dict):
+                    yield asset
+
+
+def _has_raster_asset(doc: Dict[str, Any]) -> bool:
+    for asset in _asset_dicts(doc):
+        media_type = str(asset.get("type") or "").lower()
+        roles = {str(role).lower() for role in (asset.get("roles") or [])}
+        href = str(asset.get("href") or "").lower()
+        if any(marker in media_type for marker in _RASTER_MEDIA_MARKERS):
+            return True
+        if any(href.endswith(ext) for ext in (".tif", ".tiff", ".geotiff")):
+            return True
+        if roles & _RASTER_ROLES and any(
+            marker in media_type for marker in ("image/", "geotiff", "tiff")
+        ):
+            return True
+    return False
+
+
+def infer_collection_kind(
+    source_coll: Dict[str, Any],
+    first_item: Optional[Dict[str, Any]] = None,
+    explicit_kind: Optional[str] = None,
+) -> Optional[str]:
+    """Return the collection kind to pin, or None to keep inherited defaults."""
+    if explicit_kind:
+        return explicit_kind
+    if _has_raster_extension(source_coll) or _has_raster_asset(source_coll):
+        return "RASTER"
+    if first_item and (_has_raster_extension(first_item) or _has_raster_asset(first_item)):
+        return "RASTER"
+    return None
+
+
+async def _apply_collection_kind(
+    config_writer: Any,
+    catalog_id: str,
+    collection_id: str,
+    kind: Optional[str],
+) -> Optional[str]:
+    """Pin CollectionInfo.kind before the collection is created, best-effort."""
+    if kind is None:
+        return None
+    try:
+        from dynastore.modules.catalog.catalog_config import (
+            CollectionInfo,
+            CollectionKind,
+        )
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        writer = config_writer or get_protocol(ConfigsProtocol)
+        if writer is None:
+            return f"collection_kind:{collection_id}:no_config_writer"
+        info = CollectionInfo(kind=CollectionKind(kind))
+        await writer.set_config(CollectionInfo, info, catalog_id, collection_id)
+        logger.info(
+            "stac_harvest: pinned collection_info.kind=%s on %s/%s",
+            kind, catalog_id, collection_id,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "stac_harvest: failed to pin collection_info.kind=%s on %s/%s: %s(%s)",
+            kind, catalog_id, collection_id, type(exc).__name__, exc,
+        )
+        return f"collection_kind:{collection_id}:{type(exc).__name__}"
 
 
 def virtual_assets_for(feature: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -246,15 +454,111 @@ def virtual_assets_for(feature: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 class HarvestStats:
     collections_seen: int = 0
     collections_written: int = 0
+    collections_skipped_empty: int = 0
     items_written: int = 0
     items_failed: int = 0
     virtual_assets_written: int = 0
     errors: List[str] = field(default_factory=list)
+    # Monotonic timestamp of the first failure in the current unbroken
+    # zero-write streak; ``None`` while healthy.  See _STALL_ABORT_SECONDS.
+    _stall_since: Optional[float] = field(default=None, repr=False)
+
+
+async def _persist_harvest_cursor(
+    engine: Any,
+    task_id: Any,
+    collection_id: Optional[str],
+    items_href: Optional[str],
+    done: bool,
+) -> None:
+    """Persist a resume cursor onto the task row after progress is durable (#3034).
+
+    Stamps ``inputs.inputs.resume`` on the task's own DB row so a dispatcher
+    retry (Cloud Run Job timeout/kill) resumes the source walk instead of
+    replaying the whole catalog from the first collection — mirroring
+    ingestion's ``_persist_ingestion_cursor`` (#2820).
+
+    Best-effort: a write failure here only degrades to a retry restarting the
+    affected collection from the beginning, and must never fail an otherwise
+    successful batch write. No-ops when ``engine``/``task_id`` are unavailable
+    (e.g. a sync in-process execution path with no durable task row to stamp).
+    """
+    if engine is None or not task_id:
+        return
+    try:
+        from dynastore.modules.tasks import tasks_module
+        import uuid as _uuid
+
+        task_uuid = task_id if isinstance(task_id, _uuid.UUID) else _uuid.UUID(str(task_id))
+        await tasks_module.update_task_harvest_cursor(
+            engine, task_uuid, collection_id, items_href, done,
+        )
+    except Exception:  # noqa: BLE001 — cursor persistence is best-effort
+        logger.warning(
+            "stac_harvest: failed to persist resume cursor (collection=%s "
+            "done=%s) for task %s — a retry will restart that collection "
+            "from the beginning.",
+            collection_id, done, task_id, exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Core harvest logic — uses internal protocols only
 # ---------------------------------------------------------------------------
+
+
+async def _maybe_resolve_id(
+    resolver: Any,
+    fallback: str,
+    *args: Any,
+    **kwargs: Any,
+) -> str:
+    if not callable(resolver):
+        return fallback
+    resolved = resolver(*args, **kwargs)
+    if isawaitable(resolved):
+        resolved = await resolved
+    return resolved if isinstance(resolved, str) and resolved else fallback
+
+
+async def _upsert_collection_metadata_pg(
+    catalogs: Any,
+    catalog_id: str,
+    collection_id: str,
+    coll: Dict[str, Any],
+) -> None:
+    """Persist harvested collection metadata in PG even for ES-only item routing.
+
+    The harvest's ``drivers=es`` routing applies to item storage.  Collection
+    metadata is the STAC catalog document and must remain queryable from PG so
+    collection-level assets/extensions/extent survive reads and listings.
+    """
+    from dynastore.models.shared_models import Collection
+    from dynastore.modules.storage.drivers.collection_postgresql import (
+        CollectionPostgresqlDriver,
+    )
+
+    internal_catalog = await _maybe_resolve_id(
+        getattr(catalogs, "resolve_catalog_id", None),
+        catalog_id,
+        catalog_id,
+        allow_missing=True,
+    )
+    internal_collection = await _maybe_resolve_id(
+        getattr(catalogs, "resolve_collection_id", None),
+        collection_id,
+        internal_catalog,
+        collection_id,
+        allow_missing=True,
+    )
+    metadata_payload = Collection.create_from_localized_input(
+        coll, _WRITE_LANG
+    ).model_dump(by_alias=True, exclude_none=True, mode="json")
+    await CollectionPostgresqlDriver().upsert_metadata(
+        internal_catalog,
+        internal_collection,
+        metadata_payload,
+    )
 
 
 async def _ensure_collection(
@@ -276,6 +580,7 @@ async def _ensure_collection(
             await catalogs.create_collection(catalog_id, coll, lang=_WRITE_LANG)
         else:
             await catalogs.update_collection(catalog_id, cid, coll, lang=_WRITE_LANG)
+        await _upsert_collection_metadata_pg(catalogs, catalog_id, cid, coll)
         return True
     except Exception as exc:
         logger.warning(
@@ -286,6 +591,7 @@ async def _ensure_collection(
         # to items rather than discarding the whole collection's harvest.
         try:
             if await catalogs.get_collection(catalog_id, cid, lang=_WRITE_LANG) is not None:
+                await _upsert_collection_metadata_pg(catalogs, catalog_id, cid, coll)
                 logger.warning(
                     "stac_harvest: collection %s/%s exists post-write — continuing to items",
                     catalog_id, cid,
@@ -558,6 +864,56 @@ async def _apply_harvest_presets(
         return f"routing_preset_apply:{type(exc).__name__}:{str(exc)[:240]}"
 
 
+async def _apply_collection_read_policy(
+    config_writer: Any,
+    catalog_id: str,
+    collection_id: str,
+    external_id_as_feature_id: bool,
+) -> Optional[str]:
+    """Pin the harvested collection's read-time item-id wire shape (#3070).
+
+    A harvested collection mirrors a remote STAC source whose item ``id`` is the
+    authored provider id; dynastore keeps it on ingest as the row's
+    ``external_id``. Setting the collection's
+    ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` makes both STAC and
+    OGC Features surface that source id as the item id, so a link walked back to
+    the upstream catalog resolves — instead of exposing the internal geoid the
+    default read policy would (post-#3070). ``ItemsReadPolicy`` is collection
+    -scoped only (no catalog/platform tier), so it is written per collection here
+    rather than through the catalog-scoped harvest presets.
+
+    Best-effort, mirroring ``_apply_harvest_presets``: a failure is logged at
+    WARNING and returned as a soft error string (recorded by the caller) so it
+    never aborts the item walk. No-ops when no config writer is available.
+    """
+    if config_writer is None:
+        return None
+    try:
+        from dynastore.modules.storage.read_policy import ItemsReadPolicy
+        from dynastore.modules.storage.computed_fields import FeatureType
+
+        policy = ItemsReadPolicy(
+            feature_type=FeatureType(
+                external_id_as_feature_id=external_id_as_feature_id
+            )
+        )
+        await config_writer.set_config(
+            ItemsReadPolicy, policy, catalog_id, collection_id
+        )
+        logger.info(
+            "stac_harvest: pinned items_read_policy("
+            "external_id_as_feature_id=%s) on %s/%s",
+            external_id_as_feature_id, catalog_id, collection_id,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 — read-policy pin is best-effort
+        logger.warning(
+            "stac_harvest: failed to pin items_read_policy on %s/%s: %s(%s)",
+            catalog_id, collection_id, type(exc).__name__, exc,
+        )
+        return f"read_policy:{collection_id}:{type(exc).__name__}"
+
+
 async def _harvest_collection(
     catalogs: Any,
     request: StacHarvestRequest,
@@ -565,20 +921,69 @@ async def _harvest_collection(
     items_iter: AsyncIterator[Dict[str, Any]],
     target_collection: str,
     stats: HarvestStats,
+    *,
+    source_collection_id: Optional[str] = None,
+    engine: Any = None,
+    task_id: Any = None,
+    page_cursor: Optional[PageCursor] = None,
+    config_writer: Any = None,
 ) -> None:
     """Upsert one collection and stream its items into ``target_collection``.
 
     ``source_coll`` is the raw source collection dict; ``items_iter`` yields its
     raw items.  Increments ``stats`` in place; never raises (failures are
-    recorded as soft errors).
+    recorded as soft errors) — except when a sustained zero-progress write
+    streak trips the stall abort (see ``_STALL_ABORT_SECONDS``), which raises
+    ``RuntimeError`` to stop a harvest that is stuck heartbeating but making
+    no progress (geoid#2890).
+
+    ``source_collection_id`` is the *source* collection id (pre-normalisation)
+    used to key the persisted resume cursor (#3034) — it must match what
+    ``iter_collections``/the single-collection probe hand back, since that is
+    what a resumed walk compares against. Defaults to ``target_collection``
+    when not given. When ``engine``/``task_id`` are given, the cursor is
+    stamped after each batch write commits (so a dispatcher retry resumes
+    this collection's items walk instead of restarting it) and once more
+    with ``done=True`` after the whole collection drains (so a resumed
+    catalog walk skips it entirely).
     """
+    source_collection_id = source_collection_id or target_collection
     target_catalog = request.target_catalog
+
+    first_item: Optional[Dict[str, Any]] = None
+    if request.kind is None and not (
+        _has_raster_extension(source_coll) or _has_raster_asset(source_coll)
+    ):
+        try:
+            first_item = await anext(items_iter)
+            items_iter = _prepend_item(first_item, items_iter)
+        except StopAsyncIteration:
+            first_item = None
+
+    inferred_kind = infer_collection_kind(
+        source_coll, first_item=first_item, explicit_kind=request.kind
+    )
+    perr = await _apply_collection_kind(
+        config_writer, target_catalog, target_collection, inferred_kind
+    )
+    if perr and len(stats.errors) < _MAX_RECORDED_ERRORS:
+        stats.errors.append(perr)
+
     coll = map_collection(source_coll)
     coll["id"] = target_collection
     if not await _ensure_collection(catalogs, target_catalog, coll):
         stats.errors.append(f"collection:{target_collection}")
         return
     stats.collections_written += 1
+
+    # Pin the item-id wire shape for this collection (#3070) before its items
+    # are read back, so the harvested item id round-trips the source STAC id.
+    perr = await _apply_collection_read_policy(
+        config_writer, target_catalog, target_collection,
+        request.external_id_as_feature_id,
+    )
+    if perr and len(stats.errors) < _MAX_RECORDED_ERRORS:
+        stats.errors.append(perr)
 
     async def _flush(batch: List[Dict[str, Any]]) -> None:
         written, err = await _upsert_items_batch(
@@ -588,6 +993,22 @@ async def _harvest_collection(
         stats.items_failed += len(batch) - written
         if err and len(stats.errors) < _MAX_RECORDED_ERRORS:
             stats.errors.append(f"items:{target_collection}:{err}")
+        if written == 0:
+            now = time.monotonic()
+            if stats._stall_since is None:
+                stats._stall_since = now
+            elapsed = now - stats._stall_since
+            if elapsed >= _STALL_ABORT_SECONDS:
+                raise RuntimeError(
+                    f"stac_harvest: aborting — no items written for "
+                    f"{elapsed:.0f}s (last error: {err})"
+                )
+        else:
+            stats._stall_since = None
+            await _persist_harvest_cursor(
+                engine, task_id, source_collection_id,
+                page_cursor.next_url if page_cursor else None, False,
+            )
         if request.with_assets:
             stats.virtual_assets_written += await _register_virtual_assets(
                 catalogs, target_catalog, target_collection, batch
@@ -606,12 +1027,75 @@ async def _harvest_collection(
     if batch:
         await _flush(batch)
 
+    if page_cursor is not None and page_cursor.truncated:
+        # The walk gave up on a page fetch instead of reaching a page with no
+        # rel=next link — a source hiccup, not completion. Marking this
+        # collection "done" would make a resume skip its unfetched tail
+        # forever; leave whatever the last successful batch's flush already
+        # persisted as the resume point (see PageCursor.truncated).
+        logger.warning(
+            "stac_harvest: %s items walk ended on a page-fetch error, not "
+            "exhaustion — leaving the resume cursor at the last committed "
+            "batch instead of marking the collection done.",
+            source_collection_id,
+        )
+    else:
+        # The whole collection drained without tripping the stall abort —
+        # mark it done so a resumed catalog walk skips it entirely instead
+        # of re-checking its (now stale) items_href.
+        await _persist_harvest_cursor(engine, task_id, source_collection_id, None, True)
+
+
+async def _prepend_item(
+    first: Dict[str, Any],
+    rest: AsyncIterator[Dict[str, Any]],
+) -> AsyncIterator[Dict[str, Any]]:
+    yield first
+    async for item in rest:
+        yield item
+
+
+async def _skip_empty_collection_if_requested(
+    request: StacHarvestRequest,
+    items_iter: AsyncIterator[Dict[str, Any]],
+    target_collection: str,
+    stats: HarvestStats,
+    *,
+    source_collection_id: str,
+    page_cursor: Optional[PageCursor] = None,
+    engine: Any = None,
+    task_id: Any = None,
+) -> Optional[AsyncIterator[Dict[str, Any]]]:
+    """Return an item iterator, or ``None`` when an empty source is skipped."""
+    if not request.skip_empty_collections:
+        return items_iter
+
+    try:
+        first = await anext(items_iter)
+    except StopAsyncIteration:
+        if page_cursor is not None and page_cursor.truncated:
+            return items_iter
+        stats.collections_skipped_empty += 1
+        logger.info(
+            "stac_harvest: skipping empty source collection %s → %s",
+            source_collection_id, target_collection,
+        )
+        await _persist_harvest_cursor(
+            engine, task_id, source_collection_id, None, True
+        )
+        return None
+
+    return _prepend_item(first, items_iter)
+
 
 async def run_harvest(
     request: StacHarvestRequest,
     catalogs: Any,
     preset_ctx: Any,
     base_scope: str,
+    *,
+    engine: Any = None,
+    task_id: Any = None,
 ) -> HarvestStats:
     """Walk the source STAC catalog (or single collection) and write locally.
 
@@ -619,6 +1103,14 @@ async def run_harvest(
     or a full catalog, resolves the apply scope accordingly (collection scope for
     a single-collection harvest, catalog scope otherwise), pins routing + STAC
     BEFORE the first write, then ingests.
+
+    When ``request.resume`` is set (#3034) — stamped by a previous attempt of
+    this same task via ``engine``/``task_id`` — a full-catalog walk skips every
+    source collection up to and including ``resume.collection_id`` (already
+    completed or in progress in a prior attempt) and resumes that collection's
+    items walk from ``resume.items_href`` instead of restarting the whole
+    catalog from its first collection. A single-collection harvest resumes its
+    one collection's items walk directly from ``resume.items_href``.
 
     Parameters
     ----------
@@ -630,9 +1122,14 @@ async def run_harvest(
         PresetContext used to apply the routing / stac_storage presets.
     base_scope:
         The catalog-scope string (``"catalog:{target_catalog}"``).
+    engine, task_id:
+        DB engine + this task's own row id, used to persist the resume cursor
+        after each batch commits. Cursor persistence is skipped (best-effort,
+        never fatal) when either is ``None``.
     """
     stats = HarvestStats()
     target_catalog = request.target_catalog
+    resume = request.resume
 
     # Detect a single-collection source (blocking probe off the event loop).
     single = await asyncio.to_thread(_probe_single_collection, request.catalog_url)
@@ -640,10 +1137,19 @@ async def run_harvest(
     if single is not None:
         source_coll, items_url = single
         target_col = str(request.target_collection or source_coll.get("id", "")).lower()
+        source_col_id = str(source_coll.get("id", target_col))
         logger.info(
             "stac_harvest: single-collection source %s → collection %s",
             request.catalog_url, target_col,
         )
+        if resume is not None and resume.done:
+            # A prior attempt already drained this collection fully; nothing
+            # left to walk (should be rare — a COMPLETED task is not retried).
+            logger.info(
+                "stac_harvest: resume cursor marks %s already done — skipping "
+                "items walk.", target_col,
+            )
+            return stats
         # Pin routing at CATALOG scope (collection + items templates), not the
         # narrower collection scope.  ``create_collection`` for the target
         # collection resolves its CollectionRoutingConfig at catalog scope; the
@@ -658,9 +1164,29 @@ async def run_harvest(
             if perr:
                 stats.errors.append(perr)
         stats.collections_seen = 1
+        page_cursor = PageCursor()
+        resume_href = resume.items_href if resume is not None else None
+        items_iter = _iter_items_from(
+            resume_href or items_url, target_col, cursor=page_cursor,
+            resume_from_href=bool(resume_href),
+        )
+        if resume_href:
+            logger.info(
+                "stac_harvest: resuming %s items walk from persisted cursor.",
+                target_col,
+            )
+        items_iter = await _skip_empty_collection_if_requested(
+            request, items_iter, target_col, stats,
+            source_collection_id=source_col_id, page_cursor=page_cursor,
+            engine=engine, task_id=task_id,
+        )
+        if items_iter is None:
+            return stats
         await _harvest_collection(
-            catalogs, request, source_coll,
-            _iter_items_from(items_url, target_col), target_col, stats,
+            catalogs, request, source_coll, items_iter, target_col, stats,
+            source_collection_id=source_col_id, engine=engine, task_id=task_id,
+            page_cursor=page_cursor,
+            config_writer=getattr(preset_ctx, "config", None),
         )
         return stats
 
@@ -673,14 +1199,77 @@ async def run_harvest(
         if perr:
             stats.errors.append(perr)
 
+    # Re-walking /collections is cheap (a handful of paginated list requests)
+    # even on a resume — only the per-item walk below needs to skip already
+    # -completed work. ``found_resume_point`` gates the skip: True from the
+    # start when there is nothing to resume.
+    found_resume_point = resume is None or not resume.collection_id
+
     async for coll_raw in iter_collections(request.catalog_url):
         if request.max_collections and stats.collections_seen >= request.max_collections:
             break
-        stats.collections_seen += 1
         cid = str(map_collection(coll_raw)["id"])
+        source_cid = str(coll_raw.get("id", cid))
+
+        if not found_resume_point:
+            # found_resume_point is only False when resume.collection_id is
+            # truthy (see its definition above), so resume is never None here.
+            assert resume is not None
+            if source_cid != resume.collection_id:
+                # Completed by a prior attempt (walk order precedes the
+                # resume point) — skip its items walk entirely.
+                continue
+            found_resume_point = True
+            if resume.done:
+                # This collection itself finished in a prior attempt too;
+                # resume from the one after it.
+                continue
+            resume_href = resume.items_href
+        else:
+            resume_href = None
+
+        stats.collections_seen += 1
+        page_cursor = PageCursor()
+        items_iter = (
+            _iter_items_from(
+                resume_href, source_cid, cursor=page_cursor,
+                resume_from_href=True,
+            )
+            if resume_href
+            else iter_items(request.catalog_url, source_cid, cursor=page_cursor)
+        )
+        if resume_href:
+            logger.info(
+                "stac_harvest: resuming %s items walk from persisted cursor.",
+                cid,
+            )
+        items_iter = await _skip_empty_collection_if_requested(
+            request, items_iter, cid, stats,
+            source_collection_id=source_cid, page_cursor=page_cursor,
+            engine=engine, task_id=task_id,
+        )
+        if items_iter is None:
+            continue
         await _harvest_collection(
-            catalogs, request, coll_raw,
-            iter_items(request.catalog_url, coll_raw.get("id", cid)), cid, stats,
+            catalogs, request, coll_raw, items_iter, cid, stats,
+            source_collection_id=source_cid, engine=engine, task_id=task_id,
+            page_cursor=page_cursor,
+            config_writer=getattr(preset_ctx, "config", None),
+        )
+
+    if not found_resume_point:
+        # The persisted resume_collection_id never turned up while re-walking
+        # /collections — the source likely renamed or removed it since the
+        # last attempt. Every collection this attempt saw got skipped as
+        # "already done", so silently returning here would report a false
+        # success with 0 collections/items harvested. Fail loudly instead of
+        # masking a source-side change behind an empty result.
+        assert resume is not None  # implied by found_resume_point being False
+        raise RuntimeError(
+            f"stac_harvest: resume cursor collection_id={resume.collection_id!r} "
+            "was not found while re-walking /collections — it may have been "
+            "renamed or removed at the source since the previous attempt; "
+            "resubmit without a resume cursor for a fresh full harvest."
         )
 
     return stats
@@ -769,14 +1358,19 @@ class StacHarvestTask(
                 "skipped): %s(%s)", type(exc).__name__, exc,
             )
 
-        stats = await run_harvest(request, catalogs, preset_ctx, scope)
+        stats = await run_harvest(
+            request, catalogs, preset_ctx, scope,
+            engine=self.engine, task_id=payload.task_id,
+        )
 
         logger.info(
             "stac_harvest: finished — drivers=%s collections=%d/%d "
-            "items_written=%d items_failed=%d virtual_assets=%d errors=%d",
+            "skipped_empty=%d items_written=%d items_failed=%d "
+            "virtual_assets=%d errors=%d",
             request.drivers.value,
             stats.collections_written,
             stats.collections_seen,
+            stats.collections_skipped_empty,
             stats.items_written,
             stats.items_failed,
             stats.virtual_assets_written,
@@ -788,14 +1382,31 @@ class StacHarvestTask(
 
         summary = (
             f"collections={stats.collections_written}/{stats.collections_seen} "
+            f"skipped_empty={stats.collections_skipped_empty} "
             f"items_written={stats.items_written} items_failed={stats.items_failed} "
             f"virtual_assets={stats.virtual_assets_written} "
+            f"errors={len(stats.errors)} "
             f"drivers={request.drivers.value}"
         )
+        if (
+            stats.collections_seen > 0
+            and stats.collections_written == 0
+            and stats.items_written == 0
+            and stats.errors
+        ):
+            # Every collection errored and nothing was written: reporting
+            # "successful" here masks a total write failure behind soft
+            # per-collection errors. Partial failure stays successful (the
+            # summary carries the error count); total failure must not.
+            raise RuntimeError(
+                f"stac_harvest: nothing harvested — {summary}; "
+                f"first errors: {stats.errors[:5]}"
+            )
         return {
             "message": summary,
             "collections_written": stats.collections_written,
             "collections_seen": stats.collections_seen,
+            "collections_skipped_empty": stats.collections_skipped_empty,
             "items_written": stats.items_written,
             "items_failed": stats.items_failed,
             "virtual_assets_written": stats.virtual_assets_written,

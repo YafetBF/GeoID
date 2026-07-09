@@ -23,7 +23,6 @@ from typing import (
     Any,
     Dict,
     List,
-    Literal,
     Optional,
     Set,
     TypeVar,
@@ -35,6 +34,7 @@ from pydantic import (
     HttpUrl,
     ConfigDict,
     field_validator,
+    model_serializer,
 )
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.models.localization import (
@@ -115,7 +115,6 @@ class Link(BaseModel, LocalizableModelMixin):
 SYSTEM_CATALOG_ID = "_system_"
 SYSTEM_CATALOG_TITLE = "System Catalog"
 SYSTEM_SCHEMA = "catalog"  # Physical schema for system-level tables
-SYSTEM_LOGS_TABLE = "system_logs"
 
 # --- Reusable Internationalization Types ---
 
@@ -365,6 +364,13 @@ class BaseMetadata(LocalizedFieldsBase):
     )
 
     id: str = Field(..., description="A unique logical identifier.")
+    external_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The renamable public label for this resource. "
+            "Populated by the service layer after create; not user-supplied on the model."
+        ),
+    )
     # ``physical_schema`` (the per-tenant PostgreSQL schema) is deliberately NOT a
     # field on this model. It is a storage-driver / provisioning detail that must be
     # resolved from the authoritative ``catalog.catalogs`` registry via
@@ -386,6 +392,42 @@ class BaseMetadata(LocalizedFieldsBase):
         validated_code = validate_sql_identifier(v)
 
         return validated_code
+
+    @model_serializer(mode="wrap")
+    def _serialize_public_id(self, handler: Any) -> Dict[str, Any]:
+        """Emit the renamable public label as the ``"id"`` field on the wire.
+
+        Rules:
+        - If ``external_id`` is set, replace ``id`` with its value so every
+          caller (HTTP JSON response, localize(), model_dump()) sees the public
+          label, not the opaque internal token.
+        - The raw ``external_id`` key is never emitted (it must not appear in
+          API output or intermediate dicts).
+        - The in-memory ``.id`` attribute is not modified — all in-process code
+          that reads ``.id`` directly continues to get the immutable internal
+          token.
+
+        Internal callers (service layer, pipeline stages) that call
+        ``model_dump()`` / ``localize()`` receive ``id = external_id`` in the
+        resulting dict.  Pipeline stages that round-trip through
+        ``Catalog.model_validate(data)`` will produce a model whose ``.id``
+        equals the external label — this is acceptable because those models are
+        used only for output, not for further DB operations (the service layer
+        resolves the internal id independently from the path-param).
+        """
+        data: Dict[str, Any] = handler(self)
+        if self.external_id is not None:
+            data["id"] = self.external_id
+        data.pop("external_id", None)
+        # Strip internal identifiers that ``extra="allow"`` absorbs from a DB row
+        # on create/replace/update (the same leak class the ``physical_schema``
+        # note above describes). The immutable internal id stays on ``.id`` in
+        # memory for in-process callers and the ``/catalog`` management protocol;
+        # it must never appear on a standard OGC/STAC surface, where the public
+        # ``id`` is the renamable external label only.
+        for _internal in ("catalog_id", "collection_id", "physical_schema", "connection_info"):
+            data.pop(_internal, None)
+        return data
 
     @classmethod
     def get_internal_columns(cls) -> Set[str]:
@@ -419,6 +461,14 @@ class Catalog(BaseMetadata):
     assets: Optional[Dict[str, Any]] = Field(None, description="Dictionary of asset objects that can be downloaded.")
     provisioning_status: str = Field(
         "ready", description="Provisioning status: provisioning | ready | failed"
+    )
+    deleted_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "Soft-deletion timestamp. Non-null when the catalog has been soft-deleted "
+            "but not yet hard-deleted or reclaimed. Included in GET responses so callers "
+            "can observe the deleted lifecycle state without triggering 404."
+        ),
     )
 
 
@@ -468,85 +518,6 @@ class CollectionUpdate(LocalizedFieldsBase):
     summaries: Optional[Dict[str, Any]] = Field(None)
     assets: Optional[Dict[str, Any]] = Field(None)
     item_assets: Optional[Dict[str, Any]] = Field(None)
-
-
-# --- Generic GeoJSON Models ---
-
-
-class GeoJSONGeometry(BaseModel):
-    type: str
-    coordinates: Any
-
-
-class Feature(BaseModel):
-    model_config = ConfigDict(
-        extra="allow",
-        from_attributes=True,
-        populate_by_name=True,
-        json_schema_extra={
-            "examples": [
-                {
-                    "type": "Feature",
-                    "id": "feature_001",
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [12.49, 41.89],
-                    },
-                    "bbox": [12.49, 41.89, 12.49, 41.89],
-                    "properties": {"name": "Rome", "country": "Italy"},
-                    "links": [],
-                }
-            ]
-        },
-    )
-
-    type: Literal["Feature"] = "Feature"
-    id: str
-    geometry: Optional[GeoJSONGeometry] = None
-    bbox: Optional[List[float]] = None
-    properties: Dict[str, Any]
-    links: Optional[List[Link]] = None
-
-
-class FeatureCollection(BaseModel):
-    """
-    A GeoJSON FeatureCollection, compliant with OGC API - Features Part 1.
-    """
-    model_config = ConfigDict(
-        extra="allow",
-        from_attributes=True,
-        populate_by_name=True,
-        json_schema_extra={
-            "examples": [
-                {
-                    "type": "FeatureCollection",
-                    "features": [
-                        {
-                            "type": "Feature",
-                            "id": "feature_001",
-                            "geometry": {"type": "Point", "coordinates": [12.49, 41.89]},
-                            "properties": {"name": "Rome"},
-                        }
-                    ],
-                    "numberMatched": 1,
-                    "numberReturned": 1,
-                }
-            ]
-        },
-    )
-
-    type: Literal["FeatureCollection"] = "FeatureCollection"
-    features: List[Feature]
-    links: Optional[List[Link]] = None
-    numberMatched: Optional[int] = Field(
-        None, description="The total number of features matching the query."
-    )
-    numberReturned: Optional[int] = Field(
-        None, description="The number of features returned in this response."
-    )
-    timeStamp: Optional[str] = Field(
-        None, description="A timestamp of when the response was generated."
-    )  # Recommended by Part 1
 
 
 # --- OGC API Common Models (e.g., for Filtering/CQL) ---

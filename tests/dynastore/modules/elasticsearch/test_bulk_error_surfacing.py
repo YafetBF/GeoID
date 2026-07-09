@@ -164,6 +164,140 @@ class TestClassifyBulkResponse:
         passed, transient, poison = classify_bulk_response({}, [])
         assert passed == transient == poison == []
 
+    def test_caused_by_chain_is_included_in_reason(self):
+        """#2769: a geo_shape rejection's actual diagnosable cause typically
+        lives one or more ``caused_by`` hops below the generic top-level
+        reason — both must appear in the classified reason string."""
+        from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+
+        resp = {
+            "errors": True,
+            "items": [{
+                "index": {
+                    "_id": "geo-1",
+                    "status": 400,
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": "failed to parse field [geometry] of type [geo_shape]",
+                        "caused_by": {
+                            "type": "invalid_shape_exception",
+                            "reason": "Self-intersection at or near point [179.99, -85.0]",
+                        },
+                    },
+                },
+            }],
+        }
+        _passed, _transient, poison = classify_bulk_response(resp, ["geo-1"])
+        assert len(poison) == 1
+        reason = poison[0][1]
+        assert "document_parsing_exception" in reason
+        assert "failed to parse field [geometry]" in reason
+        assert "invalid_shape_exception" in reason
+        assert "Self-intersection" in reason
+
+    def test_reason_is_capped_at_max_length(self):
+        from dynastore.modules.elasticsearch.bulk_classify import (
+            _MAX_REASON_LEN,
+            classify_bulk_response,
+        )
+
+        huge_reason = "x" * (_MAX_REASON_LEN * 3)
+        resp = {
+            "errors": True,
+            "items": [{
+                "index": {
+                    "_id": "geo-2",
+                    "status": 400,
+                    "error": {"type": "mapper_parsing_exception", "reason": huge_reason},
+                },
+            }],
+        }
+        _passed, _transient, poison = classify_bulk_response(resp, ["geo-2"])
+        assert len(poison) == 1
+        assert len(poison[0][1]) <= _MAX_REASON_LEN + len("...(truncated)") + 30
+
+
+# ---------------------------------------------------------------------------
+# #2799 — id/items length-mismatch (truncated bulk response)
+# ---------------------------------------------------------------------------
+
+
+class TestBulkIdLengthMismatch:
+    """A truncated ``items`` array (fewer entries than ids submitted) must
+    never silently drop the unaccounted tail — those ids must resurface as
+    transient (retryable) rather than being assumed acknowledged (#2799)."""
+
+    def test_classify_marks_missing_tail_as_transient(self):
+        from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+
+        # Two ids submitted, ES only echoed one item.
+        resp = {
+            "errors": False,
+            "items": [{"index": {"_id": "a", "status": 200}}],
+        }
+        passed, transient, poison = classify_bulk_response(resp, ["a", "b"])
+        assert passed == ["a"]
+        assert poison == []
+        # The dropped tail id must be surfaced, not lost.
+        assert [t[0] for t in transient] == ["b"]
+        assert "truncated" in transient[0][1]
+
+    def test_classify_all_missing_when_items_empty(self):
+        from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+
+        resp = {"errors": False, "items": []}
+        passed, transient, poison = classify_bulk_response(resp, ["a", "b"])
+        assert passed == []
+        assert poison == []
+        assert [t[0] for t in transient] == ["a", "b"]
+
+    def test_raise_on_bulk_errors_does_not_swallow_truncated_tail(self):
+        """errors:false is NOT sufficient to fast-return list(ids) when the
+        response is truncated — the tail must be raised as a failure."""
+        from dynastore.modules.elasticsearch._mapping_errors import raise_on_bulk_errors
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = {
+            "errors": False,
+            "items": [{"index": {"_id": "a", "status": 200}}],
+        }
+        with pytest.raises(EsBulkWriteError) as exc_info:
+            raise_on_bulk_errors(resp, "my-index", ["a", "b"])
+        assert exc_info.value.acknowledged == ["a"]
+        assert [f[0] for f in exc_info.value.failures] == ["b"]
+
+    def test_clean_full_response_still_fast_returns(self):
+        """The fast path must still trigger when counts match and no errors."""
+        from dynastore.modules.elasticsearch._mapping_errors import raise_on_bulk_errors
+
+        resp = {
+            "errors": False,
+            "items": [
+                {"index": {"_id": "a", "status": 200}},
+                {"index": {"_id": "b", "status": 201}},
+            ],
+        }
+        assert raise_on_bulk_errors(resp, "my-index", ["a", "b"]) == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_ladder_variant_does_not_swallow_truncated_tail(self):
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = {
+            "errors": False,
+            "items": [{"index": {"_id": "a", "status": 200}}],
+        }
+        with pytest.raises(EsBulkWriteError) as exc_info:
+            await raise_on_bulk_errors_with_ladder(
+                es=MagicMock(), bulk_resp=resp, index_name="my-index",
+                ids=["a", "b"], doc_by_id={},
+            )
+        assert exc_info.value.acknowledged == ["a"]
+        assert [f[0] for f in exc_info.value.failures] == ["b"]
+
 
 # ---------------------------------------------------------------------------
 # Task 2 helper — raise_on_bulk_errors
@@ -190,13 +324,36 @@ class TestRaiseOnBulkErrors:
         from dynastore.modules.elasticsearch._mapping_errors import raise_on_bulk_errors
 
         resp = _bulk_ok_response("id-ok")
-        # Should not raise.
-        raise_on_bulk_errors(resp, "my-index", ["id-ok"])
+        # Should not raise, and reports the id as acknowledged (#2799).
+        assert raise_on_bulk_errors(resp, "my-index", ["id-ok"]) == ["id-ok"]
 
     def test_no_raise_on_none_response(self):
         from dynastore.modules.elasticsearch._mapping_errors import raise_on_bulk_errors
 
         raise_on_bulk_errors(None, "my-index", [])
+
+    def test_mixed_batch_exception_carries_acknowledged_ids(self, caplog):
+        """#2799: on a partial rejection, EsBulkWriteError.acknowledged must
+        list exactly the ids ES actually accepted — not every non-failed id
+        assumed from batch-size arithmetic."""
+        from dynastore.modules.elasticsearch._mapping_errors import raise_on_bulk_errors
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = {
+            "errors": True,
+            "items": [
+                {"index": {"_id": "ok", "status": 200}},
+                {"index": {"_id": "bad", "status": 400, "error": {
+                    "type": "mapper_parsing_exception", "reason": "bad shape",
+                }}},
+            ],
+        }
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(EsBulkWriteError) as exc_info:
+                raise_on_bulk_errors(resp, "my-index", ["ok", "bad"])
+
+        assert exc_info.value.acknowledged == ["ok"]
+        assert exc_info.value.failures == [("bad", "400 mapper_parsing_exception: bad shape")]
 
     def test_illegal_argument_raises_mapping_mismatch_not_es_bulk(self):
         """illegal_argument_exception must surface as IndexMappingMismatchError
@@ -210,6 +367,170 @@ class TestRaiseOnBulkErrors:
         resp = _bulk_error_response("illegal_argument_exception", "unknown field", 400, "id-x")
         with pytest.raises(IndexMappingMismatchError):
             maybe_raise_bulk_mapping_mismatch(resp, "my-index")
+
+
+# ---------------------------------------------------------------------------
+# raise_on_bulk_errors_with_ladder (#2769)
+# ---------------------------------------------------------------------------
+
+
+class _LadderRecoveringEs:
+    """Fake ES client whose ``index`` call always succeeds — every
+    poison-classified doc with a geometry recovers on the first rung."""
+
+    def __init__(self) -> None:
+        self.index_calls: list = []
+
+    async def index(self, *, index, id, body, params=None):
+        self.index_calls.append((index, id, body, params))
+        return {"result": "created"}
+
+
+class _LadderFailingEs:
+    """Fake ES client whose ``index`` call always raises — every rung is
+    exhausted and the original rejection stands."""
+
+    def __init__(self) -> None:
+        self.index_calls: list = []
+
+    async def index(self, *, index, id, body, params=None):
+        self.index_calls.append((index, id, body, params))
+        raise RuntimeError("still document_parsing_exception")
+
+
+class TestRaiseOnBulkErrorsWithLadder:
+    @pytest.mark.asyncio
+    async def test_geo_shape_rejection_recovers_and_does_not_raise(self, caplog):
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+
+        resp = _bulk_error_response(
+            "document_parsing_exception",
+            "failed to parse field [geometry] of type [geo_shape]",
+            400, "geo-1",
+        )
+        doc = {
+            "id": "geo-1",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+            },
+        }
+        es = _LadderRecoveringEs()
+        with caplog.at_level(logging.WARNING):
+            acknowledged = await raise_on_bulk_errors_with_ladder(
+                es, resp, "my-index", ["geo-1"], {"geo-1": doc},
+            )
+        assert es.index_calls, "ladder must have attempted at least one rung"
+        assert any(
+            "recovered on degraded" in r.message for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+        # #2799: a doc recovered on a degraded rung counts as acknowledged —
+        # a caller crediting only the raw ES ``passed`` classification would
+        # silently drop it from its written count.
+        assert acknowledged == ["geo-1"]
+
+    @pytest.mark.asyncio
+    async def test_geo_shape_rejection_exhausted_still_raises(self, caplog):
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = _bulk_error_response(
+            "document_parsing_exception",
+            "failed to parse field [geometry] of type [geo_shape]",
+            400, "geo-2",
+        )
+        doc = {
+            "id": "geo-2",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+            },
+        }
+        es = _LadderFailingEs()
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(EsBulkWriteError) as exc_info:
+                await raise_on_bulk_errors_with_ladder(
+                    es, resp, "my-index", ["geo-2"], {"geo-2": doc},
+                )
+        assert exc_info.value.failures[0][0] == "geo-2"
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_acknowledged_includes_passed_and_recovered_not_exhausted(self):
+        """#2799: a sub-chunk with one clean pass, one ladder-recovered doc,
+        and one rung-exhausted rejection must report exactly the first two
+        as acknowledged — never the exhausted one, and never assumed from
+        ``len(ids) - len(failures)`` arithmetic."""
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = {
+            "errors": True,
+            "items": [
+                {"index": {"_id": "ok", "status": 200}},
+                {"index": {"_id": "geo-recovers", "status": 400, "error": {
+                    "type": "document_parsing_exception",
+                    "reason": "failed to parse field [geometry] of type [geo_shape]",
+                }}},
+                {"index": {"_id": "geo-exhausted", "status": 400, "error": {
+                    "type": "document_parsing_exception",
+                    "reason": "failed to parse field [geometry] of type [geo_shape]",
+                }}},
+            ],
+        }
+        polygon = {
+            "type": "Polygon",
+            "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+        }
+        doc_by_id = {
+            "geo-recovers": {"id": "geo-recovers", "geometry": polygon},
+            "geo-exhausted": {"id": "geo-exhausted", "geometry": polygon},
+        }
+
+        class _SelectiveLadderEs:
+            """Recovers ``geo-recovers`` on the first rung; every rung for
+            ``geo-exhausted`` keeps failing."""
+
+            async def index(self, *, index, id, body, params=None):
+                if id == "geo-recovers":
+                    return {"result": "created"}
+                raise RuntimeError("still document_parsing_exception")
+
+        with pytest.raises(EsBulkWriteError) as exc_info:
+            await raise_on_bulk_errors_with_ladder(
+                _SelectiveLadderEs(), resp, "my-index",
+                ["ok", "geo-recovers", "geo-exhausted"], doc_by_id,
+            )
+
+        assert sorted(exc_info.value.acknowledged) == ["geo-recovers", "ok"]
+        assert [f[0] for f in exc_info.value.failures] == ["geo-exhausted"]
+
+    @pytest.mark.asyncio
+    async def test_non_geometry_rejection_raises_without_ladder_attempt(self):
+        """A doc with no geometry key is not a candidate for the ladder —
+        it must be reported exactly as raise_on_bulk_errors would."""
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = _bulk_error_response(
+            "mapper_parsing_exception", "unrelated field type mismatch", 400, "id-1",
+        )
+        doc = {"id": "id-1"}  # no geometry
+        es = _LadderRecoveringEs()
+        with pytest.raises(EsBulkWriteError):
+            await raise_on_bulk_errors_with_ladder(
+                es, resp, "my-index", ["id-1"], {"id-1": doc},
+            )
+        assert es.index_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -259,16 +580,19 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value=mock_es,
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.resolve_catalog_known_fields",
-                new=AsyncMock(return_value=[]),
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.project_item_for_es",
-                side_effect=lambda doc, _fields: doc,
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={}),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "get_driver_config",
-                new=AsyncMock(return_value=MagicMock(simplify_geometry=False)),
+                new=AsyncMock(return_value=MagicMock(
+                    simplify_geometry=False, simplify_target_bytes=None,
+                    snap_to_grid=False, snap_grid_size=1e-5,
+                )),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "_enforce_field_constraints",
@@ -288,8 +612,8 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value="test-items-cat1",
             ),
             patch(
-                "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
             caplog.at_level(logging.ERROR),
         ):
@@ -321,16 +645,19 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value=mock_es,
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.resolve_catalog_known_fields",
-                new=AsyncMock(return_value=[]),
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.project_item_for_es",
-                side_effect=lambda doc, _fields: doc,
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={}),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "get_driver_config",
-                new=AsyncMock(return_value=MagicMock(simplify_geometry=False)),
+                new=AsyncMock(return_value=MagicMock(
+                    simplify_geometry=False, simplify_target_bytes=None,
+                    snap_to_grid=False, snap_grid_size=1e-5,
+                )),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "_enforce_field_constraints",
@@ -350,12 +677,102 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value="test-items-cat1",
             ),
             patch(
-                "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
         ):
             result = await driver.write_entities("cat1", "col1", items)
         assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_partial_rejection_raises_with_only_acknowledged_ids(self, caplog):
+        """#2799: when ES's ``_bulk`` response acknowledges FEWER docs than
+        submitted-minus-failures — the silent-sibling-drop case audited on
+        gaulb/gaul_l1 — the raised EsBulkWriteError.acknowledged must list
+        only the id ES actually confirmed, never the silently-dropped one."""
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        driver = ItemsElasticsearchDriver()
+
+        mock_es = AsyncMock()
+        mock_es.indices.exists = AsyncMock(return_value=True)
+        # Bulk response only accounts for 2 of the 3 submitted docs: one
+        # explicit 200, one explicit rejection — the third ("item-3") has
+        # no entry at all, simulating ES's response undercounting relative
+        # to what was submitted.
+        mock_es.bulk = AsyncMock(return_value={
+            "errors": True,
+            "items": [
+                {"index": {"_id": "item-1", "status": 200}},
+                {"index": {"_id": "item-2", "status": 400, "error": {
+                    "type": "mapper_parsing_exception", "reason": "bad shape",
+                }}},
+            ],
+        })
+
+        items = [
+            {"id": "item-1", "type": "Feature", "geometry": None, "properties": {}},
+            {"id": "item-2", "type": "Feature", "geometry": None, "properties": {}},
+            {"id": "item-3", "type": "Feature", "geometry": None, "properties": {}},
+        ]
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=mock_es,
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={}),
+            ),
+            patch.object(
+                ItemsElasticsearchDriver, "get_driver_config",
+                new=AsyncMock(return_value=MagicMock(
+                    simplify_geometry=False, simplify_target_bytes=None,
+                    snap_to_grid=False, snap_grid_size=1e-5,
+                )),
+            ),
+            patch.object(
+                ItemsElasticsearchDriver, "_enforce_field_constraints",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                ItemsElasticsearchDriver, "_resolve_write_policy",
+                new=AsyncMock(return_value=MagicMock(
+                    external_id_path=lambda: None,
+                    on_conflict=None,
+                    on_batch_conflict=None,
+                    validity=None,
+                )),
+            ),
+            patch.object(
+                ItemsElasticsearchDriver, "_items_index_name",
+                return_value="test-items-cat1",
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
+            ),
+            caplog.at_level(logging.ERROR),
+        ):
+            with pytest.raises(EsBulkWriteError) as exc_info:
+                await driver.write_entities("cat1", "col1", items)
+
+        # item-1 confirmed; item-2 explicitly rejected; item-3 had NO entry in
+        # the (truncated) response — it must resurface as a failure (transient),
+        # never silently assumed acknowledged (#2799).
+        assert exc_info.value.acknowledged == ["item-1"]
+        failure_ids = {f[0] for f in exc_info.value.failures}
+        assert failure_ids == {"item-2", "item-3"}
+        item3_reason = next(r for i, r in exc_info.value.failures if i == "item-3")
+        assert "truncated" in item3_reason
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +816,7 @@ class TestPrivateDriverWriteEntities:
             ),
             patch(
                 "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
             caplog.at_level(logging.ERROR),
         ):
@@ -477,7 +894,7 @@ class TestEnvelopeDriverWriteEntities:
             patch.object(driver, "_build_doc", side_effect=lambda item, **kw: dict(item)),
             patch(
                 "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
             caplog.at_level(logging.ERROR),
         ):
@@ -545,7 +962,14 @@ class TestCircuitBreakerOutboxEnqueue:
             breaker=breaker,
         )
 
-        ctx = IndexContext(catalog="cat1", collection="col1", correlation_id="cid")
+        # ``pg_conn`` must be a live handle for ``_enqueue_or_warn`` to
+        # actually enqueue (drop path (b), #2686): without one the durable
+        # write can't be made transactional with the caller's TX, so the
+        # dispatcher degrades to WARN instead of enqueuing.
+        ctx = IndexContext(
+            catalog="cat1", collection="col1", correlation_id="cid",
+            pg_conn=object(),
+        )
         ops = [
             IndexOp(op_type="upsert", entity_type="item", entity_id="i1"),
         ]

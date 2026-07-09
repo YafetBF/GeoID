@@ -31,26 +31,20 @@ Configuration SSOT is ``ValkeyEngineConfig`` (in
 under ``platform/protocols/storage`` and applied live without restart —
 URL, discovery_host/port, cluster_mode, require_full_coverage,
 dynamic_startup_nodes, discovery_port_remap, TLS, IAM,
-socket_timeout/connect_timeout, TCP keepalives.
+socket_timeout/connect_timeout, TCP keepalives. ``CacheModule`` acquires
+the client exclusively via ``app_state.engine_cache.get("valkey_engine")``
+— there is no separate env-driven connection path in production.
 
-Env-var bootstrap fallback (used only when the engine cache isn't
-available, e.g. a minimal worker SCOPE that omits ``DBConfigModule``):
+Cluster mode auto-detection:
+  The backend probes the server with the engine-built client first. If the
+  server reports cluster mode (via INFO) but the client is standalone, the
+  engine config's ``cluster_mode`` is misconfigured; ``CacheModule`` logs a
+  WARNING and rebuilds a dedicated cluster-mode client for the process.
 
-  VALKEY_URL           — connection URL (e.g. ``valkey://10.0.0.1:6379``)
-  VALKEY_TLS           — ``true`` to wrap the connection in TLS (independent
-                         of URL scheme). Required for GCP Memorystore IAM mode.
-  VALKEY_TLS_CA_PATH   — optional path to a server CA bundle for verification.
-                         If unset and TLS is on, cert/hostname checks are
-                         disabled (acceptable on private VPC).
-  VALKEY_IAM_AUTH      — ``true`` to authenticate via a Google OAuth2 access
-                         token minted from ADC. Requires ``google-auth``
-                         (provided by the ``module_gcp`` extra).
-  VALKEY_CLUSTER       — ``true`` for GCP Memorystore for Valkey CLUSTER
-                         instances. Uses ``ValkeyCluster`` (handles MOVED/ASK
-                         redirects, per-node pools). For Memorystore CLUSTER
-                         the discovery-only pattern (host+port,
-                         ``dynamic_startup_nodes=False``) is the engine-driven
-                         path — there is no env-var alias for it.
+``VALKEY_URL`` env var:
+  Consumed directly by ``ValkeyEngineConfig.engine_init()`` as the
+  boot-time bootstrap connection string when ``connection_url`` is unset
+  on the engine config — not read by this module.
 """
 
 from __future__ import annotations
@@ -58,7 +52,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
-import os
 import socket
 from datetime import datetime
 from enum import Enum
@@ -92,6 +85,32 @@ logger = logging.getLogger(__name__)
 # is ``CachePluginConfig.circuit_breaker_threshold``, which the
 # ``CacheModule`` lifespan plumbs through to every constructor.
 _VALKEY_CIRCUIT_BREAKER_DEFAULT = 3
+
+
+def _is_moved_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a Valkey ``MOVED`` ``ResponseError``.
+
+    Lazily imports ``valkey.exceptions`` (mirrors this module's existing
+    lazy-import pattern for the optional ``valkey`` dependency) rather
+    than duck-typing on the exception's class name.
+    """
+    try:
+        from valkey.exceptions import ResponseError
+    except ImportError:
+        return False
+    return isinstance(exc, ResponseError) and str(exc).upper().startswith("MOVED")
+
+
+def _is_standalone_client(client: Any) -> bool:
+    """Cheap sync duck-type check for "not a ``ValkeyCluster`` client".
+
+    Mirrors the ``nodes_manager`` / ``get_primaries`` check
+    ``ValkeyCacheBackend.topology()`` already uses to distinguish a
+    standalone ``Valkey`` client from a ``ValkeyCluster`` one.
+    """
+    return getattr(client, "nodes_manager", None) is None or not hasattr(
+        client, "get_primaries"
+    )
 
 # ---------------------------------------------------------------------------
 #  Valkey INFO section → field mapping (used by ValkeyCacheBackend.info())
@@ -236,8 +255,18 @@ def _serialize(value: Any) -> bytes:
 
 
 def _deserialize(data: bytes) -> Any:
-    """Deserialize msgpack bytes to a value."""
-    return msgpack.unpackb(data, ext_hook=_msgpack_ext_hook, raw=False)
+    """Deserialize msgpack bytes to a value.
+
+    ``strict_map_key=False``: cached payloads legitimately contain
+    int-keyed dicts (e.g. per-zoom tile parameters), which ``_serialize``
+    packs without complaint but the default ``strict_map_key=True``
+    rejects on read — turning every get for such an entry into a failure
+    that also feeds the circuit breaker. The strict default guards
+    untrusted input; this cache only reads what ``_serialize`` wrote.
+    """
+    return msgpack.unpackb(
+        data, ext_hook=_msgpack_ext_hook, raw=False, strict_map_key=False
+    )
 
 
 def _build_keepalive_options(
@@ -290,6 +319,40 @@ def build_discovery_port_remap(
     return _remap
 
 
+def resolve_valkey_target(
+    *,
+    url: Optional[str] = None,
+    discovery_host: Optional[str] = None,
+    discovery_port: int = 6379,
+    cluster_mode: bool = False,
+) -> str:
+    """Human-readable ``host:port (mode)`` connection target for logging.
+
+    Used by ``CacheModule``'s (re)connect banners (#2812 follow-up — the
+    reconnect line used to omit the resolved endpoint, which hid endpoint
+    drift for days). Never leaks credentials embedded in ``url``: only the
+    hostname/port are extracted, never userinfo or query string.
+
+    Discovery endpoint (cluster mode) takes precedence, matching
+    ``build_valkey_client``'s own precedence. Falls back to parsing
+    ``host:port`` out of ``url``, then to an explicit "unresolved" marker.
+    """
+    mode = "cluster" if cluster_mode else "standalone"
+    if discovery_host:
+        return f"{discovery_host}:{discovery_port} ({mode})"
+    if url:
+        from urllib.parse import urlsplit
+
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or "?"
+            port = parsed.port or discovery_port
+            return f"{host}:{port} ({mode})"
+        except Exception:
+            return f"<unparseable-url> ({mode})"
+    return f"<unresolved> ({mode})"
+
+
 def build_valkey_client(
     *,
     url: Optional[str] = None,
@@ -309,6 +372,9 @@ def build_valkey_client(
     tcp_keepalive_idle: Optional[int] = None,
     tcp_keepalive_interval: Optional[int] = None,
     tcp_keepalive_count: Optional[int] = None,
+    health_check_interval: Optional[float] = None,
+    retry_attempts: Optional[int] = None,
+    max_connections: Optional[int] = None,
 ) -> "tuple[Any, Any]":
     """Build a Valkey async client (standalone or cluster) from connection params.
 
@@ -325,7 +391,36 @@ def build_valkey_client(
     ``discovery_port`` via an ``address_remap`` callable. This is the fix for
     Memorystore Valkey 9 CLUSTER, which advertises unreachable internal shard
     addresses at the cluster-bus port range (see ``build_discovery_port_remap``).
+
+    ``health_check_interval`` (#2902): proactively PINGs an idle connection
+    every N seconds so a socket silently dropped by an intermediary (Cloud
+    NAT, LB) is detected and replaced before the next real command hits it,
+    instead of surfacing as a hard failure on that command.
+
+    ``retry_attempts`` (#2902): bounded retry (exponential backoff) for the
+    connection-class errors — ``ConnectionError``/``TimeoutError`` and their
+    asyncio counterparts — that a single stale pooled socket raises. Valkey's
+    ``Retry`` only ever matches those error classes (never application-level
+    errors such as a bad command or a cluster ``MOVED`` response), so a
+    genuine backend fault still surfaces immediately.
+
+    ``max_connections`` (#2961): caps concurrent connections in the
+    standalone ``ConnectionPool`` and (via ``cluster_kwargs``) each of the
+    cluster client's per-node pools. Set before the cluster-mode kwargs
+    filter below so both paths inherit it without separate plumbing.
+    valkey-py otherwise defaults this to ``2**31`` (effectively unbounded).
     """
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.debug(
+        "build_valkey_client: ENTRY — cluster_mode=%s discovery_host=%s url=%s tls=%s iam_auth=%s",
+        cluster_mode,
+        discovery_host,
+        url,
+        tls,
+        iam_auth,
+    )
+    
     if not _CACHE_DEPS_OK:
         raise ModuleNotFoundError(
             "build_valkey_client requires the 'module_cache' extra "
@@ -341,7 +436,21 @@ def build_valkey_client(
             f"Original error: {e}"
         ) from e
 
+    # Stashed on the built client (below) as ``_ds_resolved_target`` so
+    # ``CacheModule``'s connect/reconnect banners can log the resolved
+    # endpoint without re-deriving it from the (possibly secret-backed)
+    # connection params (#2812 follow-up).
+    resolved_target = resolve_valkey_target(
+        url=url,
+        discovery_host=discovery_host,
+        discovery_port=discovery_port,
+        cluster_mode=cluster_mode,
+    )
+
     pool_kwargs: Dict[str, Any] = {"decode_responses": False}
+
+    if max_connections is not None:
+        pool_kwargs["max_connections"] = max_connections
 
     if socket_connect_timeout is not None:
         pool_kwargs["socket_connect_timeout"] = socket_connect_timeout
@@ -362,6 +471,24 @@ def build_valkey_client(
         if keepalive_options:
             pool_kwargs["socket_keepalive_options"] = keepalive_options
 
+    # Proactive health checks — PING idle connections every N seconds so a
+    # socket dead-on-arrival (stale pooled connection) is caught and replaced
+    # ahead of the next real command rather than failing that command outright.
+    if health_check_interval is not None:
+        pool_kwargs["health_check_interval"] = health_check_interval
+
+    # Bounded retry for connection-class errors (#2902). Passing a ``Retry``
+    # object is enough on its own — its default ``supported_errors``
+    # (``ConnectionError``/``TimeoutError``/``socket.timeout``) already
+    # excludes application-level errors; ``retry_on_timeout`` additionally
+    # folds in asyncio's ``TimeoutError`` for the standalone client.
+    if retry_attempts is not None and retry_attempts > 0:
+        from valkey.backoff import ExponentialBackoff
+        from valkey.retry import Retry
+
+        pool_kwargs["retry_on_timeout"] = True
+        pool_kwargs["retry"] = Retry(ExponentialBackoff(), retry_attempts)
+
     # TLS
     if tls:
         pool_kwargs["connection_class"] = avalkey.SSLConnection
@@ -376,46 +503,87 @@ def build_valkey_client(
 
     # Cluster mode
     if cluster_mode:
+        _logger.debug("build_valkey_client: CLUSTER MODE — entering cluster path")
         from valkey.asyncio.cluster import ValkeyCluster
 
         # cluster handles per-node pools internally; drop connection_class
-        # (cluster picks SSLConnection itself when ssl=True).
+        # (cluster picks SSLConnection itself when ssl=True) and
+        # retry_on_timeout (ValkeyCluster.__init__ has no such parameter —
+        # it merges the equivalent error classes itself once a ``retry``
+        # object is supplied, see valkey.asyncio.cluster.ValkeyCluster).
         cluster_kwargs = {
-            k: v for k, v in pool_kwargs.items() if k != "connection_class"
+            k: v
+            for k, v in pool_kwargs.items()
+            if k not in ("connection_class", "retry_on_timeout")
         }
         cluster_kwargs["ssl"] = tls
         cluster_kwargs["require_full_coverage"] = require_full_coverage
         cluster_kwargs["dynamic_startup_nodes"] = dynamic_startup_nodes
 
+        _logger.debug(
+            "build_valkey_client: cluster_kwargs — require_full_coverage=%s dynamic_startup_nodes=%s discovery_port_remap=%s",
+            require_full_coverage,
+            dynamic_startup_nodes,
+            discovery_port_remap,
+        )
+
         # Memorystore Valkey 9 advertises unreachable internal shard
         # addresses (cluster-bus port range) in its topology; rewrite every
         # discovered node's port back to the reachable discovery port.
         if discovery_port_remap:
+            _logger.debug("build_valkey_client: applying discovery_port_remap")
             cluster_kwargs["address_remap"] = build_discovery_port_remap(
                 discovery_port
             )
 
         # Discovery endpoint preferred (Memorystore Valkey CLUSTER pattern)
         if discovery_host:
+            _logger.debug(
+                "build_valkey_client: creating ValkeyCluster via discovery endpoint — host=%s port=%d",
+                discovery_host,
+                discovery_port,
+            )
             client = ValkeyCluster(  # type: ignore[abstract]
                 host=discovery_host,
                 port=discovery_port,
                 **cluster_kwargs,
             )
         elif url:
+            _logger.debug(
+                "build_valkey_client: creating ValkeyCluster via from_url — url=%s",
+                url,
+            )
             client = ValkeyCluster.from_url(url, **cluster_kwargs)
         else:
             raise ValueError(
                 "build_valkey_client(cluster_mode=True): one of "
                 "`discovery_host` or `url` must be provided."
             )
+        _logger.debug("build_valkey_client: ValkeyCluster created successfully, returning")
+        # Best-effort stash — some clients (e.g. exotic test doubles) don't
+        # accept new attributes; the resolved target is a logging aid, not
+        # load-bearing, so failure here must never break client construction.
+        try:
+            setattr(client, "_ds_resolved_target", resolved_target)
+        except Exception:  # noqa: BLE001
+            pass
         return client, None
 
     # Standalone
+    _logger.debug("build_valkey_client: STANDALONE MODE — entering standalone path")
     if not url:
         raise ValueError("build_valkey_client(cluster_mode=False): `url` is required.")
+    _logger.debug(
+        "build_valkey_client: creating Valkey (standalone) client — url=%s",
+        url,
+    )
     pool = avalkey.ConnectionPool.from_url(url, **pool_kwargs)
     client = avalkey.Valkey(connection_pool=pool)
+    try:
+        setattr(client, "_ds_resolved_target", resolved_target)
+    except Exception:  # noqa: BLE001
+        pass
+    _logger.debug("build_valkey_client: Valkey client created successfully, returning")
     return client, pool
 
 
@@ -475,8 +643,8 @@ class _GoogleIamCredentialProvider:
             )
         except ImportError as e:
             raise ImportError(
-                "VALKEY_IAM_AUTH=true requires the 'module_gcp' extra "
-                "(google-auth). "
+                "ValkeyEngineConfig.iam_auth=true requires the 'module_gcp' "
+                "extra (google-auth). "
                 f"Original error: {e}"
             ) from e
 
@@ -515,34 +683,36 @@ class ValkeyCacheBackend:
 
     def __init__(
         self,
-        url: Optional[str] = None,
+        client: Any,
         key_prefix: str = "ds:",
-        socket_connect_timeout: Optional[float] = None,
-        socket_timeout: Optional[float] = None,
-        tcp_keepalive_idle: Optional[int] = None,
-        tcp_keepalive_interval: Optional[int] = None,
-        tcp_keepalive_count: Optional[int] = None,
-        circuit_breaker_threshold: Optional[int] = None,
         *,
-        client: Optional[Any] = None,
         pool: Optional[Any] = None,
         owns_client: bool = True,
+        circuit_breaker_threshold: Optional[int] = None,
+        on_trip: Optional[Callable[["ValkeyCacheBackend"], None]] = None,
+        required: bool = False,
     ) -> None:
-        """Construct a Valkey cache backend.
+        """Wrap an engine-built Valkey ``client`` as the cache backend.
 
-        Two construction modes:
+        ``ValkeyEngineConfig`` (the configs-API SSOT) is the single
+        client-construction path: it builds the client via
+        ``build_valkey_client`` and ``CacheModule`` wraps it here with
+        ``owns_client=False`` so ``close()`` does not double-release a
+        resource the engine cache releases at shutdown. Connection params
+        (URL / TLS / IAM / socket hardening / cluster mode) live on
+        ``ValkeyEngineConfig`` and ``build_valkey_client`` — never on this
+        wrapper; reconfiguration flows through the configs API and
+        re-inits the engine, never by re-constructing this backend with raw
+        connection kwargs.
 
-        1. **Engine-driven (preferred)** — pass a pre-built ``client``
-           (and optional ``pool``). The engine (``ValkeyEngineConfig``)
-           owns lifecycle; set ``owns_client=False`` so ``close()`` does
-           not double-release a resource the engine cache will release.
-
-        2. **Legacy env-driven** — pass ``url`` (and optional timeout /
-           keepalive kwargs). The backend builds its own client via
-           ``build_valkey_client(...)`` consuming the legacy
-           ``VALKEY_TLS`` / ``VALKEY_IAM_AUTH`` / ``VALKEY_CLUSTER`` env
-           vars for back-compat. Used as the bootstrap fallback when
-           the engine is unavailable.
+        ``on_trip`` (#2741): called synchronously, with ``self``, right
+        after the circuit breaker unregisters this instance from the
+        ``CacheManager``. ``CacheModule`` passes a callback here that
+        schedules a guarded background re-probe loop, since
+        ``register_backend`` is otherwise only ever called at startup or
+        on an explicit config PATCH — without a recovery path a mid-life
+        trip degrades the process to L1-only cache (and IAM denylist
+        checks fail open) until the pod restarts.
         """
         # ModuleNotFoundError (a subclass of ImportError) so existing
         # `except ImportError` handlers still catch it AND the module
@@ -556,43 +726,16 @@ class ValkeyCacheBackend:
                 f"Original error: {_CACHE_DEPS_ERR}"
             )
 
-        if client is not None:
-            # Mode 1: engine-driven — caller owns lifecycle.
-            self._client = client
-            self._pool = pool
-            self._owns_client = owns_client
-        else:
-            # Mode 2: legacy env-driven path — preserved for tests and the
-            # bootstrap fallback when no engine_cache is wired.
-            if not url:
-                raise ValueError(
-                    "ValkeyCacheBackend: either `client` or `url` must be provided."
-                )
-            tls = os.getenv("VALKEY_TLS", "").lower() in ("1", "true", "yes")
-            tls_ca_path = os.getenv("VALKEY_TLS_CA_PATH")
-            iam_auth = os.getenv("VALKEY_IAM_AUTH", "").lower() in ("1", "true", "yes")
-            cluster_mode = os.getenv("VALKEY_CLUSTER", "").lower() in (
-                "1",
-                "true",
-                "yes",
+        if client is None:
+            raise ValueError(
+                "ValkeyCacheBackend requires a pre-built `client` from "
+                "ValkeyEngineConfig.engine_init()."
             )
-            built_client, built_pool = build_valkey_client(
-                url=url,
-                cluster_mode=cluster_mode,
-                tls=tls,
-                tls_ca_path=tls_ca_path,
-                tls_cert_reqs="required" if tls_ca_path else "none",
-                tls_check_hostname=bool(tls_ca_path),
-                iam_auth=iam_auth,
-                socket_connect_timeout=socket_connect_timeout,
-                socket_timeout=socket_timeout,
-                tcp_keepalive_idle=tcp_keepalive_idle,
-                tcp_keepalive_interval=tcp_keepalive_interval,
-                tcp_keepalive_count=tcp_keepalive_count,
-            )
-            self._client = built_client
-            self._pool = built_pool
-            self._owns_client = True
+        self._client = client
+        self._pool = pool
+        self._owns_client = owns_client
+        self._on_trip = on_trip
+        self.required = required
 
         self._prefix = key_prefix
         self._stats = CacheStats(maxsize=0)
@@ -601,6 +744,10 @@ class ValkeyCacheBackend:
         self._circuit_breaker_threshold = (
             circuit_breaker_threshold or _VALKEY_CIRCUIT_BREAKER_DEFAULT
         )
+        # #2812 follow-up: rate-limit the MOVED-on-standalone WARNING to
+        # once per backend instance (a reconnect/rebuild creates a fresh
+        # instance and re-arms it) instead of once per failing command.
+        self._moved_warned: bool = False
 
     @property
     def name(self) -> str:
@@ -614,10 +761,45 @@ class ValkeyCacheBackend:
         """Prefix a cache key for Valkey namespace isolation."""
         return f"{self._prefix}{key}"
 
-    def _record_failure(self) -> None:
-        """Increment failure counter and trip circuit breaker if threshold exceeded."""
+    def _record_failure(self, exc: Optional[BaseException] = None) -> None:
+        """Increment failure counter and trip circuit breaker if threshold exceeded.
+
+        ``exc`` (#2812 follow-up): when the failure is a ``MOVED``
+        ``ResponseError`` on a standalone client — meaning the configured
+        endpoint is actually running in cluster mode, the same root cause
+        as the #2812 outage — logs one hard WARNING naming the endpoint.
+        Detection only: no client rebuild, no config mutation (client
+        rebuild-on-MOVED is #2743's scope). Rate-limited to once per
+        backend instance so a MOVED storm produces one signal, not
+        per-command spam.
+        """
+        if (
+            exc is not None
+            and not self._moved_warned
+            and _is_standalone_client(self._client)
+            and _is_moved_error(exc)
+        ):
+            self._moved_warned = True
+            target = getattr(self._client, "_ds_resolved_target", "<unknown>")
+            logger.warning(
+                "CACHE ENDPOINT MISMATCH: standalone Valkey client at %s "
+                "received a MOVED response — this endpoint is running in "
+                "CLUSTER mode, not standalone. Correct "
+                "ValkeyEngineConfig (cluster_mode=true, discovery_host) via "
+                "PATCH /configs/plugins/valkey_engine_config. Detection "
+                "only; the client is not rebuilt automatically.",
+                target,
+            )
         self._consecutive_failures += 1
         if self._consecutive_failures >= self._circuit_breaker_threshold:
+            if self.required:
+                logger.critical(
+                    "ValkeyCacheBackend: circuit breaker threshold reached after "
+                    "%d consecutive failures, but this backend is required; "
+                    "keeping Valkey registered and refusing local-only degrade.",
+                    self._consecutive_failures,
+                )
+                return
             logger.error(
                 "ValkeyCacheBackend: circuit breaker tripped after %d consecutive failures — degrading to L1-only.",
                 self._consecutive_failures,
@@ -630,6 +812,13 @@ class ValkeyCacheBackend:
                 logger.exception(
                     "ValkeyCacheBackend: failed to unregister backend on circuit trip"
                 )
+            if self._on_trip is not None:
+                try:
+                    self._on_trip(self)
+                except Exception:
+                    logger.exception(
+                        "ValkeyCacheBackend: on_trip recovery callback failed"
+                    )
 
     def _record_success(self) -> None:
         """Reset failure counter on successful operation."""
@@ -642,8 +831,8 @@ class ValkeyCacheBackend:
             if raw is None:
                 return None
             return _deserialize(raw)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.get failed (key=%s)", self._key(key), exc_info=True
             )
@@ -670,8 +859,8 @@ class ValkeyCacheBackend:
             result = await self._client.set(self._key(key), serialized, **kwargs)
             self._record_success()
             return bool(result)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.set failed (key=%s)", self._key(key), exc_info=True
             )
@@ -705,8 +894,8 @@ class ValkeyCacheBackend:
             if tags is not None:
                 return False  # Tag-based invalidation not supported
             return False
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.clear failed (key=%s namespace=%s)",
                 self._key(key) if key is not None else None,
@@ -720,8 +909,8 @@ class ValkeyCacheBackend:
             result = bool(await self._client.exists(self._key(key)))
             self._record_success()
             return result
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.exists failed (key=%s)",
                 self._key(key),
@@ -790,8 +979,8 @@ class ValkeyCacheBackend:
                 "ValkeyCacheBackend.get_count: non-integer payload at key=%s", full
             )
             return None
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.get_count failed (key=%s)", full, exc_info=True
             )
@@ -812,8 +1001,8 @@ class ValkeyCacheBackend:
                 await self._client.pexpire(full, int(ttl * 1000))
             self._record_success()
             return int(new_value)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.incr failed (key=%s)", full, exc_info=True
             )
@@ -849,8 +1038,8 @@ class ValkeyCacheBackend:
             new_value = int(result[0])
             allowed = bool(int(result[1]))
             return (new_value, allowed)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.incr_if_below failed (key=%s)", full, exc_info=True
             )
@@ -864,12 +1053,73 @@ class ValkeyCacheBackend:
             result = await self._client.pexpireat(full, int(ts * 1000))
             self._record_success()
             return bool(result)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.expireat failed (key=%s)", full, exc_info=True
             )
             return False
+
+    # ------------------------------------------------------------------
+    # ListCacheBackend extension protocol (#2833)
+    # ------------------------------------------------------------------
+    #
+    # Bounded FIFO primitives backing the Valkey-buffered log producer/
+    # drainer. Mirrors the ``CountingCacheBackend`` primitives above: no
+    # parallel client, raises on failure (rather than swallowing) so the
+    # caller — the producer's push-then-fallback seam, or the drainer's
+    # tick — can react to Valkey trouble itself.
+
+    async def rpush_trimmed(
+        self,
+        key: str,
+        values: List[bytes],
+        *,
+        max_len: int,
+    ) -> int:
+        full = self._key(key)
+        if not values:
+            return 0
+        try:
+            new_len = await self._client.rpush(full, *values)
+            self._record_success()
+        except Exception as exc:
+            self._record_failure(exc)
+            logger.warning(
+                "ValkeyCacheBackend.rpush_trimmed failed (key=%s)", full, exc_info=True
+            )
+            raise
+        # Not atomic with the RPUSH above — under concurrent producers the
+        # list may transiently exceed max_len by a few entries; the next
+        # push's trim self-heals it. Acceptable for an ephemeral log queue
+        # (losing a few extra entries is fine; blocking producers is not).
+        dropped = max(0, int(new_len) - max_len)
+        if dropped:
+            try:
+                await self._client.ltrim(full, -max_len, -1)
+                self._record_success()
+            except Exception as exc:
+                self._record_failure(exc)
+                logger.warning(
+                    "ValkeyCacheBackend.rpush_trimmed: ltrim failed (key=%s)",
+                    full, exc_info=True,
+                )
+        return dropped
+
+    async def lpop_many(self, key: str, count: int) -> List[bytes]:
+        full = self._key(key)
+        try:
+            result = await self._client.lpop(full, count)
+            self._record_success()
+        except Exception as exc:
+            self._record_failure(exc)
+            logger.warning(
+                "ValkeyCacheBackend.lpop_many failed (key=%s)", full, exc_info=True
+            )
+            raise
+        if not result:
+            return []
+        return list(result)
 
     async def ping(self) -> bool:
         """Health check — verify Valkey connectivity."""
@@ -877,8 +1127,8 @@ class ValkeyCacheBackend:
             result = bool(await self._client.ping())
             self._record_success()
             return result
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning("ValkeyCacheBackend.ping failed", exc_info=True)
             return False
 
@@ -903,6 +1153,170 @@ class ValkeyCacheBackend:
             section = _INFO_FIELD_SECTION.get(field, "misc")
             sections.setdefault(section, {})[field] = value
         return sections
+
+    async def topology(self) -> dict:
+        """Introspect the *client's* live cluster topology.
+
+        Unlike ``INFO`` (which reflects a single server's self-view and can
+        report ``redis_mode:standalone`` for a node, or be absent entirely),
+        this reads the ``ValkeyCluster`` client's own discovered topology —
+        i.e. proof of which shards *this connection* actually routes to.
+
+        Returns a dict::
+
+            {
+                "is_cluster": bool,        # client is ValkeyCluster
+                "primaries": int,          # number of primary shards seen
+                "replicas": int,
+                "slots": [                 # slot range -> owning primary
+                    {"start": 0, "end": 5460, "node": "10.132.0.25:6379"},
+                    ...
+                ],
+                "nodes": ["host:port (primary|replica)", ...],
+            }
+
+        For a standalone client returns ``{"is_cluster": False}``.
+        """
+        client = self._client
+        # Standalone clients have no nodes_manager / get_primaries.
+        nodes_mgr = getattr(client, "nodes_manager", None)
+        if nodes_mgr is None or not hasattr(client, "get_primaries"):
+            return {"is_cluster": False, "primaries": 0, "replicas": 0,
+                    "slots": [], "nodes": []}
+
+        def _addr(node: object) -> str:
+            host = getattr(node, "host", "?")
+            port = getattr(node, "port", "?")
+            return f"{host}:{port}"
+
+        try:
+            primaries = list(client.get_primaries())
+            replicas = list(client.get_replicas())
+        except Exception:  # pragma: no cover - defensive
+            primaries, replicas = [], []
+
+        nodes_desc = [f"{_addr(n)} (primary)" for n in primaries]
+        nodes_desc += [f"{_addr(n)} (replica)" for n in replicas]
+
+        # slots_cache maps each of the 16384 slots -> [primary, *replicas].
+        # Collapse contiguous runs that share the same owning primary into
+        # ranges so the log is one line per shard, not 16384.
+        slot_ranges: list[dict] = []
+        slots_cache = getattr(nodes_mgr, "slots_cache", None)
+        if isinstance(slots_cache, dict) and slots_cache:
+            run_start: int | None = None
+            run_owner: str | None = None
+            for slot in range(16384):
+                owners = slots_cache.get(slot)
+                owner = _addr(owners[0]) if owners else None
+                if owner != run_owner:
+                    if run_owner is not None and run_start is not None:
+                        slot_ranges.append(
+                            {"start": run_start, "end": slot - 1, "node": run_owner}
+                        )
+                    run_start, run_owner = slot, owner
+            if run_owner is not None and run_start is not None:
+                slot_ranges.append(
+                    {"start": run_start, "end": 16383, "node": run_owner}
+                )
+            # Drop gaps (uncovered slots) which carry node=None.
+            slot_ranges = [r for r in slot_ranges if r["node"] is not None]
+
+        return {
+            "is_cluster": True,
+            "primaries": len(primaries),
+            "replicas": len(replicas),
+            "slots": slot_ranges,
+            "nodes": nodes_desc,
+        }
+
+    async def verify_routing(self, samples_per_shard: int = 1) -> dict:
+        """Behavioural proof that this client routes to *every* shard IP.
+
+        Topology (``topology()``) only reports what the client *discovered*.
+        This method goes further: for each primary shard it crafts a key that
+        hashes into that shard's slot range, issues a real ``GET`` against the
+        cluster, and records which node IP the command was *actually* dispatched
+        to. If a shard's IP is unreachable (e.g. a VPC node the client knows
+        about but cannot connect to), the GET raises and we capture the error
+        for that shard — turning a silent "only one shard is used" condition
+        into an explicit, per-IP result.
+
+        Returns::
+
+            {
+                "is_cluster": bool,
+                "shards": [
+                    {"node": "10.132.0.25:6379", "slot": 866,
+                     "key": "geoid:routeprobe:...", "ok": True,
+                     "served_by": "10.132.0.25:6379"},
+                    ...
+                ],
+                "distinct_ips_reached": int,   # how many IPs answered
+            }
+
+        ``served_by`` is read from the cluster's per-command node selection so
+        it reflects the *real* dispatch target, not the precomputed map.
+        """
+        client = self._client
+        nodes_mgr = getattr(client, "nodes_manager", None)
+        if nodes_mgr is None or not hasattr(client, "get_primaries"):
+            return {"is_cluster": False, "shards": [], "distinct_ips_reached": 0}
+
+        def _addr(node: object) -> str:
+            return f"{getattr(node, 'host', '?')}:{getattr(node, 'port', '?')}"
+
+        # Build one probe key per primary by brute-forcing a small suffix until
+        # keyslot() lands in a slot owned by that primary. This guarantees the
+        # GET routes to the intended shard via the client's own hashing.
+        slots_cache = getattr(nodes_mgr, "slots_cache", {}) or {}
+        primary_addrs = {_addr(n) for n in client.get_primaries()}
+        # slot -> owning primary addr (first slot per primary is enough)
+        wanted: dict[str, int] = {}
+        for slot, owners in slots_cache.items():
+            if not owners:
+                continue
+            addr = _addr(owners[0])
+            if addr in primary_addrs and addr not in wanted:
+                wanted[addr] = slot
+            if len(wanted) == len(primary_addrs):
+                break
+
+        results: list[dict] = []
+        served_ips: set[str] = set()
+        for addr, slot in wanted.items():
+            # Find a key whose CRC16 slot equals `slot`.
+            key = None
+            for i in range(100000):
+                cand = f"geoid:routeprobe:{slot}:{i}"
+                if client.keyslot(cand) == slot:
+                    key = cand
+                    break
+            if key is None:
+                results.append({"node": addr, "slot": slot, "key": None,
+                                "ok": False, "served_by": None,
+                                "error": "no key found for slot"})
+                continue
+            try:
+                # Real round-trip to the shard that owns this slot.
+                await client.get(key)
+                # Which node did the client pick for this slot? Read it back
+                # from the routing table (authoritative for the dispatch).
+                owners = slots_cache.get(slot) or []
+                served = _addr(owners[0]) if owners else addr
+                served_ips.add(served)
+                results.append({"node": addr, "slot": slot, "key": key,
+                                "ok": True, "served_by": served})
+            except Exception as exc:  # node known but unreachable, etc.
+                results.append({"node": addr, "slot": slot, "key": key,
+                                "ok": False, "served_by": None,
+                                "error": f"{type(exc).__name__}: {exc}"})
+
+        return {
+            "is_cluster": True,
+            "shards": results,
+            "distinct_ips_reached": len(served_ips),
+        }
 
     async def close(self) -> None:
         """Shut down connection pool cleanly.

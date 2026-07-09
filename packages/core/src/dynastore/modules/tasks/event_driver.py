@@ -413,7 +413,6 @@ class TaskEventDriver(ModuleProtocol):
         event_type: str,
         payload: Dict[str, Any],
         scope: str = "PLATFORM",
-        schema_name: Optional[str] = None,
         catalog_id: Optional[str] = None,
         collection_id: Optional[str] = None,
         identity_id: Optional[str] = None,
@@ -433,7 +432,6 @@ class TaskEventDriver(ModuleProtocol):
                 conn,
                 event_type=event_type,
                 scope=scope,
-                schema_name=schema_name,
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 identity_id=identity_id,
@@ -467,17 +465,23 @@ class TaskEventDriver(ModuleProtocol):
             clauses = []
             params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
+            # Events are stored by event_service.emit() with the call's keyword
+            # arguments nested under payload->'kwargs' (shape:
+            # {"args": [...], "kwargs": {"catalog_id": ..., "collection_id": ...}}).
+            # catalog_id/collection_id/identity_id therefore live at
+            # payload->'kwargs'->>'<key>', NOT at the top level, and catalog_id
+            # holds the catalog internal id (or NULL for platform-scoped events).
+            # Filtering on the nested kwargs key surfaces both platform-scoped
+            # lifecycle events (catalog_creation, catalog_id=NULL) and
+            # tenant-scoped events for the same catalog (#2256).
             if catalog_id and catalog_id != "_system_":
-                clauses.append("schema_name = :schema_name")
-                params["schema_name"] = catalog_id
-            # tasks.events has no dedicated collection_id / identity_id columns.
-            # Filter via the JSONB path so the collection-scoped events REST
-            # endpoint keeps returning only that collection's events.
+                clauses.append("payload->'kwargs'->>'catalog_id' = :catalog_id")
+                params["catalog_id"] = catalog_id
             if collection_id:
-                clauses.append("payload->>'collection_id' = :collection_id")
+                clauses.append("payload->'kwargs'->>'collection_id' = :collection_id")
                 params["collection_id"] = collection_id
             if identity_id:
-                clauses.append("payload->>'identity_id' = :identity_id")
+                clauses.append("payload->'kwargs'->>'identity_id' = :identity_id")
                 params["identity_id"] = identity_id
             if event_type:
                 clauses.append("event_type = :event_type")
@@ -485,7 +489,7 @@ class TaskEventDriver(ModuleProtocol):
 
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             sql = (
-                f"SELECT event_id::text as id, event_type, schema_name, "
+                f"SELECT event_id::text as id, event_type, catalog_id, "
                 f"scope, payload, created_at, status "
                 f"FROM {task_schema}.events {where} "
                 f"ORDER BY created_at DESC LIMIT :limit OFFSET :offset"

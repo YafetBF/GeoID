@@ -123,10 +123,18 @@ class IamCatalogScopedOwner(BaseResourceOwner):
                         result_handler=ResultHandler.ONE_OR_NONE,
                     ).execute(conn, tname=partition_table)
                     if exists:
-                        from dynastore.modules.db_config.query_executor import DDLQuery
-                        await DDLQuery(
-                            f'DROP TABLE IF EXISTS iam."{partition_table}";'
-                        ).execute(conn)
+                        # Bounded lock_timeout + retry on 55P03/40P01 instead
+                        # of a raw DROP TABLE — mirrors catalog_service's
+                        # catalog-schema drop (#2831).
+                        from dynastore.modules.db_config.locking_tools import (
+                            safe_drop_relation,
+                        )
+                        await safe_drop_relation(
+                            conn,
+                            schema=_IAM_SCHEMA,
+                            relation=partition_table,
+                            kind="table",
+                        )
                         logger.info(
                             "IamCatalogScopedOwner: dropped partition table iam.%r.",
                             partition_table,
@@ -137,6 +145,22 @@ class IamCatalogScopedOwner(BaseResourceOwner):
                         "for %r (non-fatal — rows already deleted): %s",
                         catalog_id, drop_exc,
                     )
+
+            # Every catalog-scoped grant that fed CatalogMembershipHandler
+            # (modules/iam/conditions.py) is now gone. get_membership_cached
+            # (extensions/iam/membership_cache.py) keys its 60s-TTL cache on
+            # iam_rule_version() — the platform "iam" binding-version counter
+            # — so without this bump a principal whose membership was cached
+            # before the delete keeps passing catalog_membership_required for
+            # up to the rest of that TTL window. Bump both counters, mirroring
+            # PostgresIamStorage._bump_binding_version /
+            # PostgresPolicyStorage._bump_binding_version — every other write
+            # to iam.policies / iam grants already does this; a catalog
+            # hard-delete removing those rows out from under the cache must
+            # too (#2674).
+            from dynastore.modules.iam.phantom_token import bump_binding_version
+            await bump_binding_version(catalog_id)
+            await bump_binding_version("iam")
 
             logger.info(
                 "IamCatalogScopedOwner: deleted iam.policies rows for partition_key=%r.",

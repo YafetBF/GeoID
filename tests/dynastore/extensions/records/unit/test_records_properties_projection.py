@@ -88,6 +88,18 @@ class _FakeCatalogs:
     async def get_collection_config(self, catalog_id, collection_id, ctx=None):
         return None
 
+    async def resolve_catalog_id(self, catalog_id, allow_missing=False):
+        return None
+
+    async def resolve_catalog_alias(self, catalog_id):
+        return None
+
+    async def resolve_collection_alias(self, catalog_internal_id, collection_id):
+        return None
+
+    async def get_catalog_model(self, catalog_internal_id):
+        return None
+
     async def stream_items(self, **kwargs):
         self.stream_called = True
         self.last_request = kwargs.get("request")
@@ -131,6 +143,13 @@ def _wire(monkeypatch, svc, catalogs):
     )
 
 
+async def _read_body(resp) -> bytes:
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+    return b"".join(chunks)
+
+
 def _call_get_records(svc, **overrides):
     kwargs = dict(
         request=_make_request(),
@@ -146,7 +165,9 @@ def _call_get_records(svc, **overrides):
         skip_geometry=None,
         return_geometry=None,
         sortby=None,
+        bbox=None,
         q=None,
+        request_hints=frozenset(),
     )
     kwargs.update(overrides)
     return svc.get_records(**kwargs)
@@ -164,7 +185,7 @@ async def test_records_properties_subset(monkeypatch):
     _wire(monkeypatch, svc, catalogs)
 
     resp = await _call_get_records(svc, properties="title,country")
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
     feat = body["features"][0]
     # Property set narrowed by the post-fetch projection.
     assert set(feat["properties"].keys()) == {"title", "country"}

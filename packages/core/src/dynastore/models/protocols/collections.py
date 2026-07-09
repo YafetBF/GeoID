@@ -30,6 +30,7 @@ from typing import (
     List,
     Dict,
     Set,
+    Tuple,
     Union,
     runtime_checkable,
     TYPE_CHECKING,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from dynastore.models.otf import SchemaEvolution, SchemaVersion, SnapshotInfo
     from dynastore.models.driver_context import DriverContext  # noqa: F401
     from dynastore.modules.storage.hints import Hint
+    from dynastore.models.resolved_ids import ResolvedCollectionIds
 
 
 @runtime_checkable
@@ -49,12 +51,76 @@ class CollectionsProtocol(Protocol):
     Protocol for collection management operations.
     """
 
+    async def resolve_collection_id(
+        self,
+        catalog_id: str,
+        external_id: str,
+        allow_missing: bool = False,
+    ) -> Optional[str]:
+        """
+        Resolves a public collection ``external_id`` to the immutable internal
+        collection id, scoped by the (already-internal) ``catalog_id``.
+
+        Returns ``None`` when no live collection in the catalog carries that
+        ``external_id``; with ``allow_missing=False`` callers treat that as
+        not-found.
+        """
+        ...
+
+    async def resolve_collection_external_id(
+        self,
+        catalog_id: str,
+        internal_id: str,
+        allow_missing: bool = True,
+    ) -> Optional[str]:
+        """
+        Resolves a collection's public ``external_id`` from its immutable
+        internal ``id``.  Used by the item read path to project stored
+        internal collection ids back to client-visible labels.
+
+        Returns ``None`` (default) or raises ``ValueError`` when the collection
+        is not found, depending on ``allow_missing``.
+        """
+        ...
+
+    async def resolve_collection_ids(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> "ResolvedCollectionIds":
+        """
+        Resolve a collection's IDs (internal + external) from either form.
+
+        Accepts either an external_id or an internal_id and returns both,
+        ensuring callers always have the immutable internal ID for persistence
+        operations.
+
+        Args:
+            catalog_id: The catalog ID (can be external or internal).
+            collection_id: The collection ID (can be external or internal).
+            allow_missing: If False (default), raises ValueError when not found.
+
+        Returns:
+            ResolvedCollectionIds with both id (internal) and external_id.
+
+        Raises:
+            ValueError: When the collection is not found and allow_missing=False.
+
+        This method is the canonical resolution point for config persistence
+        (Issue #2430) to ensure configs are keyed on immutable internal IDs.
+        """
+        ...
+
     async def get_collection(
         self,
         catalog_id: str,
         collection_id: str,
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
     ) -> Optional["Collection"]:
         """
         Retrieves a collection by ID.
@@ -119,9 +185,22 @@ class CollectionsProtocol(Protocol):
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
     ) -> List[Any]:
         """
         Lists all collections in a catalog.
+        """
+        ...
+
+    async def list_collection_id_pairs(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> List[Tuple[str, Optional[str]]]:
+        """
+        Lists (internal id, external_id) pairs for every active collection
+        in a catalog, without hydrating full collection models.
         """
         ...
 
@@ -300,3 +379,24 @@ class CollectionsProtocol(Protocol):
         Does NOT rewrite data — only updates metadata.
         """
         ...
+
+    # === Rename / Alias Operations ===
+
+    async def rename_collection(
+        self,
+        catalog_internal_id: str,
+        collection_internal_id: str,
+        new_external_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Tuple[str, str]:
+        """Rename a collection's public label (external_id) within a catalog.
+
+        Returns ``(prev_external_id, new_external_id)``.
+
+        Raises:
+            CollectionRenameConflictError: if another live collection in the
+                same catalog already holds ``external_id = new_external_id``.
+            ValueError: if no live collection row exists for the given internal ids.
+        """
+        ...
+

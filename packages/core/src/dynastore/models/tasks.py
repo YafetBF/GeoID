@@ -74,12 +74,13 @@ Tasks live in **one global PG table**, ``{DYNASTORE_TASK_SCHEMA}.tasks`` (defaul
 ``tasks.tasks``), provisioned once at ``TasksModule.lifespan``. Multi-tenancy is
 modelled via columns, not per-tenant tables:
 
-*   **Tenant / Catalog discriminator:** the ``schema_name`` column carries the
-    catalog's physical PG schema (e.g. ``s_2ka8fbc3``) for ``CATALOG``-scoped
-    tasks, ``"public"`` for ``PLATFORM`` tasks, and ``"system"`` for
-    cross-tenant platform tasks. Every CRUD path (``get_task``,
-    ``update_task``, ``claim_batch``) filters on **both** ``task_id`` AND
-    ``schema_name`` — a ``task_id`` alone is not tenant-safe.
+*   **Tenant / Catalog discriminator:** the ``catalog_id`` column carries the
+    catalog internal id (after identity collapse, equal to the physical PG
+    schema, e.g. ``s_2ka8fbc3``) for ``CATALOG``-scoped tasks, ``"platform"``
+    for ``PLATFORM`` tasks, and ``"system"`` for cross-tenant platform tasks.
+    Every CRUD path (``get_task``, ``update_task``, ``claim_batch``) filters
+    on **both** ``task_id`` AND ``catalog_id`` — a ``task_id`` alone is not
+    tenant-safe.
 *   **Collection scope:** the ``collection_id`` column carries the target
     STAC Collection id for collection-scoped work (ingestion, tile preseed/
     invalidation, exports). NULL when the task is catalog-wide.
@@ -88,14 +89,14 @@ modelled via columns, not per-tenant tables:
     ``"system:<reason>"`` sentinel for system-emitted tasks (e.g.
     ``"system:platform"``, ``"system:tile_cache_invalidation"``).
 *   **Dedup:** the partial unique index ``idx_tasks_dedup`` on
-    ``(schema_name, dedup_key, timestamp)`` for non-terminal rows guarantees
+    ``(catalog_id, dedup_key, timestamp)`` for non-terminal rows guarantees
     that two tenants sharing the same ``dedup_key`` do not collide. The
-    cross-partition dedup guard in ``enqueue()`` is also ``schema_name``-scoped.
+    cross-partition dedup guard in ``enqueue()`` is also ``catalog_id``-scoped.
 
 A single global dispatcher claims tasks across all tenants via ``FOR UPDATE
 SKIP LOCKED`` against the partial ``idx_tasks_queue`` index (filtered on
 ``status IN ('PENDING','ACTIVE')`` — the hot working set, never the full
-partition). Runners receive ``schema_name`` so they operate in the correct
+partition). Runners receive ``catalog_id`` so they operate in the correct
 tenant context.
 
 There is no per-catalog ``{tenant}.tasks`` table.
@@ -232,8 +233,8 @@ class TaskExecutionScope(str, Enum):
 
 class TaskScope(str, Enum):
     """Scope of a task within the platform."""
-    CATALOG = "CATALOG"      # Scoped to a catalog (schema_name = tenant schema)
-    SYSTEM = "SYSTEM"        # Platform-level (schema_name = 'system')
+    CATALOG = "CATALOG"      # Scoped to a catalog (catalog_id = tenant catalog internal id)
+    SYSTEM = "SYSTEM"        # Platform-level (catalog_id = 'system')
     ASSET = "ASSET"          # Scoped to an asset operation
 
 # --- Generic Payload Model ---
@@ -349,7 +350,7 @@ class Task(TaskBase):
     type: str = Field(default="task", description="Type of job: 'task' or 'process'")
 
     # Global table fields
-    schema_name: Optional[str] = Field(default=None, description="Tenant schema name (e.g. s_2ka8fbc3) or 'system'")
+    catalog_id: Optional[str] = Field(default=None, description="Catalog internal id (e.g. s_2ka8fbc3), or the reserved sentinels 'platform'/'system'")
     scope: str = Field(default=TaskScope.CATALOG, description="Task scope: CATALOG, SYSTEM, or ASSET")
     execution_mode: str = Field(default=TaskExecutionMode.ASYNCHRONOUS, description="SYNCHRONOUS or ASYNCHRONOUS")
     dedup_key: Optional[str] = Field(default=None, description="Deduplication key for event-driven task creation")
@@ -398,3 +399,236 @@ class Task(TaskBase):
     def task_id(self) -> UUID:
         """Backward compatibility alias for jobID."""
         return self.jobID
+
+
+# ---------------------------------------------------------------------------
+# Per-execution resource overrides
+# ---------------------------------------------------------------------------
+
+
+class TaskExecutionOverrides(BaseModel):
+    """Per-execution resource hints forwarded to the runner that handles the task.
+
+    All fields are optional (None → runner default).  Each runner applies the
+    subset it supports; unsupported fields are silently ignored with a debug log
+    so the same task spec works across Cloud Run, in-process, and queue runners.
+
+    Cloud Run mapping (``RunJobRequest.Overrides``):
+      - ``timeout_seconds`` → ``overrides.timeout`` (Duration proto)
+      - ``cpu`` / ``memory`` → NOT supported by ``RunJobRequest.Overrides`` in
+        the installed google-cloud-run client (``ContainerOverride`` exposes
+        only args/env/name/clear_args); stored for future client upgrades.
+
+    In-process runners (BackgroundRunner, SyncRunner):
+      - ``timeout_seconds`` → ``asyncio.wait_for`` deadline, taking priority
+        over the routing-config ``timeout_seconds`` when set.
+      - ``cpu`` / ``memory`` → ignored (logged at DEBUG).
+
+    ``max_retries``: applied by all spawn handlers (overrides SpawnTaskRequest.max_retries
+    when not None); not a Cloud Run Overrides-proto field.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "timeout_seconds": 28800,
+                    "cpu": "4",
+                    "memory": "16Gi",
+                    "max_retries": 0,
+                }
+            ]
+        }
+    )
+
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Wall-clock deadline in seconds for this execution. "
+            "For Cloud Run Jobs, sets RunJobRequest.Overrides.timeout and also "
+            "extends the dispatcher lease to match. "
+            "For in-process runners, applied as asyncio.wait_for timeout, "
+            "overriding the routing-config ceiling."
+        ),
+    )
+    cpu: Optional[str] = Field(
+        default=None,
+        description=(
+            "vCPU request for Cloud Run (e.g. '4'). "
+            "Stored for future client support; not applied by the current "
+            "google-cloud-run client (ContainerOverride has no resources field)."
+        ),
+    )
+    memory: Optional[str] = Field(
+        default=None,
+        description=(
+            "Memory request for Cloud Run (e.g. '16Gi'). "
+            "Stored for future client support; not applied by the current "
+            "google-cloud-run client (ContainerOverride has no resources field)."
+        ),
+    )
+    max_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Per-execution retry cap. When set, overrides SpawnTaskRequest.max_retries "
+            "in all spawn handlers (system, catalog, collection scope). "
+            "Not a Cloud Run Overrides-proto field — honored at task-creation time."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tasks API request / response DTOs
+# ---------------------------------------------------------------------------
+
+
+class SpawnTaskRequest(BaseModel):
+    """Request body for the generic task-spawn endpoints.
+
+    Scope identifiers (catalog_id, collection_id) are NEVER accepted in
+    the body — they are always derived from path parameters so the route
+    layer can enforce tenant isolation without trusting the caller.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "task_type": "catalog_provision",
+                    "inputs": {"operation": "provision", "force": False},
+                },
+            ]
+        }
+    )
+
+    task_type: str = Field(
+        ...,
+        description="Registered task type identifier (e.g. 'catalog_provision', "
+                    "'reindex'). Unknown task types are rejected with HTTP 404.",
+    )
+    inputs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Free-form inputs forwarded to the task runner. "
+                    "Path-derived ids (catalog_id, collection_id) are injected "
+                    "by the route layer and must NOT be included here.",
+    )
+    dedup_key: Optional[str] = Field(
+        default=None,
+        description="Optional idempotency token. If a non-terminal task with "
+                    "the same dedup_key and tenant already exists, the spawn "
+                    "returns the existing TaskRef instead of creating a duplicate.",
+    )
+    max_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Per-row retry budget override. When absent the platform "
+                    "default (column DEFAULT = 3) applies.",
+    )
+    execution_overrides: Optional[TaskExecutionOverrides] = Field(
+        default=None,
+        description=(
+            "Optional per-execution resource overrides (timeout, cpu, memory, "
+            "max_retries). Persisted alongside task inputs and forwarded to "
+            "whichever runner claims the row. Unsupported fields are silently "
+            "ignored by runners that cannot honour them."
+        ),
+    )
+
+
+class TaskRef(BaseModel):
+    """Lightweight reference returned (HTTP 202) after a successful spawn.
+
+    Callers poll ``status_url`` to track progress without needing to
+    reconstruct the scoped task URL themselves.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "task_id": "018f1a2b-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+                    "status": "PENDING",
+                    "status_url": "/task/catalogs/my-catalog/tasks/018f1a2b-3c4d-7e5f-8a9b-0c1d2e3f4a5b",
+                }
+            ]
+        }
+    )
+
+    task_id: UUID = Field(..., description="UUID of the newly created task row.")
+    status: str = Field(..., description="Initial status of the task (typically 'PENDING').")
+    status_url: str = Field(
+        ...,
+        description="Absolute or root-relative URL of the scoped get-by-id "
+                    "endpoint for this task. Callers poll this URL to observe "
+                    "status transitions.",
+    )
+
+
+class TaskPage(BaseModel):
+    """Paginated list of tasks.
+
+    ``next_cursor`` is an opaque keyset token.  Pass it as ``?cursor=`` on
+    the next request to retrieve the following page.  ``None`` means the
+    current page is the last one.
+    """
+
+    items: List[Task] = Field(default_factory=list)
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Keyset pagination token for the next page; None on the last page.",
+    )
+
+
+class LogEntry(BaseModel):
+    """A single remote-execution log line (vendor extension, not OGC core)."""
+
+    timestamp: datetime = Field(..., description="Log entry timestamp (UTC).")
+    severity: Optional[str] = Field(default=None, description="Log severity, e.g. 'INFO', 'ERROR' (runner-specific).")
+    message: str = Field(..., description="Log line text.")
+
+
+class LogPage(BaseModel):
+    """Best-effort page of remote execution logs for a job.
+
+    Vendor extension: ``GET /jobs/{id}/logs`` is a dynastore-specific surface,
+    not part of OGC API - Processes core. Always returns HTTP 200, even when
+    logs are unavailable — a missing IAM permission on the runner service
+    account, an unmapped/in-process owner, or a transient read failure all
+    degrade to an empty page with ``note`` explaining why, rather than a 404
+    or 500.
+    """
+
+    entries: List[LogEntry] = Field(default_factory=list)
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Opaque page token for the next page of logs; None on "
+                    "the last page or when logs are unavailable.",
+    )
+    note: Optional[str] = Field(
+        default=None,
+        description="Human-readable reason when logs are unavailable or "
+                    "incomplete (e.g. 'log access not granted').",
+    )
+    links: List[Link] = Field(
+        default_factory=list,
+        description="HATEOAS links (e.g. rel='next' for pagination). "
+                    "Vendor extension, not OGC core.",
+    )
+
+
+class RequeueResult(BaseModel):
+    """Result of a single dead-letter requeue operation."""
+
+    task_id: UUID = Field(..., description="UUID of the requeued task.")
+    requeued: bool = Field(
+        ...,
+        description="True when the task was found in a requeueable state "
+                    "(DEAD_LETTER or FAILED) and successfully reset to PENDING. "
+                    "False when the task was not found or was not in a requeueable state.",
+    )
+    detail: Optional[str] = Field(
+        default=None,
+        description="Human-readable explanation when requeued=False.",
+    )

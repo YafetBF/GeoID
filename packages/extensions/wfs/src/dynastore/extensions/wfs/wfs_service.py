@@ -21,9 +21,9 @@
 from dynastore.models.driver_context import DriverContext
 import logging
 import re
-from typing import Optional, cast
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, FastAPI
+from fastapi import APIRouter, Depends, Request, Response, FastAPI
 from sqlalchemy.ext.asyncio import AsyncConnection
 from contextlib import asynccontextmanager
 
@@ -32,6 +32,7 @@ from dynastore.modules.db_config.exceptions import TableNotFoundError, SchemaNot
 
 from dynastore.extensions.tools.db import get_async_connection
 from dynastore.models.protocols import ItemsProtocol
+from dynastore.models.query_builder import QueryResponse
 from . import wfs_generator, wfs_db
 from .wfs_models import WFSException
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -57,6 +58,87 @@ from dynastore.extensions.tools.query import parse_ogc_query_request, stream_ogc
 from dynastore.modules.storage.hints import EXACT_READ_HINTS
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# RFC 7946 GeoJSON Feature top-level member allowlist.
+# WFS GetFeature output must not carry any other foreign members.
+# Internal sidecar sections (system/stats/access) injected into
+# Feature.__pydantic_extra__ by _apply_expose_all_sections or the PG sidecar
+# bridge must be stripped before serialisation.
+# ---------------------------------------------------------------------------
+_WFS_GEOJSON_MEMBERS: frozenset = frozenset(
+    {"type", "id", "geometry", "properties", "bbox", "links"}
+)
+
+
+async def _strip_wfs_foreign_members(
+    items: AsyncIterator[Any],
+) -> AsyncGenerator[Any, None]:
+    """Remove non-RFC-7946 foreign members from each Feature before WFS output.
+
+    ``Feature`` uses ``extra="allow"`` so ``model_dump`` returns everything in
+    ``__pydantic_extra__``.  Internal sidecar sections (``system``, ``stats``,
+    ``access``, and any other implementation-detail key) are injected there and
+    must not appear as top-level GeoJSON Feature members on the WFS wire.
+    """
+    async for item in items:
+        extra = getattr(item, "__pydantic_extra__", None)
+        if extra:
+            for k in list(extra):
+                if k not in _WFS_GEOJSON_MEMBERS:
+                    del extra[k]
+        yield item
+
+
+async def _query_pg_or_es_fallback(
+    items_svc: Any,
+    catalog_id: str,
+    collection_id: str,
+    request_obj: Any,
+) -> QueryResponse:
+    """Call ``stream_items`` preferring PG; fall back to ES when PG schema absent.
+
+    WFS GetFeature passes ``EXACT_READ_HINTS`` so the PG driver (which
+    declares ``Hint.GEOMETRY_EXACT``) is tried first for full-precision
+    geometry.  When the PG schema has not been provisioned yet, the call
+    is retried without hints so the ES driver can serve from its index
+    (simplified geometry is better than an empty FeatureCollection).
+    Only when both drivers are unavailable is an empty result returned.
+    """
+    try:
+        return await items_svc.stream_items(
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            request=request_obj,
+            ctx=None,
+            hints=EXACT_READ_HINTS,
+        )
+    except (TableNotFoundError, SchemaNotFoundError):
+        pass
+
+    try:
+        return await items_svc.stream_items(
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            request=request_obj,
+            ctx=None,
+            hints=frozenset(),
+        )
+    except (TableNotFoundError, SchemaNotFoundError):
+        pass
+
+    async def _empty() -> AsyncIterator[Any]:
+        if False:
+            yield  # pragma: no cover
+
+    return QueryResponse(
+        items=_empty(),
+        total_count=0,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+        collection_config=None,
+    )
 
 
 def wfs_sortby_to_ogc(sort_by_str: Optional[str]) -> Optional[str]:
@@ -257,19 +339,41 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
 
     def _register_routes(self):
         """
-        Registers two distinct entry points to handle WFS requests:
+        Registers the WFS entry points:
         1. A root endpoint (`/wfs`) for service-wide discovery (GetCapabilities).
-        2. A scoped endpoint (`/wfs/{catalog_id}`) for operations within a specific catalog.
+        2. A scoped endpoint (`/wfs/catalogs/{catalog_id}`) for operations within a
+           specific catalog (OGC aligned path).
+        3. The legacy scoped endpoint (`/wfs/{catalog_id}`), kept for existing WFS
+           2.0 clients (QGIS/ArcGIS connections are typically saved by URL).
 
         This dual structure provides flexibility for different client behaviors.
         """
         if self.router is None:
             return
-        # The root endpoint is disabled to enforce catalog-scoped requests.
-        self.router.add_api_route("", self.handle_root_wfs_request, methods=["GET"])
-        self.router.add_api_route(
-            "/{catalog_id}", self.handle_scoped_wfs_request, methods=["GET"]
-        )
+        # (path, handler_name, methods, kwargs)
+        route_table = [
+            # The root endpoint is disabled to enforce catalog-scoped requests.
+            ("", "handle_root_wfs_request", ["GET"], {}),
+            (
+                "/catalogs/{catalog_id}",
+                "handle_scoped_wfs_request", ["GET"],
+                {"summary": "WFS 2.0 catalog-scoped operations (OGC aligned path)"},
+            ),
+            (
+                "/{catalog_id}",
+                "handle_scoped_wfs_request", ["GET"],
+                {
+                    "deprecated": True,
+                    "summary": (
+                        "WFS 2.0 catalog-scoped operations (deprecated). "
+                        "Use /wfs/catalogs/{catalog_id} instead."
+                    ),
+                },
+            ),
+        ]
+
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     async def _dispatch_request(
         self,
@@ -337,13 +441,12 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
     ):
-        """Handles requests scoped to a specific catalog, e.g., `/wfs/my_catalog`."""
+        """Handles requests scoped to a specific catalog, e.g., `/wfs/catalogs/my_catalog`
+        (or the deprecated `/wfs/my_catalog`)."""
         safe_catalog_id = catalog_id.replace(":", "_").replace("-", "_")
-        catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_catalog(safe_catalog_id, ctx=DriverContext(db_resource=conn)):
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{safe_catalog_id}' not found."
-            )
+        await self._resolve_catalog_or_404(
+            safe_catalog_id, ctx=DriverContext(db_resource=conn),
+        )
         return await self._dispatch_request(
             request,
             conn,
@@ -412,20 +515,22 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             # Root request: fetch all catalogs and their respective collections.
             catalogs = await catalogs_svc.list_catalogs(limit=1000, ctx=DriverContext(db_resource=conn))
             for catalog in catalogs:
+                _cat_internal_id = catalog.id
+                _cat_external_id = getattr(catalog, "external_id", None) or catalog.id
                 all_collections_summary = await catalogs_svc.list_collections(
-                    catalog.id, limit=1000, ctx=DriverContext(db_resource=conn)
+                    _cat_internal_id, limit=1000, ctx=DriverContext(db_resource=conn)
                 )
                 vector_collections = []
                 for c_summary in all_collections_summary:
-                    if await _is_vector(catalog.id, c_summary.id):
+                    if await _is_vector(_cat_internal_id, c_summary.id):
                         full_collection_details = await catalogs_svc.get_collection(
-                            catalog.id, c_summary.id, ctx=DriverContext(db_resource=conn)
+                            _cat_internal_id, c_summary.id, ctx=DriverContext(db_resource=conn)
                         )
                         if full_collection_details:
                             localized, _ = full_collection_details.localize(language)
                             vector_collections.append(localized)
                 if vector_collections:
-                    catalogs_with_collections[catalog.id] = vector_collections
+                    catalogs_with_collections[_cat_external_id] = vector_collections
 
         # The generator already handles localization based on the localized dictionaries passed.
         xml_content = wfs_generator.create_capabilities_response(
@@ -649,36 +754,17 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             )
 
         try:
-            query_response = await items_svc.stream_items(
+            # Prefer PG (EXACT_READ_HINTS / Hint.GEOMETRY_EXACT); fall back to
+            # ES (empty hints) when the PG schema has not been provisioned yet.
+            query_response = await _query_pg_or_es_fallback(
+                items_svc=items_svc,
                 catalog_id=schema_prefix,
                 collection_id=collection_id,
-                request=request_obj,
-                # Decouple from request connection to allow background streaming
-                # without premature closure errors.
-                ctx=None,
-                # WFS GetFeature must return exact, full-precision geometry.
-                # EXACT_READ_HINTS routes past any simplified-geometry ES driver
-                # to whichever driver declares Hint.GEOMETRY_EXACT.
-                hints=EXACT_READ_HINTS,
+                request_obj=request_obj,
             )
         except ValueError as e:
             xml = wfs_generator.create_exception_report("InvalidParameterValue", None, str(e))
             return Response(content=xml, media_type="application/xml", status_code=400)
-        except (TableNotFoundError, SchemaNotFoundError):
-            # Physical hub table/schema has not been materialized yet (lazy creation
-            # on first write). Return an empty FeatureCollection in the requested
-            # format rather than a 500.
-            from dynastore.models.query_builder import QueryResponse
-            async def _empty():
-                if False:
-                    yield  # pragma: no cover
-            query_response = QueryResponse(
-                items=_empty(),
-                total_count=0,
-                catalog_id=schema_prefix,
-                collection_id=collection_id,
-                collection_config=None,
-            )
 
         total_count = query_response.total_count or 0
 
@@ -697,20 +783,15 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             number_returned = len(features_list)
 
             # Pagination links for GML Response
-            base_url = str(request.url).split("?")[0]
-            original_params = dict(request.query_params)
-            
-            previous_url = None
-            if start_index > 0:
-                prev_params = original_params.copy()
-                prev_params["startIndex"] = str(max(0, start_index - count))
-                previous_url = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in prev_params.items()])}"
+            from dynastore.extensions.tools.pagination import build_pagination_links
 
-            next_url = None
-            if (start_index + number_returned) < total_count:
-                next_params = original_params.copy()
-                next_params["startIndex"] = str(start_index + count)
-                next_url = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in next_params.items()])}"
+            gml_page_links = dict(
+                build_pagination_links(
+                    request, start_index, count, total_count, offset_param="startIndex", raw=True
+                )
+            )
+            previous_url = gml_page_links.get("prev")
+            next_url = gml_page_links.get("next")
 
             xml_content = wfs_generator.create_feature_collection_response(
                 features_list,
@@ -725,29 +806,26 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             return Response(content=xml_content, media_type="application/gml+xml; version=3.2")
 
         # Pagination links for OGC formats
-        base_url = str(request.url).split("?")[0]
-        original_params = dict(request.query_params)
-        
-        links = []
-        if start_index > 0:
-            prev_params = original_params.copy()
-            prev_params["startIndex"] = str(max(0, start_index - count))
-            links.append(Link(
-                rel="prev",
-                href=f"{base_url}?{'&'.join([f'{k}={v}' for k, v in prev_params.items()])}",
-                type=normalized_format,
-                title=LocalizedText(en="Previous page"),
-            ))
+        from dynastore.extensions.tools.pagination import build_pagination_links
 
-        if (start_index + count) < total_count:
-            next_params = original_params.copy()
-            next_params["startIndex"] = str(start_index + count)
-            links.append(Link(
-                rel="next",
-                href=f"{base_url}?{'&'.join([f'{k}={v}' for k, v in next_params.items()])}",
+        _rel_titles = {"prev": "Previous page", "next": "Next page"}
+        links = [
+            Link(
+                rel=rel,
+                href=href,
                 type=normalized_format,
-                title=LocalizedText(en="Next page"),
-            ))
+                title=LocalizedText(en=_rel_titles[rel]),
+            )
+            for rel, href in build_pagination_links(
+                request, start_index, count, total_count, offset_param="startIndex", raw=True
+            )
+        ]
+
+        # Strip non-RFC-7946 foreign members (system/stats/access/...) that
+        # internal sidecar paths inject into Feature.__pydantic_extra__.
+        # Only the standard GeoJSON Feature members listed in _WFS_GEOJSON_MEMBERS
+        # must appear on the WFS wire.
+        query_response.items = _strip_wfs_foreign_members(query_response.items)
 
         return stream_ogc_features(
             request=request,

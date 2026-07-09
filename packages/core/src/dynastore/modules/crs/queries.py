@@ -25,9 +25,11 @@ from dynastore.modules.db_config.query_executor import DQLQuery, DDLQuery, Resul
 CREATE_CUSTOM_CRS_TABLE = DDLQuery(
     """
     CREATE TABLE IF NOT EXISTS crs.crs_definitions (
-        catalog_id VARCHAR NOT NULL, 
-        crs_uri VARCHAR NOT NULL,    
-        definition JSONB NOT NULL,   
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
+        -- Partitioned on this value so rows survive catalog renames transparently.
+        catalog_id VARCHAR NOT NULL,
+        crs_uri VARCHAR NOT NULL,
+        definition JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (catalog_id, crs_uri)
     ) PARTITION BY LIST (catalog_id);
@@ -82,21 +84,21 @@ get_custom_crs_by_name_query = DQLQuery(
     result_handler=ResultHandler.ONE_OR_NONE
 )
 
-# List all CRS for a catalog
-list_custom_crs_query = DQLQuery(
-    """
-    SELECT * FROM crs.crs_definitions 
-    WHERE catalog_id = :catalog_id 
-    ORDER BY created_at DESC 
+# List all CRS for a catalog. Paged via list_page_with_count (modules/db_config/
+# shared_queries.py) — the COUNT(*) OVER() window is merged into the page query
+# so the caller gets the total match count in the same round trip.
+LIST_CUSTOM_CRS_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, *
+    FROM crs.crs_definitions
+    WHERE catalog_id = :catalog_id
+    ORDER BY created_at DESC
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS
-)
+    """
 
 # Search functionality: Looks inside the JSONB structure for matches in 'name', 'description', or 'scope'
-search_custom_crs_query = DQLQuery(
-    """
-    SELECT * FROM crs.crs_definitions
+SEARCH_CUSTOM_CRS_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, *
+    FROM crs.crs_definitions
     WHERE
         catalog_id = :catalog_id AND (
             definition->>'name' ILIKE :search_term OR
@@ -105,6 +107,4 @@ search_custom_crs_query = DQLQuery(
         )
     ORDER BY created_at DESC
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS
-)
+    """

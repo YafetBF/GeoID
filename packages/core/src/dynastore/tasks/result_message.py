@@ -143,6 +143,42 @@ def with_message(data: Dict[str, Any], message: str) -> Dict[str, Any]:
     return out
 
 
+def reference_result(
+    output_id: str,
+    href: str,
+    *,
+    media_type: str,
+    message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Task ``outputs`` for a single file artifact delivered *by reference*.
+
+    Produces an OGC API - Processes results-document entry: a map keyed by the
+    process's declared output id whose value is a ``Link``-shaped qualified
+    value (``href`` + media ``type``), as required by Part 1 §7.13
+    (``/req/core/job-results-success``, schema ``results.yaml``) for an output
+    transmitted with ``transmissionMode: reference``.
+
+    The standard human-facing ``message`` is carried alongside (defaulting to
+    the artifact ``href``) so :func:`task_to_status_info` still populates the
+    job *status* document.
+
+    Note: ``message`` also lands in ``task.outputs`` alongside the declared
+    output, and the results handler (``_handle_job_results`` in the processes
+    extension) returns it verbatim by default. For the frozen ``dwh_join``
+    customer contract this is intentional — the released integration reads
+    ``message``, and the conformant ``result`` link was added additively beside
+    it. A strict OGC API - Processes §7.13 results document would carry only
+    declared output ids; the results handler projects ``message`` out for
+    processes that opt in (new, non-frozen processes — see
+    ``_STRICT_RESULTS_PROCESSES`` there) rather than changing this helper's
+    output for everyone.
+    """
+    return {
+        "message": message or href,
+        output_id: {"href": href, "type": media_type},
+    }
+
+
 # --------------------------------------------------------------------------- #
 # File-producing exports — server-owned storage + signed URL by reference.
 # --------------------------------------------------------------------------- #

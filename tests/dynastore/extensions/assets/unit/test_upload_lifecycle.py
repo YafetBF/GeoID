@@ -35,6 +35,8 @@ real PG end-to-end is deferred until the docker test-runner fixture lands
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -141,6 +143,11 @@ def patched_env(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
     #    the protocols dict.
     catalogs_proto = AsyncMock()
     catalogs_proto.resolve_physical_schema = AsyncMock(return_value="ds_test")
+    # resolve_catalog_id / resolve_collection_id return None so the resolution
+    # block treats the incoming ids as already internal and leaves them unchanged.
+    catalogs_proto.resolve_catalog_id = AsyncMock(return_value=None)
+    catalogs_proto.collections = AsyncMock()
+    catalogs_proto.collections.resolve_collection_id = AsyncMock(return_value=None)
     configs_proto = AsyncMock()
     configs_proto.get_config = AsyncMock(return_value=AssetsWritePolicy())
 
@@ -464,6 +471,79 @@ async def test_url_mint_http_exception_also_triggers_rollback(
         )
     assert exc_info.value.status_code == 503
     patched_env["rollback"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_url_mint_cancellation_rolls_back_pending_row(
+    patched_env: Dict[str, Any],
+) -> None:
+    """asyncio.CancelledError (a BaseException, not Exception) must still
+    trigger the compensating soft-delete so the PENDING row is not orphaned
+    when a client/gateway ingress timeout cancels the handler mid-mint.
+
+    Note: raising CancelledError as a side_effect (rather than task.cancel())
+    drives the handler's except branch without putting the task into a
+    cancelling state, so it asserts the rollback is reached — not the
+    shield's drain-under-re-cancellation behaviour.
+    """
+    svc = _make_service()
+    driver = AsyncMock()
+    driver.initiate_upload = AsyncMock(side_effect=asyncio.CancelledError())
+    svc.resolve_upload_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await svc._initiate_upload_with_policy(
+            catalog_id="cat",
+            collection_id="col",
+            body=_make_upload_request(),
+        )
+
+    # The PENDING row must be cleaned up despite the cancellation.
+    patched_env["rollback"].assert_awaited_once()
+    # signature: (engine, scope, asset_id) — asset_id is the third positional arg
+    assert patched_env["rollback"].await_args.args[2] == "asset-1"
+    # Ticket was never stamped because minting failed.
+    patched_env["stamp"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_url_mint_cancellation_logs_warning(
+    patched_env: Dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A warning must be emitted when CancelledError interrupts the URL mint.
+
+    The log line must appear BEFORE the shielded rollback so operators can
+    correlate the compensation attempt with its trigger even when the rollback
+    itself is still in-flight.
+    """
+    svc = _make_service()
+    driver = AsyncMock()
+    driver.initiate_upload = AsyncMock(side_effect=asyncio.CancelledError())
+    svc.resolve_upload_driver = AsyncMock(return_value=driver)  # type: ignore[method-assign]
+
+    assets_service_logger = "dynastore.extensions.assets.assets_service"
+    with caplog.at_level(logging.WARNING, logger=assets_service_logger):
+        with pytest.raises(asyncio.CancelledError):
+            await svc._initiate_upload_with_policy(
+                catalog_id="cat",
+                collection_id="col",
+                body=_make_upload_request(asset_id="asset-1"),
+            )
+
+    # A WARNING record containing both the asset id and "cancelled" must exist.
+    matching = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "asset-1" in r.getMessage()
+        and "cancel" in r.getMessage().lower()
+    ]
+    assert matching, (
+        "Expected a WARNING log containing 'asset-1' and 'cancel' in the "
+        "CancelledError branch, but got: "
+        + str([r.getMessage() for r in caplog.records])
+    )
 
 
 # ---------------------------------------------------------------------------

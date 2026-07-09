@@ -126,12 +126,22 @@ def instantiate_extensions(app: Any, include_only: Optional[List[str]] = None):
             if name.lower().replace("_", "-") in target_names
         ]
     
-    # Sort extensions by priority if defined
-    def get_priority(name):
+    # Sort by (priority, name) so ties (e.g. Web and IamExtension both at
+    # priority 100) resolve deterministically instead of falling back to
+    # entry-point discovery order, which varies with installed-distribution
+    # order. Mirrors the tiebreak in modules/__init__.py's instantiation sort.
+    #
+    # Direction note: ASCENDING — lower priority instantiates first, same
+    # convention as modules/__init__.py's _get_ordered_modules. This is the
+    # opposite direction from modules/presets/cold_boot.py's
+    # ColdBootContributor.priority, which is DESCENDING (higher runs first).
+    # Same field name, opposite meaning — don't assume one from the other.
+    def _sort_key(name: str) -> tuple[int, str]:
         config = _DYNASTORE_EXTENSIONS.get(name)
-        return getattr(config.cls, "priority", 0) if config else 0
-    
-    extensions_to_load = sorted(extensions_to_load, key=get_priority)
+        priority = getattr(config.cls, "priority", 0) if config else 0
+        return (priority, name)
+
+    extensions_to_load = sorted(extensions_to_load, key=_sort_key)
 
     logger.info(f"Attempting to instantiate enabled extension modules: {list(extensions_to_load)}")
     ordered_configs = []
@@ -176,14 +186,3 @@ def instantiate_extensions(app: Any, include_only: Optional[List[str]] = None):
     if hasattr(app, "state"):
         app.state.ordered_configs = ordered_configs
         logger.info(f"Attached {len(ordered_configs)} ordered extension configs to app.state")
-
-def apply_app_configurations(app: Any):
-    """
-    Applies configurations to the FastAPI app for all successfully instantiated extensions.
-    """
-    for extension_name, config in _DYNASTORE_EXTENSIONS.items():
-        if config.instance:
-            try:
-                config.instance.configure_app(app)
-            except Exception:
-                logger.error(f"Failed to configure app for extension '{extension_name}'", exc_info=True)

@@ -90,10 +90,21 @@ def _render_default_style(
 
         temp_fill_source.Destroy()
 
-        # Collect the boundary for the batched stroke pass
-        boundary = geom.GetBoundary()
-        if boundary and not boundary.IsEmpty():
-            all_boundaries.append(boundary)
+        # Collect the stroke geometry for the batched stroke pass.
+        #
+        # For (multi)polygons the stroke is the ring boundary. For
+        # (multi)line geometries — road/river/network layers — the line IS
+        # the drawable feature: ``GetBoundary()`` on a LineString returns only
+        # its endpoints (a MultiPoint), so the fill pass (no area) plus a
+        # point-boundary stroke pass would render the whole layer invisible
+        # (blank/white tiles). Use the geometry itself as the stroke for lines.
+        flat_type = ogr.GT_Flatten(geom.GetGeometryType())
+        if flat_type in (ogr.wkbLineString, ogr.wkbMultiLineString):
+            stroke_geom = geom
+        else:
+            stroke_geom = geom.GetBoundary()
+        if stroke_geom and not stroke_geom.IsEmpty():
+            all_boundaries.append(stroke_geom)
 
     # Pass 2: Render all strokes at once for performance
     if all_boundaries:
@@ -360,10 +371,18 @@ def _render_custom_style(
             )
             ogr_layer.ResetReading()
             for feature in ogr_layer:
-                boundary = feature.GetGeometryRef().GetBoundary()
-                if boundary:
+                geom = feature.GetGeometryRef()
+                # Lines are drawn as themselves; only polygons stroke their
+                # ring boundary. GetBoundary() on a LineString yields just its
+                # endpoints, which would leave line/network layers invisible.
+                flat_type = ogr.GT_Flatten(geom.GetGeometryType())
+                if flat_type in (ogr.wkbLineString, ogr.wkbMultiLineString):
+                    stroke_geom = geom
+                else:
+                    stroke_geom = geom.GetBoundary()
+                if stroke_geom and not stroke_geom.IsEmpty():
                     stroke_feature = ogr.Feature(stroke_layer.GetLayerDefn())
-                    stroke_feature.SetGeometry(boundary)
+                    stroke_feature.SetGeometry(stroke_geom)
                     stroke_layer.CreateFeature(stroke_feature)
 
             gdal.RasterizeLayer(
@@ -377,6 +396,68 @@ def _render_custom_style(
 # --- Main Entry Point ---
 
 
+def _reproject_bbox(
+    bbox: List[float],
+    bbox_srid: int,
+    target_srs: "osr.SpatialReference",
+    gdal_major_version: int,
+) -> List[float]:
+    """Reproject an axis-aligned ``[minx, miny, maxx, maxy]`` bbox into the
+    render CRS ``target_srs``.
+
+    Returns the bbox unchanged when the source and target CRS are the same.
+    Otherwise the four corners are transformed and the min/max taken so the
+    result stays axis-aligned (sufficient for Web-Mercator/UTM-style render
+    CRSs used here).
+    """
+    source_srs = osr.SpatialReference()
+    source_srs.ImportFromEPSG(int(bbox_srid))
+    if gdal_major_version >= 3:
+        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    if source_srs.IsSame(target_srs):
+        return bbox
+
+    transform = osr.CoordinateTransformation(source_srs, target_srs)
+    corners = (
+        (bbox[0], bbox[1]),
+        (bbox[0], bbox[3]),
+        (bbox[2], bbox[1]),
+        (bbox[2], bbox[3]),
+    )
+    xs: List[float] = []
+    ys: List[float] = []
+    for x, y in corners:
+        tx, ty, *_ = transform.TransformPoint(x, y)
+        xs.append(tx)
+        ys.append(ty)
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def reproject_bbox_epsg(
+    bbox: List[float], src_epsg: int, dst_epsg: int
+) -> Optional[List[float]]:
+    """Reproject an axis-aligned bbox between EPSG codes, failing closed.
+
+    Thin public wrapper around ``_reproject_bbox`` for callers that only have
+    EPSG codes on hand rather than a resolved ``osr.SpatialReference`` (e.g.
+    the MVT cache fast path). Unlike ``_reproject_bbox``, this never raises:
+    an unresolvable EPSG code (or any other CRS failure) yields ``None``
+    instead of propagating a GDAL/OGR exception, since callers use this to
+    gate a best-effort accelerator that must fall back cleanly.
+    """
+    try:
+        if int(src_epsg) == int(dst_epsg):
+            return list(bbox)
+        gdal_major_version = int(gdal_version.split(".")[0])
+        target_srs = osr.SpatialReference()
+        target_srs.ImportFromEPSG(int(dst_epsg))
+        if gdal_major_version >= 3:
+            target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        return _reproject_bbox(bbox, src_epsg, target_srs, gdal_major_version)
+    except Exception:
+        return None
+
+
 def render_map_image(
     width: int,
     height: int,
@@ -387,6 +468,7 @@ def render_map_image(
     style_record: Optional[Any],
     transparent: bool = True,
     bgcolor: Optional[str] = None,
+    bbox_srid: int = 4326,
 ) -> bytes:
     gdal_major_version = int(gdal_version.split(".")[0])
 
@@ -400,13 +482,22 @@ def render_map_image(
         target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     mem_dataset.SetProjection(target_srs.ExportToWkt())
 
+    # The geotransform describes the raster window in the *render* CRS, and the
+    # geometry below is reprojected into that same CRS. The request bbox is
+    # expressed in ``bbox_srid`` (defaults to CRS84), which need not match the
+    # render CRS — so reproject the bbox into the render CRS first. Without this,
+    # e.g. a CRS84 (degree) bbox with a default EPSG:3857 (metre) render CRS
+    # produces a metres-sized window near Null Island and every feature lands
+    # off-canvas, yielding a fully transparent image.
+    render_bbox = _reproject_bbox(bbox, bbox_srid, target_srs, gdal_major_version)
+
     geotransform = (
-        bbox[0],
-        (bbox[2] - bbox[0]) / width,
+        render_bbox[0],
+        (render_bbox[2] - render_bbox[0]) / width,
         0,
-        bbox[3],
+        render_bbox[3],
         0,
-        (bbox[1] - bbox[3]) / height,
+        (render_bbox[1] - render_bbox[3]) / height,
     )
     mem_dataset.SetGeoTransform(geotransform)
 

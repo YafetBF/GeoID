@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -56,6 +57,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Coroutine,
     Dict,
     List,
     Optional,
@@ -408,6 +410,311 @@ class LocalAsyncCacheBackend:
 
 
 # ---------------------------------------------------------------------------
+#  Cache version envelope
+# ---------------------------------------------------------------------------
+
+# Field names chosen to be short and collision-resistant.  Real cached
+# values are Python dicts/models from config services; having both "__v"
+# AND "__d" at the top level of a user value is astronomically unlikely.
+_EV_VER = "__v"   # monotonic version key  (int, time.time_ns())
+_EV_DATA = "__d"  # payload key            (any serialisable value)
+_EV_TOMB = "__t"  # tombstone flag key     (bool True; no __d present)
+
+
+def _ev_wrap(value: Any, ver: int) -> Dict[str, Any]:
+    """Wrap ``value`` in a version envelope for tiered storage."""
+    return {_EV_VER: ver, _EV_DATA: value}
+
+
+def _ev_tombstone(ver: int) -> Dict[str, Any]:
+    """Create a tombstone envelope (marks a deleted key)."""
+    return {_EV_VER: ver, _EV_TOMB: True}
+
+
+# CacheBackend.set() is typed `value: bytes` ("Backends store raw bytes;
+# the Cache wrapper handles serialization" — see models/protocols/cache.py).
+# TieredAsyncBackend stores version envelopes (plain dicts) directly and
+# relies on its backends being object-passthrough (NullSerializer) tiers —
+# same runtime contract LocalCache uses via `self._serializer.dumps()`.
+# Routing envelopes through NullSerializer.dumps() here is a no-op at
+# runtime (it returns the value unchanged) but gives pyright a `bytes`-typed
+# value at the `CacheBackend.set()` call sites, matching that convention
+# without changing the CacheBackend interface or backend behavior.
+_ENVELOPE_SERIALIZER = NullSerializer()
+
+
+def _ev_parse(data: Any) -> "tuple[int, Any, bool]":
+    """Parse a stored value.
+
+    Returns ``(ver, value, is_tombstone)``:
+
+    - Normal envelope  → ``(ver, value, False)``
+    - Tombstone        → ``(ver, None, True)``
+    - Legacy raw value → ``(0, data, False)`` — treated as ver 0 so any
+      new envelope write out-versions it during rolling deployment.
+    """
+    if isinstance(data, dict) and _EV_VER in data:
+        ver = int(data[_EV_VER])
+        if _EV_TOMB in data:
+            return ver, None, True
+        return ver, data.get(_EV_DATA), False
+    # Legacy (pre-envelope) entry — ver=0 is out-versioned by any new write.
+    return 0, data, False
+
+
+# ---------------------------------------------------------------------------
+#  Stale-serving envelope (#2902)
+# ---------------------------------------------------------------------------
+
+# A cache entry is kept physically alive past its logical TTL by a grace
+# window, so a slow or failing rebuild (DB pool starvation, downstream
+# outage) can serve the last-known-good value instead of every queued
+# waiter riding an unbounded factory() call to the caller's own gateway
+# timeout. This wrapper is independent of the L1/L2 version envelope above
+# (``_ev_wrap``/``_ev_parse`` — tiered-backend concurrency): it operates one
+# layer up, on the value ``LocalCache.get_or_set`` and the ``@cached``
+# decorator hand to whichever backend is resolved (local or tiered), so it
+# behaves the same regardless of backend type.
+
+DEFAULT_STALE_GRACE_SECONDS: float = 300.0
+_DEFAULT_SLOW_PATH_TIMEOUT_SECONDS: float = 30.0
+
+_STALE_AT = "__sat"    # wall-clock write time (time.time())
+_STALE_TTL = "__sttl"  # logical ttl (seconds) in effect at write time
+_STALE_VAL = "__sval"  # payload
+
+_NO_STALE: Any = object()  # sentinel: "no stale value available for fallback"
+
+
+def _stale_wrap(value: Any, ttl: float) -> Dict[str, Any]:
+    """Wrap ``value`` with its write time + logical ttl for stale-grace tracking."""
+    return {_STALE_AT: time.time(), _STALE_TTL: ttl, _STALE_VAL: value}
+
+
+def _stale_unwrap(raw: Any) -> "tuple[Any, bool]":
+    """Unwrap a stale-tracked entry -> ``(value, is_stale)``.
+
+    Entries not produced by ``_stale_wrap`` (grace disabled at write time)
+    are returned as-is and are never considered stale.
+    """
+    if not (
+        isinstance(raw, dict)
+        and _STALE_AT in raw
+        and _STALE_TTL in raw
+        and _STALE_VAL in raw
+    ):
+        return raw, False
+    age = time.time() - float(raw[_STALE_AT])
+    return raw[_STALE_VAL], age > float(raw[_STALE_TTL])
+
+
+# The config read below goes through the config service, whose loads are
+# themselves ``@cached`` — so a cache miss on the config entry would re-enter
+# the slow path and call back into this loader, recursing until Python's
+# stack limit ("maximum recursion depth exceeded" storms on boot). The
+# ContextVar breaks that same-task re-entrancy; the memo keeps the value off
+# the per-miss hot path (and off the config service entirely between
+# refreshes).
+_SLOW_PATH_TIMEOUT_REFRESH_SECONDS: float = 60.0
+_DEFAULT_MAX_CONCURRENT_REBUILDS: int = 4
+_slow_path_timeout_value: float = _DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+_max_concurrent_rebuilds_value: int = _DEFAULT_MAX_CONCURRENT_REBUILDS
+_slow_path_timeout_checked_at: float = 0.0  # time.monotonic(); 0 = never
+_slow_path_timeout_loading: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "cache_slow_path_timeout_loading", default=False
+)
+
+
+async def _load_cache_plugin_config_values() -> None:
+    """Refresh the memoized ``CachePluginConfig`` values used on the cache
+    slow path: ``slow_path_timeout_seconds`` and
+    ``max_concurrent_detached_rebuilds``.
+
+    Both fields live on the same config row, so they share one fetch, one
+    re-entrancy guard, and one refresh interval — see
+    :func:`_load_slow_path_timeout` for why the guard exists.
+    """
+    global _slow_path_timeout_value, _max_concurrent_rebuilds_value
+    global _slow_path_timeout_checked_at
+
+    if _slow_path_timeout_loading.get():
+        # Re-entered from the @cached config load this function triggered:
+        # answering with the memo/default is what terminates the recursion.
+        return
+
+    now = time.monotonic()
+    if (
+        _slow_path_timeout_checked_at
+        and now - _slow_path_timeout_checked_at < _SLOW_PATH_TIMEOUT_REFRESH_SECONDS
+    ):
+        return
+
+    token = _slow_path_timeout_loading.set(True)
+    try:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        configs_proto = get_protocol(ConfigsProtocol)
+        if configs_proto is not None:
+            cfg = await configs_proto.get_config(CachePluginConfig)
+            if cfg is not None:
+                _slow_path_timeout_value = cfg.slow_path_timeout_seconds
+                _max_concurrent_rebuilds_value = cfg.max_concurrent_detached_rebuilds
+    except Exception as e:
+        logger.debug(
+            "cache: CachePluginConfig load failed (%s), using cached/default values", e
+        )
+    finally:
+        _slow_path_timeout_loading.reset(token)
+        # Stamp even on failure so a broken config path is retried once per
+        # refresh window, not hammered on every cache miss.
+        _slow_path_timeout_checked_at = now
+
+
+async def _load_slow_path_timeout() -> float:
+    """Load ``slow_path_timeout_seconds`` from ``CachePluginConfig``.
+
+    Bounds lock-wait + factory time on the ``get_or_set``/``@cached`` slow
+    path. Falls back to the last-known value (default 30s) when the memoized
+    value is still fresh or ``ConfigsProtocol`` is unavailable / the config
+    load fails — mirrors
+    ``modules/tasks/dispatcher.py::_load_oracle_inner_timeout``.
+    """
+    await _load_cache_plugin_config_values()
+    return _slow_path_timeout_value
+
+
+async def _load_max_concurrent_rebuilds() -> int:
+    """Load ``max_concurrent_detached_rebuilds`` from ``CachePluginConfig``.
+
+    Bounds how many detached cache-rebuild tasks (see
+    :func:`_await_shared_rebuild`) may run concurrently across the process.
+    Falls back to the last-known value (default 4) on the same terms as
+    :func:`_load_slow_path_timeout`.
+    """
+    await _load_cache_plugin_config_values()
+    return _max_concurrent_rebuilds_value
+
+
+# In-flight rebuild tasks, one per cache key. A rebuild runs as its OWN task,
+# shared by every concurrent miss on that key, and always runs to completion:
+# cancelling in-flight DB work mid-query leaves the asyncpg connection's
+# protocol state machine stuck ("cannot switch to state N; another operation
+# is in progress") and poisons the pool (#2900). The original slow-path
+# ``asyncio.timeout`` did exactly that — it cancelled ``factory()`` at the
+# budget, and every client disconnect did the same to the request's factory —
+# so under post-deploy cold-cache load each 30s rebuild cancellation seeded a
+# fresh poisoned connection (the 06:29Z state-11 storm). Callers now wait on
+# the shared task via ``wait_for(shield(task))``: a caller that gives up
+# (budget below, client disconnect) stops WAITING, while the rebuild finishes
+# and writes the cache for whoever comes next.
+_inflight_rebuilds: Dict[str, "asyncio.Task[Any]"] = {}
+
+# Process-wide cap on concurrent detached rebuild tasks (#2902): a CPU-
+# throttling storm can turn dozens of simultaneous cache misses (each its own
+# key) into dozens of detached tasks all racing for the same small DB pool,
+# each holding/queuing a slot for up to ``slow_path_timeout_seconds``. The
+# semaphore is acquired INSIDE the detached task (see ``_gated_rebuild``
+# below), not by the caller of ``_await_shared_rebuild`` — callers already
+# fall back to a stale value or their own timeout while they wait, so having
+# an excess rebuild candidate queue for a slot costs nothing but time.
+_rebuild_semaphore: Optional[asyncio.Semaphore] = None
+_rebuild_semaphore_limit: int = 0
+
+
+async def _get_rebuild_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide detached-rebuild concurrency semaphore.
+
+    Reads ``max_concurrent_detached_rebuilds`` live (mirrors the
+    background-DB-concurrency semaphore in ``query_executor.py``) and rebuilds
+    the semaphore when the configured limit changes; in-flight holders of a
+    superseded semaphore are unaffected and release normally.
+    """
+    global _rebuild_semaphore, _rebuild_semaphore_limit
+    limit = await _load_max_concurrent_rebuilds()
+    if _rebuild_semaphore is None or _rebuild_semaphore_limit != limit:
+        _rebuild_semaphore = asyncio.Semaphore(limit)
+        _rebuild_semaphore_limit = limit
+    return _rebuild_semaphore
+
+
+def _is_orphaned_teardown_error(exc: BaseException) -> bool:
+    """True for a torn-down-connection error from an orphaned rebuild (#3023).
+
+    A detached ``@cached`` rebuild (:func:`_await_shared_rebuild`) always runs
+    to completion even after every waiter has stopped waiting on it (#2900 --
+    cancelling in-flight DB work mid-query poisons the connection pool). If
+    the rebuild's own connection then gets torn down before it finishes, the
+    resulting ``InterfaceError``/``DatabaseConnectionError`` ("connection is
+    closed") is expected teardown noise rather than an actionable failure --
+    no live caller depends on the outcome.
+    """
+    from sqlalchemy.exc import InterfaceError
+    from dynastore.modules.db_config.exceptions import DatabaseConnectionError
+
+    if isinstance(exc, (InterfaceError, DatabaseConnectionError)):
+        return "closed" in str(exc).lower()
+    return False
+
+
+async def _await_shared_rebuild(
+    key: str,
+    rebuild: "Callable[[], Coroutine[Any, Any, Any]]",
+    timeout: float,
+) -> Any:
+    """Await the single in-flight rebuild task for ``key``, bounded by ``timeout``.
+
+    Creates the task if none is running. Raises ``TimeoutError`` when the wait
+    budget elapses (the task keeps running detached) and re-raises whatever the
+    rebuild itself raised; the caller decides whether a stale value absorbs it.
+    """
+    task = _inflight_rebuilds.get(key)
+    if task is None or task.done():
+
+        async def _gated_rebuild(_rebuild: "Callable[[], Coroutine[Any, Any, Any]]" = rebuild) -> Any:
+            sem = await _get_rebuild_semaphore()
+            async with sem:
+                return await _rebuild()
+
+        task = asyncio.get_running_loop().create_task(_gated_rebuild())
+        _inflight_rebuilds[key] = task
+
+        def _cleanup(t: "asyncio.Task[Any]", _key: str = key) -> None:
+            if _inflight_rebuilds.get(_key) is t:
+                _inflight_rebuilds.pop(_key, None)
+            # Retrieve the exception so an abandoned detached rebuild (every
+            # waiter already timed out) surfaces as one structured log line
+            # instead of asyncio's raw "exception was never retrieved" ERROR
+            # traceback.
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    if _is_orphaned_teardown_error(exc):
+                        # The rebuild outlived every waiter (all timed out or
+                        # disconnected) and its own connection was then torn
+                        # down mid-flight — no live caller depends on this
+                        # result, so a "connection is closed" rollback/
+                        # transaction error here is expected teardown noise,
+                        # not an actionable failure (#3023). Cancelling the
+                        # rebuild instead is not an option: it always runs to
+                        # completion by design (#2900) since cancelling
+                        # in-flight DB work mid-query poisons the pool.
+                        logger.debug(
+                            "cache_rebuild_orphaned key=%s error_type=%s error=%s",
+                            _key, type(exc).__name__, exc,
+                        )
+                    else:
+                        logger.warning(
+                            "cache_rebuild_failed key=%s error_type=%s error=%s",
+                            _key, type(exc).__name__, exc,
+                        )
+
+        task.add_done_callback(_cleanup)
+    return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
 #  TieredAsyncBackend
 # ---------------------------------------------------------------------------
 
@@ -415,30 +722,67 @@ class LocalAsyncCacheBackend:
 class TieredAsyncBackend:
     """Chain multiple cache backends in priority order (L1, L2, L3...).
 
-    Read path: tries each tier in order, populating upstream tiers on miss.
-    Write path: writes to all tiers.
-    Delete/clear: deletes from all tiers.
+    Read path: L2-authoritative with version stamping — every value is
+    stored as a ``{"__v": ver, "__d": payload}`` envelope where ``ver`` is
+    ``time.time_ns()`` captured at write time.  On ``get()``, both L1
+    (in-process) and L2 (distributed) are read; the envelope with the
+    **higher version wins**.
 
-    Implements get_lock by delegating to the first tier that supports it.
+    This gives two guarantees at once:
+    - Cross-instance accuracy: L2 (Valkey) acts as the distributed source
+      of truth; a newer write from another Cloud Run instance propagates to
+      L1 automatically on the next local read.
+    - Read-your-write: ``set()`` stamps L1 with a fresh ver before the
+      asynchronous L2 write completes, so an immediate local read always
+      returns the new value (L1 ver > stale L2 ver).
+
+    Clock-skew caveat: ``time.time_ns()`` is wall-clock, so two instances
+    with clock skew may produce non-monotonic versions across processes.
+    This is acceptable because these caches hold infrequently-written
+    configuration data and the version is only compared within a TTL window
+    bounded by ``l1_ttl_cap``.  NTP keeps skew well under the write interval
+    for these workloads.
+
+    Write path: stamp envelope → L1 synchronous, L2+ background with retry.
+    If a conditional write (``exist=``) is rejected by L1, L2 writes are
+    skipped and ``False`` is returned.
+
+    Clear/invalidation: keyed clear writes a **tombstone** envelope to L1
+    **and** L2 **synchronously** (not background) so any L2-authoritative
+    read in another process sees the tombstone immediately.  Tombstones
+    carry a fresh ver so they out-version any concurrent stale async set.
+    Namespace/tags clears delete from all backends synchronously.
+
+    Background L2 writes (#2328):
+        L2+ set operations are scheduled as background tasks with exponential
+        backoff retry.  If L2 is unreliable the TTL cap self-heals staleness.
+        Set ``l2_retry_attempts=0`` to skip background writes entirely (no
+        task scheduled, no warning emitted).
+
+    Implements ``get_lock`` by delegating to the first tier that supports it.
     """
 
-    # Default L1 TTL cap (seconds). Bounds the per-process staleness window
-    # observable after a cross-process invalidate (#930): process A writes +
-    # invalidates L2, but sibling process B's L1 only converges once its
-    # local entry expires. Correctness-critical caches (config tiers, router)
-    # pass a smaller value via ``cached(l1_ttl=...)``.
     DEFAULT_L1_TTL_CAP: float = 60.0
+    DEFAULT_L2_RETRY_ATTEMPTS: int = 3
+    DEFAULT_L2_RETRY_BACKOFF: float = 0.1
 
     def __init__(
         self,
         backends: List[CacheBackend],
         l1_ttl_cap: Optional[float] = None,
+        l2_retry_attempts: Optional[int] = None,
+        l2_retry_backoff: Optional[float] = None,
     ) -> None:
         """Initialize with an ordered list of backends (best to worst).
 
-        ``l1_ttl_cap`` bounds the TTL written to / populated into the L1
-        (first) tier regardless of the caller-supplied ttl. Defaults to
-        ``DEFAULT_L1_TTL_CAP`` (60s).
+        Args:
+            backends: Ordered list of backends (L1, L2, ...).
+            l1_ttl_cap: Bounds TTL for L1 tier. Defaults to 60s.
+            l2_retry_attempts: Max attempts for L2+ background writes.
+                Defaults to 3. Set to 0 to skip background writes entirely
+                (no task is scheduled, no warning is emitted).
+            l2_retry_backoff: Initial backoff in seconds for L2+ retry.
+                Defaults to 0.1s (100ms). Exponential backoff applied.
         """
         if not backends:
             raise ValueError("TieredAsyncBackend requires at least one backend")
@@ -448,12 +792,21 @@ class TieredAsyncBackend:
         self._l1_ttl_cap = (
             self.DEFAULT_L1_TTL_CAP if l1_ttl_cap is None else float(l1_ttl_cap)
         )
-        # ``cached()`` increments _stats.{hits,misses,size} unconditionally
-        # on every call regardless of the backend type, so the wrapper
-        # must expose the same shape as the leaf backends or it AttributeErrors
-        # on the first call.  Stats here aggregate across tiers — leaves
-        # keep their own per-tier counters for finer-grained inspection.
+        self._l2_retry_attempts = (
+            self.DEFAULT_L2_RETRY_ATTEMPTS
+            if l2_retry_attempts is None
+            else int(l2_retry_attempts)
+        )
+        self._l2_retry_backoff = (
+            self.DEFAULT_L2_RETRY_BACKOFF
+            if l2_retry_backoff is None
+            else float(l2_retry_backoff)
+        )
+        self._required_l2 = any(
+            getattr(backend, "required", False) for backend in backends[1:]
+        )
         self._stats = CacheStats()
+        self._pending_bg_tasks: Set[asyncio.Task] = set()
 
     @property
     def name(self) -> str:
@@ -463,39 +816,110 @@ class TieredAsyncBackend:
     def priority(self) -> int:
         return self._priority
 
-    async def get(self, key: str) -> Optional[bytes]:
-        """Try each tier in order, populating upstream on miss."""
-        for i, backend in enumerate(self._backends):
-            value = await backend.get(key)
-            if value is not None:
-                # Populate all upstream tiers (0..i-1) with the L1 cap so the
-                # populate-back path observes the same staleness bound as set().
-                for j in range(i):
-                    await self._backends[j].set(key, value, ttl=self._l1_ttl_cap)
-                return value
-        return None
+    async def get(self, key: str) -> Optional[Any]:
+        """L2-authoritative versioned read.
+
+        Reads both L1 (in-process) and L2 (distributed) and returns the
+        value carried by the **higher-versioned** envelope.
+
+        - L2 unavailable: falls back to L1 best-effort (degraded mode).
+        - L2 wins (ver >= L1 ver): refreshes L1 from L2 and returns L2 value.
+        - L1 wins (own fresh write not yet propagated): returns L1, leaves L2.
+        - Tombstone in winning tier: returns ``None`` (caller treats as miss).
+        - Legacy unversioned entry in either tier: treated as ver=0, so any
+          envelope write out-versions it automatically during rolling deploys.
+        """
+        l1_raw = await self._backends[0].get(key)
+        l1_ver, l1_val, l1_tomb = _ev_parse(l1_raw) if l1_raw is not None else (-1, None, False)
+        l1_present = l1_raw is not None
+
+        # Read L2 (distributed source of truth).
+        l2_present = False
+        l2_ver = -1
+        l2_val: Any = None
+        l2_tomb = False
+        if len(self._backends) > 1:
+            try:
+                l2_raw = await self._backends[1].get(key)
+                if l2_raw is not None:
+                    l2_present = True
+                    l2_ver, l2_val, l2_tomb = _ev_parse(l2_raw)
+            except Exception as e:
+                log = logger.error if self._required_l2 else logger.warning
+                log("L2 cache get failed (key=%s): %s", key, e)
+                if self._required_l2:
+                    raise
+                # L2 unavailable — fall back to L1 best-effort.
+                if l1_present and not l1_tomb:
+                    return l1_val
+                return None
+
+        if not l1_present and not l2_present:
+            return None
+
+        # L2 wins when it is present and its version is >= L1's version.
+        if l2_present and (not l1_present or l2_ver >= l1_ver):
+            if l2_tomb:
+                # Propagate tombstone to L1 so subsequent reads don't serve stale data.
+                if l1_present and not l1_tomb:
+                    await self._backends[0].set(
+                        key,
+                        _ENVELOPE_SERIALIZER.dumps(_ev_tombstone(l2_ver)),
+                        ttl=self._l1_ttl_cap,
+                    )
+                return None
+            # Refresh L1 from L2 (version-guarded write).
+            await self._backends[0].set(
+                key,
+                _ENVELOPE_SERIALIZER.dumps(_ev_wrap(l2_val, l2_ver)),
+                ttl=self._l1_ttl_cap,
+            )
+            return l2_val
+
+        # L1 wins — our own fresher write not yet propagated to L2.
+        if l1_tomb:
+            return None
+        return l1_val
 
     async def set(
         self,
         key: str,
-        value: bytes,
+        value: Any,
         *,
         ttl: Optional[float] = None,
         exist: Optional[bool] = None,
     ) -> bool:
-        """Write to all tiers (with tier-specific TTLs)."""
-        # L1 gets the configured cap; L2+ get the full caller-supplied TTL.
-        results = []
-        for i, backend in enumerate(self._backends):
-            if i == 0:
-                tier_ttl: Optional[float] = (
-                    min(ttl, self._l1_ttl_cap) if ttl is not None else self._l1_ttl_cap
-                )
-            else:
-                tier_ttl = ttl
-            result = await backend.set(key, value, ttl=tier_ttl, exist=exist)
-            results.append(result)
-        return all(results)
+        """Stamp a version envelope and write to L1 synchronously, L2+ in background.
+
+        The version (``time.time_ns()``) is captured once and embedded in the
+        envelope stored in every tier.  Because ``get()`` picks the higher
+        version, the synchronous L1 write wins over any stale L2 value still
+        present during the background-write window (read-your-write guarantee).
+
+        If a conditional write (``exist=True/False``) is rejected by L1, L2
+        writes are skipped and ``False`` is returned.
+        """
+        ver = time.time_ns()
+        envelope = _ENVELOPE_SERIALIZER.dumps(_ev_wrap(value, ver))
+
+        l1_ttl: Optional[float] = (
+            min(ttl, self._l1_ttl_cap) if ttl is not None else self._l1_ttl_cap
+        )
+        l1_ok = await self._backends[0].set(key, envelope, ttl=l1_ttl, exist=exist)
+        if not l1_ok:
+            # Conditional write precondition rejected by L1; skip L2.
+            return False
+
+        for i, backend in enumerate(self._backends[1:], start=2):
+            async def _set_op(b: CacheBackend = backend, e: Any = envelope) -> bool:
+                return await b.set(key, e, ttl=ttl, exist=exist)
+            task = asyncio.create_task(
+                self._bg_op_with_retry(_set_op, i, "set", f"key={key}")
+            )
+            self._pending_bg_tasks.add(task)
+            task.add_done_callback(self._pending_bg_tasks.discard)
+
+        return True
 
     async def clear(
         self,
@@ -504,12 +928,81 @@ class TieredAsyncBackend:
         namespace: Optional[str] = None,
         tags: Optional[List[str]] = None,
     ) -> bool:
-        """Clear from all tiers."""
-        results = []
-        for backend in self._backends:
-            result = await backend.clear(key=key, namespace=namespace, tags=tags)
-            results.append(result)
-        return any(results)
+        """Invalidate cache entries with immediate cluster-wide visibility.
+
+        Keyed clear (``key=``):
+            Writes a versioned tombstone to L1 **and** all L2+ backends
+            **synchronously** (not in background).  A tombstone carries a
+            fresh ``time.time_ns()`` version so it out-versions any
+            concurrent stale async set still in flight.  Callers that read
+            via ``get()`` see the tombstone immediately regardless of which
+            instance they are on.  On L2 write failure a warning is logged
+            but the L1 tombstone still guards local reads for ``l1_ttl_cap``.
+
+        Namespace / tags clear:
+            Deletes matching keys from all backends synchronously.  Namespace
+            clears cannot use per-key tombstones without a full key scan, so
+            they rely on the same synchronous-delete approach as before.
+        """
+        if key is not None:
+            ver = time.time_ns()
+            tombstone = _ENVELOPE_SERIALIZER.dumps(_ev_tombstone(ver))
+            # L1 tombstone — synchronous, always fast.
+            await self._backends[0].set(key, tombstone, ttl=self._l1_ttl_cap)
+            # L2+ tombstone — synchronous so other instances see it immediately.
+            for i, backend in enumerate(self._backends[1:], start=2):
+                try:
+                    await backend.set(key, tombstone, ttl=self._l1_ttl_cap)
+                except Exception as e:
+                    logger.warning(
+                        "L%d cache clear tombstone write failed (key=%s): %s — "
+                        "L1 tombstone guards local reads for %.0fs",
+                        i, key, e, self._l1_ttl_cap,
+                    )
+            return True
+
+        # Namespace / tags clear: synchronous delete on all backends.
+        l1_result = await self._backends[0].clear(namespace=namespace, tags=tags)
+        for i, backend in enumerate(self._backends[1:], start=2):
+            try:
+                await backend.clear(namespace=namespace, tags=tags)
+            except Exception as e:
+                logger.warning(
+                    "L%d cache clear failed (ns=%s): %s", i, namespace, e
+                )
+        return l1_result
+
+    async def _bg_op_with_retry(
+        self,
+        op_factory: Callable[[], Awaitable[bool]],
+        tier: int,
+        op_name: str,
+        log_ctx: str,
+    ) -> None:
+        """Shared background retry loop for L2+ set operations.
+
+        Skipped entirely (no attempt, no warning) when ``l2_retry_attempts`` is 0.
+        ``op_factory`` is called once per attempt so each retry creates a fresh
+        coroutine — never re-awaits a spent one.
+        """
+        if self._l2_retry_attempts <= 0:
+            return
+        for attempt in range(self._l2_retry_attempts):
+            try:
+                if await op_factory():
+                    return
+            except Exception as e:
+                logger.debug(
+                    "L%d cache %s exception (attempt %d/%d): %s",
+                    tier, op_name, attempt + 1, self._l2_retry_attempts, e,
+                )
+            if attempt < self._l2_retry_attempts - 1:
+                backoff = self._l2_retry_backoff * (2**attempt)
+                await asyncio.sleep(backoff)
+        logger.warning(
+            "L%d cache %s failed after %d attempts (%s) — TTL cap will self-heal",
+            tier, op_name, self._l2_retry_attempts, log_ctx,
+        )
 
     async def exists(self, key: str) -> bool:
         """Check any tier."""
@@ -519,7 +1012,9 @@ class TieredAsyncBackend:
         return False
 
     async def close(self) -> None:
-        """Close all backends."""
+        """Wait for pending background tasks, then close all backends."""
+        if self._pending_bg_tasks:
+            await asyncio.gather(*self._pending_bg_tasks, return_exceptions=True)
         for backend in self._backends:
             await backend.close()
 
@@ -528,7 +1023,6 @@ class TieredAsyncBackend:
         for backend in self._backends:
             if isinstance(backend, LockableCacheBackend):
                 return await backend.get_lock(key)
-        # Fallback: create a new lock (caller's decorator will cache it)
         return asyncio.Lock()
 
 
@@ -783,31 +1277,96 @@ class LocalCache:
         *,
         ttl: Optional[Union[timedelta, float]] = None,
         namespace: Optional[str] = None,
+        stale_grace: Optional[Union[timedelta, float]] = None,
     ) -> Any:
+        """Stampede-safe get-or-create with bounded slow path + stale fallback.
+
+        ``stale_grace`` (default ``DEFAULT_STALE_GRACE_SECONDS`` = 300s, ``0``
+        disables it) keeps the previous value physically alive past its
+        logical ``ttl`` so that, if the rebuild's lock-wait + ``factory()``
+        call exceeds ``CachePluginConfig.slow_path_timeout_seconds`` (default
+        30s) or ``factory()`` raises, the stale value is served instead of
+        propagating (see #2902). With no stale value available, the original
+        exception/timeout propagates promptly.
+        """
+        resolved_ttl = self._resolve_ttl(ttl)
+        grace = (
+            DEFAULT_STALE_GRACE_SECONDS
+            if stale_grace is None
+            else (
+                stale_grace.total_seconds()
+                if isinstance(stale_grace, timedelta)
+                else float(stale_grace)
+            )
+        )
+        stale_on = grace > 0 and resolved_ttl is not None
+        # Cross-revision key compatibility (#2902): an old-revision process
+        # reading a stale-wrapped entry has no unwrap logic and would return
+        # the wrapper dict as the value. Version-prefixing the key when
+        # stale-wrapping is active means old code simply misses (one cold
+        # rebuild, absorbed by the bounded slow path) instead of misreading;
+        # this also makes rollback safe since the old revision resumes
+        # reading its own unprefixed keys.
         full_key = self._full_key(key, namespace)
+        if stale_on:
+            full_key = "sv1|" + full_key
+        stale_candidate: Any = _NO_STALE
+
+        async def _read() -> "tuple[Any, bool]":
+            raw = await self._backend.get(full_key)
+            if raw is None:
+                return _NO_STALE, False
+            loaded = self._serializer.loads(raw)
+            return _stale_unwrap(loaded) if stale_on else (loaded, False)
 
         # Fast path: value in cache
-        raw = await self._backend.get(full_key)
-        if raw is not None:
-            self._stats.hits += 1
-            return self._serializer.loads(raw)
-
-        # Slow path: acquire per-key lock for stampede protection
-        lock = await self._backend.get_lock(full_key)
-        async with lock:
-            # Double-check after acquiring lock
-            raw = await self._backend.get(full_key)
-            if raw is not None:
+        value, is_stale = await _read()
+        if value is not _NO_STALE:
+            if not is_stale:
                 self._stats.hits += 1
-                return self._serializer.loads(raw)
+                return value
+            stale_candidate = value
 
-            self._stats.misses += 1
-            value = await factory()
-            resolved_ttl = self._resolve_ttl(ttl)
-            serialized = self._serializer.dumps(value)
-            await self._backend.set(full_key, serialized, ttl=resolved_ttl)
-            await self._emit(CacheEvent.SET, key=full_key, ttl=resolved_ttl)
-            return value
+        # Slow path: one shared rebuild task per key (see
+        # _await_shared_rebuild) so a caller abandoning the wait — the budget
+        # below, or a client disconnect cancelling the request — never
+        # cancels the factory's in-flight DB work (#2900 poisoning). The
+        # per-key lock is kept for cross-checking with waiters outside this
+        # process-local single-flight.
+        async def _rebuild() -> Any:
+            lock = await self._backend.get_lock(full_key)
+            async with lock:
+                # Double-check after acquiring lock
+                value, is_stale = await _read()
+                if value is not _NO_STALE and not is_stale:
+                    self._stats.hits += 1
+                    return value
+
+                self._stats.misses += 1
+                result = await factory()
+                if stale_on and resolved_ttl is not None:
+                    to_store: Any = _stale_wrap(result, resolved_ttl)
+                    physical_ttl = resolved_ttl + grace
+                else:
+                    to_store = result
+                    physical_ttl = resolved_ttl
+                serialized = self._serializer.dumps(to_store)
+                await self._backend.set(full_key, serialized, ttl=physical_ttl)
+                await self._emit(CacheEvent.SET, key=full_key, ttl=physical_ttl)
+                return result
+
+        timeout = await _load_slow_path_timeout()
+        try:
+            return await _await_shared_rebuild("gos|" + full_key, _rebuild, timeout)
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "error"
+            if stale_candidate is not _NO_STALE:
+                logger.warning(
+                    "cache_stale_served key=%s reason=%s error=%s",
+                    full_key, reason, exc,
+                )
+                return stale_candidate
+            raise
 
     async def close(self) -> None:
         pass  # Backend lifecycle managed by CacheManager
@@ -857,9 +1416,27 @@ class CacheManager:
     def unregister_backend(
         self, backend: Union[CacheBackend, SyncCacheBackend]
     ) -> None:
-        """Unregister a backend (e.g. on circuit breaker trip)."""
-        self._async_backends.pop(backend.name, None)
-        self._sync_backends.pop(backend.name, None)
+        """Unregister a backend (e.g. on circuit breaker trip).
+
+        Removal is identity-checked: backend names are class-level
+        constants (every ``ValkeyCacheBackend`` is named ``"valkey"``),
+        so popping by name alone would let a stale instance's late
+        circuit-breaker trip rip out a healthy replacement that a live
+        reconnect just registered under the same name.
+        """
+        removed = False
+        if self._async_backends.get(backend.name) is backend:
+            del self._async_backends[backend.name]
+            removed = True
+        if self._sync_backends.get(backend.name) is backend:
+            del self._sync_backends[backend.name]
+            removed = True
+        if not removed:
+            logger.info(
+                "Ignored unregister for superseded cache backend instance: %s",
+                backend.name,
+            )
+            return
         logger.warning("Unregistered cache backend: %s", backend.name)
         _notify_backend_change()
 
@@ -944,6 +1521,18 @@ _notify_backend_upgrade = _notify_backend_change
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_MAX_DISTRIBUTED_TTL: float = 3600.0
+
+# Shared TTL/L1-TTL pair for config-like caches (catalog/collection config,
+# platform config, storage router, collection model) that must self-heal
+# within a bounded cross-pod staleness window after invalidation is dropped
+# by an unreliable distributed backend. ``DEFAULT_CONFIG_CACHE_TTL`` bounds
+# the L2 window; ``DEFAULT_CONFIG_CACHE_L1_TTL`` tightens the L1 window so
+# sibling pods converge quickly after a write.
+DEFAULT_CONFIG_CACHE_TTL: float = 300.0
+DEFAULT_CONFIG_CACHE_L1_TTL: float = 2.0
+
+
 def cached(
     maxsize: int = 1024,
     ttl: Optional[Union[float, int]] = None,
@@ -956,6 +1545,8 @@ def cached(
     key_builder: Optional[Callable[..., str]] = None,
     distributed: bool = True,
     l1_ttl: Optional[Union[float, int]] = None,
+    max_distributed_ttl: Optional[Union[float, int]] = None,
+    stale_grace: Optional[Union[float, int]] = None,
 ) -> Callable:
     """Centralized caching decorator for sync and async functions.
 
@@ -963,7 +1554,9 @@ def cached(
 
     Args:
         maxsize: Maximum number of entries.
-        ttl: Time-to-live in seconds. ``None`` = no expiration.
+        ttl: Time-to-live in seconds. ``None`` = no expiration for local caches;
+            for distributed caches, capped by ``max_distributed_ttl`` to prevent
+            unbounded staleness when L2 (Valkey) is unreliable (#2328).
         jitter: Random TTL variance in seconds (prevents thundering herd on expiry).
         backend: Named backend or ``None`` for default local memory.
         namespace: Cache namespace prefix for key isolation.
@@ -980,6 +1573,18 @@ def cached(
             post-PUT staleness across sibling Cloud Run processes must converge
             quickly (#930). Ignored when ``distributed=False`` or when no
             distributed backend is registered.
+        max_distributed_ttl: Maximum TTL for distributed (L2) tier when
+            ``ttl=None``. Prevents unbounded staleness when Valkey is unreliable
+            and invalidations are dropped (#2328). Defaults to 3600s (1 hour).
+            Set higher for slowly-changing metadata (e.g., tiles config) or to
+            ``float("inf")`` to disable the cap. Ignored for local-only caches.
+        stale_grace: Grace window (seconds) a value is kept physically alive
+            past its logical ``ttl`` so a rebuild that exceeds
+            ``CachePluginConfig.slow_path_timeout_seconds`` (default 30s) or
+            raises can serve the stale value instead of propagating (#2902).
+            Defaults to ``DEFAULT_STALE_GRACE_SECONDS`` (300s). ``0`` disables
+            stale serving. Ignored when ``ttl=None`` (no logical expiry, so
+            nothing can go stale).
 
     The decorated function gets these methods:
         - ``.cache_invalidate(*args, **kwargs)`` -- invalidate specific entry
@@ -1047,15 +1652,44 @@ def cached(
 
         ns = namespace or func_qualname
 
+        _effective_max_distributed_ttl = (
+            float(max_distributed_ttl)
+            if max_distributed_ttl is not None
+            else DEFAULT_MAX_DISTRIBUTED_TTL
+        )
+        if ttl is None and distributed and max_distributed_ttl != float("inf"):
+            logger.debug(
+                "@cached(%s): distributed=True with ttl=None — applying max_distributed_ttl=%.0fs (#2328)",
+                func_qualname, _effective_max_distributed_ttl,
+            )
+
+        _grace = (
+            DEFAULT_STALE_GRACE_SECONDS if stale_grace is None else float(stale_grace)
+        )
+
+        # Cross-revision key compatibility (#2902): Valkey is shared across
+        # rolling-deploy revisions. An old-revision process has no unwrap
+        # logic for the stale-wrapped envelope, so its fast path would
+        # return the wrapper dict AS the cached value — silently corrupting
+        # every cached endpoint until the entry expires. Storing
+        # stale-wrapped entries under a version-prefixed key means old code
+        # simply misses (cold-rebuilds once, absorbed by the bounded slow
+        # path) instead of misreading. Grace-disabled functions keep
+        # today's unprefixed keys (those entries are never wrapped, so they
+        # stay cross-revision safe as-is).
+        _key_prefix = "sv1|" if _grace > 0 else ""
+
         def _build_key(args: tuple, kwargs: dict) -> str:
             if key_builder is not None:
-                return key_builder(func, *args, **kwargs)
-            return _make_cache_key(
+                return _key_prefix + key_builder(func, *args, **kwargs)
+            return _key_prefix + _make_cache_key(
                 ns, args, kwargs, sig, ignored_params, typed
             )
 
         def _resolve_ttl() -> Optional[float]:
             if ttl is None:
+                if distributed and max_distributed_ttl != float("inf"):
+                    return _effective_max_distributed_ttl
                 return None
             base = float(ttl)
             if jitter:
@@ -1078,46 +1712,91 @@ def cached(
                 assert _backend is not None
 
                 cache_key = _build_key(args, kwargs)
+                stale_candidate: Any = _NO_STALE
 
                 # Fast path
                 raw = await _backend.get(cache_key)
                 if raw is not None:
-                    # Re-validate against ``condition`` so stale entries written
-                    # before the condition was added (or by a code path that
-                    # bypassed it) cannot keep being served forever.  Drop the
-                    # entry across all tiers so the next read refetches.
-                    if condition is None or condition(raw):
-                        _backend._stats.hits += 1
-                        return raw  # NullSerializer for local; msgpack for Valkey
-                    await _backend.clear(key=cache_key)
-
-                # Stampede protection
-                if _backend_has_lock:
-                    lock = await _backend.get_lock(cache_key)
-                else:
-                    if cache_key not in _fallback_locks:
-                        _fallback_locks[cache_key] = asyncio.Lock()
-                    lock = _fallback_locks[cache_key]
-                async with lock:
-                    raw = await _backend.get(cache_key)
-                    if raw is not None:
-                        if condition is None or condition(raw):
+                    value, is_stale = _stale_unwrap(raw) if _grace > 0 else (raw, False)
+                    if not is_stale:
+                        # Re-validate against ``condition`` so stale entries written
+                        # before the condition was added (or by a code path that
+                        # bypassed it) cannot keep being served forever.  Drop the
+                        # entry across all tiers so the next read refetches.
+                        if condition is None or condition(value):
                             _backend._stats.hits += 1
-                            return raw
+                            return value  # NullSerializer for local; msgpack for Valkey
                         await _backend.clear(key=cache_key)
+                    else:
+                        stale_candidate = value
 
-                    _backend._stats.misses += 1
-                    result = await func(*args, **kwargs)
+                # Stampede protection: one shared rebuild task per key (see
+                # _await_shared_rebuild), waited on for at most
+                # slow_path_timeout_seconds. A caller abandoning the wait (the
+                # budget, or a client disconnect cancelling the request) never
+                # cancels the in-flight rebuild — cancelled mid-query DB work
+                # poisons asyncpg connections (#2900). On timeout or a rebuild
+                # exception, fall back to a still-grace-window stale value.
+                async def _rebuild() -> Any:
+                    assert _backend is not None
+                    if _backend_has_lock:
+                        lock = await _backend.get_lock(cache_key)
+                    else:
+                        if cache_key not in _fallback_locks:
+                            _fallback_locks[cache_key] = asyncio.Lock()
+                        lock = _fallback_locks[cache_key]
+                    async with lock:
+                        raw = await _backend.get(cache_key)
+                        if raw is not None:
+                            value, is_stale = (
+                                _stale_unwrap(raw) if _grace > 0 else (raw, False)
+                            )
+                            if not is_stale:
+                                if condition is None or condition(value):
+                                    _backend._stats.hits += 1
+                                    return value
+                                await _backend.clear(key=cache_key)
 
-                    if condition is not None and not condition(result):
+                        _backend._stats.misses += 1
+                        result = await func(*args, **kwargs)
+
+                        if condition is not None and not condition(result):
+                            return result
+
+                        resolved = _resolve_ttl()
+                        if _grace > 0 and resolved is not None:
+                            to_store = _stale_wrap(result, resolved)
+                            await _backend.set(
+                                cache_key, to_store, ttl=resolved + _grace
+                            )
+                        else:
+                            await _backend.set(cache_key, result, ttl=resolved)
                         return result
 
-                    resolved = _resolve_ttl()
-                    await _backend.set(cache_key, result, ttl=resolved)
-                    return result
+                timeout = await _load_slow_path_timeout()
+                try:
+                    return await _await_shared_rebuild(
+                        "dec|" + cache_key, _rebuild, timeout
+                    )
+                except Exception as exc:
+                    reason = "timeout" if isinstance(exc, TimeoutError) else "error"
+                    if stale_candidate is not _NO_STALE:
+                        logger.warning(
+                            "cache_stale_served key=%s reason=%s error=%s",
+                            cache_key, reason, exc,
+                        )
+                        return stale_candidate
+                    raise
 
             def sync_cache_invalidate_impl(*args: Any, **kwargs: Any) -> None:
                 """Sync invalidation -- works in both sync and async contexts."""
+                nonlocal _backend
+                if _backend is None:
+                    # Backend not yet initialized (no GET has run yet on this
+                    # function).  Resolve it now so a PUT that precedes the first
+                    # GET still writes a tombstone to the distributed cache and
+                    # prevents stale reads on other pods.
+                    _resolve_backend()
                 if _backend is None:
                     return
                 cache_key = _build_key(args, kwargs)
@@ -1145,7 +1824,7 @@ def cached(
                     # Distributed backend: schedule async namespace clear
                     try:
                         loop = asyncio.get_running_loop()
-                        _track(loop.create_task(_backend.clear(namespace=ns)))
+                        _track(loop.create_task(_backend.clear(namespace=_key_prefix + ns)))
                     except RuntimeError:
                         pass
 
@@ -1153,9 +1832,10 @@ def cached(
                 """Drop all entries whose key starts with ``sub_namespace + "|"``.
 
                 ``@cached`` functions build keys as ``"{ns}|{arg1}|{arg2}|..."``
-                where ``ns`` is the decorator's ``namespace`` parameter.  A
-                *sub-namespace* is a prefix of that key that identifies a
-                subset of entries — for example
+                (version-prefixed with ``sv1|`` when stale-grace is active,
+                see ``_key_prefix`` above) where ``ns`` is the decorator's
+                ``namespace`` parameter.  A *sub-namespace* is a prefix of
+                that key that identifies a subset of entries — for example
                 ``"collection_config|'mycat'|'mycoll'"`` matches every
                 class-key entry for that (catalog, collection) pair.
 
@@ -1172,7 +1852,8 @@ def cached(
                 """
                 if _backend is None:
                     return
-                key_prefix = f"{sub_namespace}|"
+                versioned_sub_ns = _key_prefix + sub_namespace
+                key_prefix = f"{versioned_sub_ns}|"
                 if isinstance(_backend, LocalAsyncCacheBackend):
                     # Direct in-process scan — no separator ambiguity.
                     to_delete = [k for k in list(_backend._store.keys()) if k.startswith(key_prefix)]
@@ -1186,7 +1867,7 @@ def cached(
                     # by this clear; residual L1 entries expire within l1_ttl.
                     try:
                         loop = asyncio.get_running_loop()
-                        _track(loop.create_task(_backend.clear(namespace=sub_namespace)))
+                        _track(loop.create_task(_backend.clear(namespace=versioned_sub_ns)))
                     except RuntimeError:
                         pass
 

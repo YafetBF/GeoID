@@ -30,6 +30,8 @@ from sqlalchemy import text
 
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
 from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler
+from dynastore.modules.db_config.core_metadata_ddl import core_metadata_columns
+from dynastore.tools.db import build_upsert, qualify_table
 
 from .models import NotebookCreate
 
@@ -39,8 +41,7 @@ NOTEBOOKS_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.notebooks (
     notebook_id VARCHAR NOT NULL,
     catalog_id VARCHAR NOT NULL,
-    title JSONB,
-    description JSONB,
+    %s
     tags JSONB DEFAULT '[]'::jsonb,
     content JSONB NOT NULL,
     metadata JSONB DEFAULT '{}'::jsonb,
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS {schema}.notebooks (
     copied_from VARCHAR DEFAULT NULL,
     PRIMARY KEY (notebook_id)
 );
-"""
+""" % core_metadata_columns(title_required=True)
 
 
 async def init_notebooks_storage(conn, schema: str, catalog_id: str) -> None:
@@ -64,7 +65,7 @@ async def get_notebook(conn, schema: str, notebook_id: str) -> Dict[str, Any]:
     query = text(f"""
         SELECT notebook_id, catalog_id, title, description, tags, content, metadata,
                created_at, updated_at, deleted_at, owner_id, copied_from
-        FROM {schema}.notebooks
+        FROM {qualify_table(schema, "notebooks")}
         WHERE notebook_id = :notebook_id AND deleted_at IS NULL
     """)
     row = await DQLQuery(query, result_handler=ResultHandler.ONE_DICT).execute(
@@ -113,7 +114,7 @@ async def list_notebooks(
 
     where_sql = " AND ".join(where_clauses)
 
-    count_query = text(f"SELECT COUNT(*) FROM {schema}.notebooks WHERE {where_sql}")
+    count_query = text(f"SELECT COUNT(*) FROM {qualify_table(schema, 'notebooks')} WHERE {where_sql}")
     total_count = await DQLQuery(
         count_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
     ).execute(conn, **{k: v for k, v in params.items() if k not in ("limit", "offset")})
@@ -122,7 +123,7 @@ async def list_notebooks(
     list_query = text(f"""
         SELECT notebook_id, catalog_id, title, description, tags, metadata,
                created_at, updated_at, owner_id, copied_from
-        FROM {schema}.notebooks
+        FROM {qualify_table(schema, "notebooks")}
         WHERE {where_sql}
         ORDER BY updated_at DESC
         LIMIT :limit OFFSET :offset
@@ -136,7 +137,7 @@ async def list_notebooks(
 async def soft_delete_notebook(conn, schema: str, notebook_id: str) -> None:
     """Soft-delete a notebook."""
     rowcount = await DQLQuery(
-        f"UPDATE {schema}.notebooks SET deleted_at = NOW() WHERE notebook_id = :notebook_id AND deleted_at IS NULL",
+        f"UPDATE {qualify_table(schema, 'notebooks')} SET deleted_at = NOW() WHERE notebook_id = :notebook_id AND deleted_at IS NULL",
         result_handler=ResultHandler.ROWCOUNT,
     ).execute(conn, notebook_id=notebook_id)
     if not rowcount:
@@ -163,23 +164,21 @@ async def save_notebook(
     copied_from: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Save or update a notebook."""
-    query = text(f"""
-        INSERT INTO {schema}.notebooks
-            (notebook_id, catalog_id, title, description, tags, content, metadata,
-             owner_id, copied_from, updated_at)
-        VALUES
-            (:notebook_id, :catalog_id, :title, :description, :tags, :content,
-             :metadata, :owner_id, :copied_from, NOW())
-        ON CONFLICT (notebook_id) DO UPDATE SET
-            title = EXCLUDED.title,
-            description = EXCLUDED.description,
-            tags = EXCLUDED.tags,
-            content = EXCLUDED.content,
-            metadata = EXCLUDED.metadata,
-            updated_at = NOW()
-        RETURNING notebook_id, catalog_id, title, description, tags, content, metadata,
-                  created_at, updated_at, deleted_at, owner_id, copied_from
-    """)
+    query = text(build_upsert(
+        table=qualify_table(schema, "notebooks"),
+        columns=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "owner_id", "copied_from", "updated_at",
+        ),
+        conflict_cols=("notebook_id",),
+        update_cols=("title", "description", "tags", "content", "metadata", "updated_at"),
+        literal_values={"updated_at": "NOW()"},
+        returning=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "created_at", "updated_at", "deleted_at",
+            "owner_id", "copied_from",
+        ),
+    ))
     params = {
         "notebook_id": notebook.notebook_id,
         "catalog_id": catalog_id,
@@ -202,17 +201,20 @@ async def copy_from_platform(
     owner_id: str,
 ) -> Dict[str, Any]:
     """Copy a platform notebook into a tenant catalog (no-op if already exists)."""
-    query = text(f"""
-        INSERT INTO {schema}.notebooks
-            (notebook_id, catalog_id, title, description, tags, content, metadata,
-             owner_id, copied_from)
-        VALUES
-            (:notebook_id, :catalog_id, :title, :description, :tags, :content,
-             :metadata, :owner_id, :copied_from)
-        ON CONFLICT (notebook_id) DO NOTHING
-        RETURNING notebook_id, catalog_id, title, description, tags, content, metadata,
-                  created_at, updated_at, deleted_at, owner_id, copied_from
-    """)
+    query = text(build_upsert(
+        table=qualify_table(schema, "notebooks"),
+        columns=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "owner_id", "copied_from",
+        ),
+        conflict_cols=("notebook_id",),
+        update_cols=(),
+        returning=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "created_at", "updated_at", "deleted_at",
+            "owner_id", "copied_from",
+        ),
+    ))
     title = platform_notebook.get("title")
     description = platform_notebook.get("description")
     tags = platform_notebook.get("tags", [])

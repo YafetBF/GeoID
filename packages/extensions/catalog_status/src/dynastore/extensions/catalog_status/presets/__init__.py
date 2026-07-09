@@ -43,8 +43,9 @@ class _CatalogStatusPolicyContributor:
 register_preset(PolicyContributorPreset(
     name="catalog_status_enable",
     description=(
-        "catalog_status extension IAM policies; read status surface (open to "
-        "anonymous) + catalog-admin mutation gate (reprovision / dead-letter)."
+        "catalog_status extension IAM policies; read-only status surface "
+        "(catalog members + sysadmin). Mutation surfaces (reprovision, "
+        "dead-letter) are now governed by the tasks extension policies."
     ),
     keywords=("iam", "catalog", "status", "platform"),
     contributor_factory=_CatalogStatusPolicyContributor,

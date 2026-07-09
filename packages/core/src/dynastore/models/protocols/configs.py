@@ -27,7 +27,7 @@ side-by-side.  For single-instance configs ``ref_key == class_key`` and
 both APIs return the same row.
 """
 
-from typing import Protocol, Optional, Any, Dict, Type, TypeVar, runtime_checkable, TYPE_CHECKING
+from typing import Protocol, Optional, Any, Dict, List, Tuple, Type, TypeVar, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dynastore.models.plugin_config import PluginConfig
@@ -63,6 +63,25 @@ class ConfigsProtocol(Protocol):
         """
         ...
 
+    async def get_configs_batch(
+        self,
+        config_cls: Type[_T_Config],
+        catalog_id: str,
+        collection_ids: List[str],
+        ctx: Optional["DriverContext"] = None,
+    ) -> Dict[str, _T_Config]:
+        """Resolve ``config_cls`` for every id in ``collection_ids`` in a bounded
+        number of round trips instead of one ``get_config`` call per id.
+
+        Same base → catalog → collection waterfall as :meth:`get_config`, but
+        the catalog-tier work runs once and the collection-tier deltas are
+        fetched in a single batched query. Built for callers that must
+        resolve the same config class across many/most collections of a
+        catalog in one request (e.g. a PG-fallback search over an
+        auto-expanded collection scope) — see ``ConfigService.get_configs_batch``.
+        """
+        ...
+
     async def get_persisted_config(
         self,
         config_cls: Type["PluginConfig"],
@@ -76,6 +95,28 @@ class ConfigsProtocol(Protocol):
         """
         ...
 
+    async def get_config_versioned(
+        self,
+        config_cls: Type[_T_Config],
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        ctx: Optional["DriverContext"] = None,
+    ) -> "Tuple[_T_Config, Optional[str]]":
+        """Versioned read pairing a resolved config with its CAS token (#2707).
+
+        ``config`` is the same fully-resolved waterfall value ``get_config``
+        would return. ``version`` is the opaque token for the row at
+        exactly the tier ``(catalog_id, collection_id)`` implies — the one
+        a paired ``set_config(..., expected_version=version)`` call asserts
+        against — or ``None`` when no row is persisted at that tier yet
+        (nothing to CAS against; write unconditionally instead).
+
+        Always reads storage directly, never through the config cache — a
+        stale cached read must never mask (or falsely trigger) a CAS
+        conflict.
+        """
+        ...
+
     async def set_config(
         self,
         config_cls: Type["PluginConfig"],
@@ -84,6 +125,7 @@ class ConfigsProtocol(Protocol):
         collection_id: Optional[str] = None,
         check_immutability: bool = True,
         ctx: Optional["DriverContext"] = None,
+        expected_version: Optional[str] = None,
     ) -> "PluginConfig":
         """
         Sets configuration at the appropriate level based on provided parameters:
@@ -95,6 +137,19 @@ class ConfigsProtocol(Protocol):
         place by the validate phase (``_self_register_*`` augmentation).
         The configs API route returns this body; #738/#747 — a successful
         PUT now returns the effective config, not ``200 + null``.
+
+        ``expected_version`` (#2707): ``None`` (default) writes
+        unconditionally, matching prior behavior. A token obtained from
+        :meth:`get_config_versioned` turns this into an atomic
+        compare-and-set against the row at the tier implied by
+        ``(catalog_id, collection_id)`` — raises
+        ``dynastore.modules.db_config.exceptions.ConfigVersionConflictError``
+        when a concurrent writer already moved the row past that version
+        (or removed it). Closes the read-modify-write race described in
+        #2689: an actuator that reads a config, mutates one field, and
+        writes it back can now assert the write is still based on the
+        value it read, instead of silently reverting a concurrent edit to
+        a different field.
         """
         ...
 
@@ -132,6 +187,22 @@ class ConfigsProtocol(Protocol):
         Captures the resolved platform/code defaults for stable value-configs
         into a schema-id-tagged blob used as the inheritance base, so later
         default changes do not silently re-resolve into existing collections.
+        """
+        ...
+
+    async def get_catalog_defaults_snapshot(
+        self,
+        catalog_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the catalog's frozen defaults-snapshot blob (#1079 c), or ``None``.
+
+        Raw ``{class_key: {"schema_id": ..., "data": ...}}`` blob captured by
+        :meth:`snapshot_catalog_defaults` at catalog creation. Callers gate
+        the per-class entry through
+        ``dynastore.modules.catalog.config_snapshot.select_snapshot_base``
+        (or its ``resolve_catalog_snapshot_base`` wrapper) — this is the
+        shared accessor both ``get_config``'s runtime resolution and the
+        composed-config view use so the two never disagree (#2830).
         """
         ...
 

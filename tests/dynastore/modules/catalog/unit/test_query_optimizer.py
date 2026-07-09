@@ -401,6 +401,76 @@ def test_read_policy_disables_external_id_as_feature_id(mock_col_config, mock_re
     assert "COALESCE(sc_attributes.external_id, h.geoid::text) AS id" in sql_on
 
 
+def test_stac_consumer_honors_external_id_policy(mock_col_config, mock_registry):
+    """#3070 — the STAC consumer no longer forces COALESCE(external_id, geoid)
+    as the item id. STAC honours ``external_id_as_feature_id`` exactly like
+    Features: geoid by default, the authored external_id only when the
+    collection opts in — so one item carries the same id across both protocols.
+    """
+    from dynastore.modules.storage.read_policy import ItemsReadPolicy
+    from dynastore.modules.storage.computed_fields import FeatureType
+    from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
+
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom", sql_expression="sc_geom.geom",
+            capabilities=[FieldCapability.SPATIAL], data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = "LEFT JOIN geom_table sc_geom ON h.geoid = sc_geom.geoid"
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.provides_feature_id = False
+    mock_geom.get_main_geometry_field.return_value = "geom"
+
+    mock_attr = MagicMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "external_id": FieldDefinition(
+            name="external_id", sql_expression="sc_attr.external_id",
+            capabilities=[FieldCapability.FILTERABLE], data_type="string",
+        )
+    }
+    mock_attr.get_join_clause.return_value = "LEFT JOIN attr_table sc_attr ON h.geoid = sc_attr.geoid"
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.provides_feature_id = True
+    mock_attr.feature_id_field_name = "external_id"
+    mock_attr.get_main_geometry_field.return_value = None
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom if getattr(sc, "sidecar_type", "") == "geometries" else mock_attr
+    )
+
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        filters=[FilterCondition(field="external_id", operator="=", value="X")],
+        raw_where=None, include_total_count=False,
+    )
+
+    # STAC + default/no policy (external_id_as_feature_id=False) → geoid IS the
+    # id; the external_id COALESCE is NOT forced (the pre-#3070 behaviour).
+    optimizer = QueryOptimizer(mock_col_config, consumer=ConsumerType.STAC)
+    sql_default, _ = optimizer.build_optimized_query(req, "schema", "table")
+    assert "COALESCE(sc_attributes.external_id" not in sql_default
+    assert "h.geoid AS id" in sql_default
+
+    # STAC + policy opts in → external_id IS aliased as id (COALESCE), same as
+    # every other consumer.
+    policy = ItemsReadPolicy(feature_type=FeatureType(external_id_as_feature_id=True))
+    optimizer_on = QueryOptimizer(
+        mock_col_config, consumer=ConsumerType.STAC, read_policy=policy
+    )
+    sql_on, _ = optimizer_on.build_optimized_query(req, "schema", "table")
+    assert "COALESCE(sc_attributes.external_id, h.geoid::text) AS id" in sql_on
+
+
 def test_item_ids_filter_casts_geoid_uuid(mock_col_config, mock_registry):
     """item_ids filter must not emit a bare ``uuid = text`` comparison.
 
@@ -867,6 +937,95 @@ def test_star_expansion_skips_sidecar_field_when_raw_select_override_present(
     )
 
 
+def test_star_expansion_drops_ungrouped_unaggregated_explicit_override(
+    mock_col_config, mock_registry
+):
+    """#2859: the wildcard branch's explicit-override loop must apply the
+    same ``group_by`` guard the non-wildcard branch got in #2843 — an
+    override field that is neither grouped nor aggregated cannot appear in
+    SELECT alongside an explicit GROUP BY (PostgreSQL 42803).
+
+    Repro from #2859: ``select=[FieldSelection(field="*"),
+    FieldSelection(field="extra")], group_by=["region"]``.
+    """
+    class _SidecarMock(MagicMock):
+        @classmethod
+        def serves_consumers(cls):
+            return None
+
+    mock_geom = _SidecarMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry(Geometry,4326)",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_geometries" sc_geometries '
+        "ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.get_main_geometry_field.return_value = "geom"
+    mock_geom.get_select_fields.return_value = []
+
+    mock_attr = _SidecarMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "region": FieldDefinition(
+            name="region",
+            sql_expression="sc_attributes.region",
+            data_type="string",
+            capabilities=[FieldCapability.GROUPABLE],
+        ),
+        "extra": FieldDefinition(
+            name="extra",
+            sql_expression="sc_attributes.extra",
+            data_type="string",
+        ),
+    }
+    mock_attr.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_attributes" sc_attributes '
+        "ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.get_main_geometry_field.return_value = None
+    # Narrowed "selective mode" projection under group_by — restricted to
+    # the grouped field, mirroring the real sidecar's group_by-aware gating
+    # (``get_select_fields(..., include_all=not query.group_by)``).
+    mock_attr.get_select_fields.return_value = ['sc_attributes.region as "region"']
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom
+        if getattr(sc, "sidecar_type", "") == "geometries"
+        else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    req = QueryRequest(
+        select=[FieldSelection(field="*"), FieldSelection(field="extra")],
+        group_by=["region"],
+    )
+
+    sql, _ = optimizer.build_optimized_query(req, "schema", "table")
+
+    sql_lower = sql.lower()
+    assert "extra" not in sql_lower, (
+        f"ungrouped, unaggregated override field 'extra' must not appear in "
+        f"SELECT alongside GROUP BY:\n{sql}"
+    )
+    assert "group by" in sql_lower
+
+
 # ---------------------------------------------------------------------------
 # items_schema → field_index enrichment (regression for the empty-MVT case
 # where a VECTOR collection's ``ItemsSchema`` declares user fields that live
@@ -1298,6 +1457,80 @@ def test_validate_query_sort_defaults_and_optout(mock_col_config, mock_registry)
 
 
 # ---------------------------------------------------------------------------
+# #2859 — validate_query diagnostic for a selected, ungrouped/unaggregated
+# field alongside an explicit group_by (previously a silent projection drop,
+# #2843).
+# ---------------------------------------------------------------------------
+
+
+def _group_by_fields() -> dict:
+    return {
+        "region": FieldDefinition(
+            name="region",
+            sql_expression="sc_test.region",
+            data_type="string",
+            capabilities=[FieldCapability.GROUPABLE],
+        ),
+        "id": FieldDefinition(
+            name="id", sql_expression="sc_test.id", data_type="string",
+        ),
+        "count": FieldDefinition(
+            name="count", sql_expression="sc_test.count", data_type="integer",
+        ),
+    }
+
+
+def test_validate_query_rejects_selected_ungrouped_unaggregated_field(
+    mock_col_config, mock_registry
+):
+    """``select=[id, region], group_by=[region]`` — "id" is neither grouped
+    nor aggregated. Must be reported by ``validate_query`` rather than
+    silently dropped at render time (the #2843 gap)."""
+    optimizer = _optimizer_with_fields(mock_col_config, mock_registry, _group_by_fields())
+    req = QueryRequest(
+        select=[FieldSelection(field="id"), FieldSelection(field="region")],
+        group_by=["region"],
+    )
+    errors = optimizer.validate_query(req)
+    assert any(
+        "id" in e and "neither grouped nor aggregated" in e for e in errors
+    ), errors
+
+
+def test_validate_query_allows_grouped_and_aggregated_selects(
+    mock_col_config, mock_registry
+):
+    """A field that is grouped, or aggregated, must not trigger the #2859
+    diagnostic — only a selected field that is neither must."""
+    optimizer = _optimizer_with_fields(mock_col_config, mock_registry, _group_by_fields())
+    req = QueryRequest(
+        select=[
+            FieldSelection(field="region"),
+            FieldSelection(field="count", aggregation="sum"),
+        ],
+        group_by=["region"],
+    )
+    errors = optimizer.validate_query(req)
+    assert not any("neither grouped nor aggregated" in e for e in errors), errors
+
+
+def test_validate_query_skips_ungrouped_check_for_wildcard_select(
+    mock_col_config, mock_registry
+):
+    """A wildcard select's rendered projection (sidecar expansion + explicit
+    overrides) isn't knowable at validate time, so the #2859 diagnostic must
+    not fire for it — the render-time guard in
+    ``build_optimized_query`` is the only defense there."""
+    optimizer = _optimizer_with_fields(mock_col_config, mock_registry, _group_by_fields())
+    req = QueryRequest(
+        select=[FieldSelection(field="*"), FieldSelection(field="id")],
+        group_by=["region"],
+    )
+    errors = optimizer.validate_query(req)
+    assert not any("neither grouped nor aggregated" in e for e in errors), errors
+
+
+# ---------------------------------------------------------------------------
 # #719 — projection alias quoting (regression for MVT mixed/upper-case fields)
 # ---------------------------------------------------------------------------
 
@@ -1466,4 +1699,124 @@ def test_build_optimized_query_quotes_upper_case_alias_star_path(
 
     assert 'as "CODE"' in sql, (
         f'Expected quoted alias as "CODE" in SQL on the wildcard path (got: {sql})'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bbox spatial filter — operator does not exist: && record (#2282)
+#
+# A bbox FilterCondition with operator="&&" and spatial_op=True was rendered
+# as ``&&(sc_geometries.geom, :filter_0)`` by build_optimized_query.
+# PostgreSQL parses the parenthesised pair as a composite/record type and
+# applies ``&&`` to that single record operand, raising:
+#   operator does not exist: && record
+# The fix renders infix spatial operators as ``expr op ST_GeomFromEWKT(:param)``
+# so both sides are typed geometry values.
+# ---------------------------------------------------------------------------
+
+
+def test_build_optimized_query_bbox_filter_emits_infix_not_function_form(
+    mock_col_config, mock_registry
+):
+    """A bbox FilterCondition (operator='&&', spatial_op=True, EWKT value) must
+    produce ``sc_geometries.geom && ST_GeomFromEWKT(:filter_0)`` in the WHERE
+    clause, not the broken ``&&(sc_geometries.geom, :filter_0)`` form that
+    PostgreSQL rejects with 'operator does not exist: && record'."""
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        "LEFT JOIN geom_table sc_geometries ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+
+    mock_registry.get_sidecar.side_effect = lambda sc, lenient=True: mock_geom
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    ewkt = "SRID=4326;POLYGON((1.0 2.0, 1.0 4.0, 3.0 4.0, 3.0 2.0, 1.0 2.0))"
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        filters=[
+            FilterCondition(
+                field="geom",
+                operator="&&",
+                value=ewkt,
+                spatial_op=True,
+            )
+        ],
+        raw_where=None,
+        include_total_count=False,
+    )
+
+    sql, params = optimizer.build_optimized_query(req, "myschema", "mytable")
+
+    # Correct infix form: geometry_col && ST_GeomFromEWKT(:param)
+    assert "sc_geometries.geom && ST_GeomFromEWKT(:filter_0)" in sql, (
+        f"Expected infix bbox predicate in SQL, got:\n{sql}"
+    )
+    # Broken record form must NOT appear
+    assert "&&(sc_geometries.geom," not in sql, (
+        f"Broken record-form &&(expr, :param) must not appear in SQL, got:\n{sql}"
+    )
+    assert params["filter_0"] == ewkt
+
+
+def test_build_optimized_query_st_intersects_uses_function_form(
+    mock_col_config, mock_registry
+):
+    """ST_Intersects (and other ST_* spatial operators) must still use the
+    function-call form ST_Intersects(expr, :param) — only infix operators
+    like && change to the infix form."""
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.FILTERABLE, FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        "LEFT JOIN geom_table sc_geometries ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+
+    mock_registry.get_sidecar.side_effect = lambda sc, lenient=True: mock_geom
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        filters=[
+            FilterCondition(
+                field="geom",
+                operator="ST_Intersects",
+                value="SRID=4326;POINT(1 2)",
+                spatial_op=True,
+            )
+        ],
+        raw_where=None,
+        include_total_count=False,
+    )
+
+    sql, params = optimizer.build_optimized_query(req, "myschema", "mytable")
+
+    # ST_* operators use function-call form
+    assert "ST_Intersects(sc_geometries.geom, :filter_0)" in sql, (
+        f"Expected ST_Intersects(expr, :param) in SQL, got:\n{sql}"
     )

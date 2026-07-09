@@ -19,9 +19,8 @@
 """Catalog-status extension service.
 
 Always-on extension that exposes catalog and collection provisioning/task
-status, and provides catalog-admin recovery operations (reprovision,
-dead-letter list/requeue).  Supersedes the corresponding routes that were
-previously hosted under the admin extension.
+status.  Recovery operations (reprovision, dead-letter list/requeue) have
+moved to the unified Tasks API under the ``/task`` prefix.
 
 URL prefix: ``/catalog``
 """
@@ -34,6 +33,10 @@ from typing import Optional
 from fastapi import APIRouter, FastAPI, HTTPException
 
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.resolvers import (
+    resolve_catalog_or_404,
+    resolve_collection_or_404,
+)
 from dynastore.models.protocols.catalogs import CatalogsProtocol
 from dynastore.modules import get_protocol
 
@@ -50,63 +53,6 @@ from dynastore.models.protocols.visibility import (  # noqa: E402
     resolve_catalog_listing_ids,
     resolve_collection_listing_ids,
 )
-
-
-# ---------------------------------------------------------------------------
-# DB / engine helpers — no admin imports
-# ---------------------------------------------------------------------------
-
-
-def _platform_engine():
-    """Return the SQLAlchemy async engine via DatabaseProtocol, or None."""
-    from dynastore.models.protocols import DatabaseProtocol
-
-    db = get_protocol(DatabaseProtocol)
-    return db.engine if db is not None else None
-
-
-# ---------------------------------------------------------------------------
-# DLQ primitives (imported from tasks maintenance; no admin dependency)
-# ---------------------------------------------------------------------------
-
-from dynastore.modules.tasks.maintenance import (  # noqa: E402
-    list_dead_letter_tasks as _dlq_list,
-    requeue_dead_letter_task as _dlq_requeue,
-)
-
-
-async def _catalog_task_schema(catalog_id: str, engine) -> str:
-    """Resolve the catalog's task-row ``schema_name`` (the tenant tag DLQ
-    queries filter on).  Reuses the tasks module's catalog→schema resolver."""
-    from dynastore.modules.tasks.tasks_module import _resolve_catalog_schema
-
-    return await _resolve_catalog_schema(catalog_id, engine)
-
-
-async def list_catalog_dead_letter(catalog_id: str) -> list[dict]:
-    """Dead-lettered tasks for one catalog (catalog-admin recovery view)."""
-    engine = _platform_engine()
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Database unavailable.")
-    schema = await _catalog_task_schema(catalog_id, engine)
-    return await _dlq_list(engine, schema_name=schema)  # type: ignore[arg-type]
-
-
-async def requeue_catalog_dead_letter(catalog_id: str, task_id: str) -> dict:
-    """One-shot recall of a dead-lettered task (catalog-admin).
-
-    Tenant-scoped: resolves the catalog's task ``schema_name`` and passes it
-    to ``requeue_dead_letter_task``, whose UPDATE only matches a task carrying
-    that tenant tag.  A catalog admin therefore cannot requeue another
-    catalog's task even by guessing its id — the UPDATE matches nothing and
-    returns ``requeued: false``.
-    """
-    engine = _platform_engine()
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Database unavailable.")
-    schema = await _catalog_task_schema(catalog_id, engine)
-    ok = await _dlq_requeue(engine, task_id, reset_retries=True, schema_name=schema)  # type: ignore[arg-type]
-    return {"task_id": task_id, "requeued": bool(ok)}
 
 
 # ---------------------------------------------------------------------------
@@ -197,11 +143,7 @@ class CatalogStatusService(ExtensionProtocol):
             raise HTTPException(
                 status_code=503, detail="Catalogs service not available."
             )
-        catalog = await catalogs.get_catalog_model(catalog_id)
-        if catalog is None:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        catalog = await resolve_catalog_or_404(catalogs, catalog_id, use_model=True)
 
         provisioning_status = getattr(catalog, "provisioning_status", "ready") or "ready"
 
@@ -226,8 +168,13 @@ class CatalogStatusService(ExtensionProtocol):
                         tasks = await tasks_module.list_tasks(
                             conn, schema=physical_schema, limit=20, offset=0,
                         )
+                    # Accept both the current task type ("catalog_provision",
+                    # enqueued by create_catalog since #2329) and the legacy
+                    # type ("gcp_provision_catalog", enqueued by the old GCP
+                    # module and by the reprovision endpoint).
                     provision_tasks = [
-                        t for t in tasks if t.task_type == "gcp_provision_catalog"
+                        t for t in tasks
+                        if t.task_type in ("catalog_provision", "gcp_provision_catalog")
                     ]
                     if provision_tasks:
                         t = sorted(
@@ -256,11 +203,24 @@ class CatalogStatusService(ExtensionProtocol):
                         exc_info=True,
                     )
 
+        provisioning_checklist: dict[str, str] = {}
+        if physical_schema:
+            try:
+                provisioning_checklist = await catalogs.get_provisioning_checklist(physical_schema)
+            except Exception as exc:
+                logger.warning(
+                    "catalog_status: failed to read provisioning_checklist for "
+                    "catalog %s: %s",
+                    catalog_id, exc,
+                    exc_info=True,
+                )
+
         return CatalogStatusView(
-            catalog_id=catalog_id,
-            physical_schema=physical_schema,
+            external_id=catalog_id,
+            id=physical_schema,
             provisioning_status=provisioning_status,
             task=task_view,
+            provisioning_checklist=provisioning_checklist,
         )
 
     # -------------------------------------------------------------------------
@@ -299,21 +259,13 @@ class CatalogStatusService(ExtensionProtocol):
                 status_code=503, detail="Catalogs service not available."
             )
 
-        catalog = await catalogs.get_catalog_model(catalog_id)
-        if catalog is None:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        catalog = await resolve_catalog_or_404(catalogs, catalog_id, use_model=True)
 
         # get_collection already enforces visibility (returns None for hidden).
-        collection = await catalogs.get_collection(catalog_id, collection_id)
-        if collection is None:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Collection '{collection_id}' not found in catalog '{catalog_id}'."
-                ),
-            )
+        await resolve_collection_or_404(
+            catalogs, catalog_id, collection_id,
+            detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
+        )
 
         provisioning_status = getattr(catalog, "provisioning_status", "ready") or "ready"
 
@@ -330,128 +282,9 @@ class CatalogStatusService(ExtensionProtocol):
             )
 
         return CollectionStatusView(
-            catalog_id=catalog_id,
+            catalog_external_id=catalog_id,
             collection_id=collection_id,
-            physical_schema=physical_schema,
+            catalog_id=physical_schema,
             catalog_provisioning_status=provisioning_status,
         )
 
-    # -------------------------------------------------------------------------
-    # POST /catalog/catalogs/{catalog_id}/reprovision
-    # -------------------------------------------------------------------------
-
-    @router.post(
-        "/catalogs/{catalog_id}/reprovision",
-        status_code=202,
-        summary="Re-enqueue the gcp_provision_catalog task for a catalog.",
-    )
-    async def reprovision_catalog(catalog_id: str):  # type: ignore[reportGeneralTypeIssues]
-        """Re-trigger GCP provisioning for a catalog.
-
-        Idempotent: the underlying task is already idempotent (bucket ensure +
-        eventing attach). Useful when eventing was degraded due to a missing
-        IAM grant — fix the grant, then call this endpoint to repair without
-        recreating the catalog.
-
-        Gated by the ``catalog_status_admin`` policy (sysadmin + admin +
-        catalog-admin delegation via ``catalog_admin_required`` condition).
-        """
-        from dynastore.modules.tasks import tasks_module
-        from dynastore.modules.tasks.models import TaskCreate
-        from dynastore.models.protocols import DatabaseProtocol
-
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalogs is None:
-            raise HTTPException(
-                status_code=503, detail="Catalogs service not available."
-            )
-        catalog = await catalogs.get_catalog_model(catalog_id)
-        if catalog is None:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
-
-        db = get_protocol(DatabaseProtocol)
-        if db is None:
-            raise HTTPException(status_code=503, detail="Database unavailable.")
-
-        provisioning_status = getattr(catalog, "provisioning_status", "ready") or "ready"
-
-        task = await tasks_module.create_task_for_catalog(
-            engine=db.engine,
-            task_data=TaskCreate(
-                caller_id="system:admin",
-                task_type="gcp_provision_catalog",
-                inputs={"catalog_id": catalog_id},
-            ),
-            catalog_id=catalog_id,
-        )
-        if task is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Task enqueue returned None (possible dedup collision).",
-            )
-        return {
-            "task_id": str(task.task_id),
-            "catalog_id": catalog_id,
-            "provisioning_status": provisioning_status,
-            "status": "queued",
-        }
-
-    # -------------------------------------------------------------------------
-    # GET /catalog/catalogs/{catalog_id}/dead-letter
-    # -------------------------------------------------------------------------
-
-    @router.get(
-        "/catalogs/{catalog_id}/dead-letter",
-        summary="List dead-lettered tasks for this catalog (catalog-admin).",
-    )
-    async def list_catalog_dead_letter_view(catalog_id: str):  # type: ignore[reportGeneralTypeIssues]
-        """List dead-lettered tasks scoped to this catalog.
-
-        Tenant-scoped via the catalog's task schema tag; a caller cannot
-        enumerate dead-letter tasks for a catalog they do not administer.
-        Gated by ``catalog_status_admin``.
-        """
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalogs is None:
-            raise HTTPException(
-                status_code=503, detail="Catalogs service not available."
-            )
-        catalog = await catalogs.get_catalog_model(catalog_id)
-        if catalog is None:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
-        return await list_catalog_dead_letter(catalog_id)
-
-    # -------------------------------------------------------------------------
-    # POST /catalog/catalogs/{catalog_id}/dead-letter/{task_id}/requeue
-    # -------------------------------------------------------------------------
-
-    @router.post(
-        "/catalogs/{catalog_id}/dead-letter/{task_id}/requeue",
-        summary="One-shot recall of a dead-lettered task (catalog-admin).",
-    )
-    async def requeue_catalog_dead_letter_view(
-        catalog_id: str,  # type: ignore[reportGeneralTypeIssues]
-        task_id: str,
-    ):
-        """Move a dead-lettered task back to PENDING for re-processing.
-
-        Tenant-scoped: the requeue UPDATE only matches tasks carrying the
-        catalog's schema tag, so a catalog admin cannot requeue tasks from
-        another catalog even by guessing a task id.
-        Gated by ``catalog_status_admin``.
-        """
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalogs is None:
-            raise HTTPException(
-                status_code=503, detail="Catalogs service not available."
-            )
-        catalog = await catalogs.get_catalog_model(catalog_id)
-        if catalog is None:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
-        return await requeue_catalog_dead_letter(catalog_id, task_id)

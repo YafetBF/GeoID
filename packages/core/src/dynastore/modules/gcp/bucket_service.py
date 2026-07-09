@@ -23,11 +23,19 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from google.cloud import storage
+    from dynastore.modules.storage.circuit_breaker import CircuitBreaker
 else:
     try:
         from google.cloud import storage
     except ImportError:
         storage = None
+
+try:
+    from google.api_core import retry
+    from google.cloud.exceptions import GoogleCloudError
+except ImportError:
+    retry = None  # type: ignore
+    GoogleCloudError = Exception  # type: ignore
 
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
@@ -98,12 +106,17 @@ class BucketService:
         storage_client: "storage.Client",
         project_id: str,
         region: str,
+        breaker: Optional["CircuitBreaker"] = None,
     ):
         self._engine = engine
         self._config_service = config_service
         self.storage_client = storage_client
         self.project_id = project_id
         self.region = region
+        # Per-bucket circuit breaker passed from GCPModule.  When None (e.g.
+        # test context without a full lifespan), _apply_bucket_settings falls
+        # back to the legacy google.api_core.retry.Retry path.
+        self._breaker = breaker
 
     @property
     def engine(self) -> DbResource:
@@ -370,6 +383,23 @@ class BucketService:
 
         await run_in_thread(blob.download_to_filename, target_path)
 
+    async def download_file_content(self, path: str) -> Optional[bytes]:
+        """StorageProtocol: Downloads a full object as bytes, or None if absent."""
+        if not path.startswith("gs://"):
+            raise ValueError(f"Invalid GCS path: {path}")
+
+        bucket_name, blob_name = path[5:].split("/", 1)
+        blob = self.storage_client.bucket(bucket_name).blob(blob_name)
+
+        def _fetch():
+            from google.api_core.exceptions import NotFound
+            try:
+                return blob.download_as_bytes()
+            except NotFound:
+                return None
+
+        return await run_in_thread(_fetch)
+
     async def file_exists(self, path: str) -> bool:
         """StorageProtocol: Checks if a file exists in storage."""
         if not path.startswith("gs://"):
@@ -390,6 +420,11 @@ class BucketService:
         """
         Polls for bucket existence with exponential backoff.
         Returns True if the bucket becomes visible, False if retries are exhausted.
+
+        Each poll miss emits a structured WARNING so GCP log-based metrics can
+        track readiness-wait patterns alongside transient-error retries:
+
+            gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s
         """
         bucket = self.storage_client.bucket(bucket_name)
         for attempt in range(1, max_retries + 1):
@@ -397,13 +432,22 @@ class BucketService:
                 return True
             if attempt < max_retries:
                 delay = initial_delay * (2 ** (attempt - 1))
-                logger.debug(
-                    f"Attempt {attempt}/{max_retries}: Bucket '{bucket_name}' not ready. "
-                    f"Retrying in {delay}s..."
+                logger.warning(
+                    "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+                    bucket_name,
+                    "wait_for_bucket_ready",
+                    attempt,
+                    max_retries,
+                    "NotReady: bucket not yet visible",
                 )
                 await asyncio.sleep(delay)
         logger.warning(
-            f"Bucket '{bucket_name}' not ready after {max_retries} attempts."
+            "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+            bucket_name,
+            "wait_for_bucket_ready",
+            max_retries,
+            max_retries,
+            "NotReady: bucket not visible after all attempts",
         )
         return False
 
@@ -417,6 +461,18 @@ class BucketService:
         blob = bucket.blob(blob_name)
 
         await run_in_thread(blob.delete)
+
+    async def list_prefix(self, base_uri: str, prefix: str) -> list:
+        """StorageProtocol: List ``gs://`` object paths under a bucket + key prefix."""
+        if not base_uri.startswith("gs://"):
+            raise ValueError(f"Invalid GCS path: {base_uri}")
+        bucket_name = base_uri[5:].split("/", 1)[0]
+        bucket = self.storage_client.bucket(bucket_name)
+
+        def _list() -> list:
+            return [f"gs://{bucket_name}/{blob.name}" for blob in bucket.list_blobs(prefix=prefix)]
+
+        return await run_in_thread(_list)
 
 
     async def download_bytes_range(self, path: str, offset: int, length: int) -> bytes:
@@ -809,17 +865,30 @@ class BucketService:
     async def _apply_bucket_settings(
         self, bucket_name: str, config: GcpCatalogBucketConfig
     ):
-        """
-        Maps the declarative Pydantic configuration to the GCS bucket properties.
-        This handles partial updates for mutable fields.
+        """Map the declarative Pydantic configuration to the GCS bucket properties.
+
+        This handles partial updates for mutable fields and is idempotent, making
+        it safe to retry on transient failures.
+
+        When a per-bucket :class:`CircuitBreaker` is available (set at lifespan
+        startup via ``GCPModule``), retries are handled by
+        :func:`~gcs_retry.gcs_run_with_retry`, which:
+
+        * emits a structured ``gcs_operation_retry`` WARNING on each non-final retry,
+        * records successes and failures to the breaker keyed on ``bucket_name``.
+
+        Without a breaker (test contexts / bare ``BucketService`` construction)
+        the legacy ``google.api_core.retry.Retry`` path is used as a fallback so
+        existing behaviour is preserved.
         """
         if not self.storage_client:
             logger.warning(
-                f"Storage client not available. Skipping update for bucket '{bucket_name}'."
+                "Storage client not available. Skipping update for bucket '%s'.",
+                bucket_name,
             )
             return
 
-        def _sync_update():
+        def _sync_update() -> None:
             bucket = self.storage_client.bucket(bucket_name)
             needs_patch = False
 
@@ -838,7 +907,7 @@ class BucketService:
                     cors_list.append(rule_dict)
 
                 logger.info(
-                    f"Applying CORS rules to bucket '{bucket_name}': {cors_list}"
+                    "Applying CORS rules to bucket '%s': %s", bucket_name, cors_list
                 )
                 bucket.cors = cors_list
                 needs_patch = True
@@ -850,15 +919,56 @@ class BucketService:
             if needs_patch:
                 bucket.patch()
                 logger.info(
-                    f"Successfully applied settings to GCS bucket '{bucket_name}'."
+                    "Successfully applied settings to GCS bucket '%s'.", bucket_name
                 )
 
-        try:
-            await run_in_thread(_sync_update)
-        except Exception as e:
-            logger.error(
-                f"Failed to patch GCS bucket '{bucket_name}': {e}", exc_info=True
-            )
+        if self._breaker is not None:
+            # Preferred path: async retry with structured observability and breaker.
+            from dynastore.modules.gcp.gcs_retry import gcs_run_with_retry
+
+            try:
+                await gcs_run_with_retry(
+                    lambda: run_in_thread(_sync_update),
+                    bucket=bucket_name,
+                    operation="patch_cors",
+                    breaker=self._breaker,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to patch GCS bucket '%s': %s", bucket_name, e,
+                    exc_info=True,
+                )
+                raise
+        else:
+            # Fallback path: legacy google.api_core.retry.Retry (no breaker).
+            def _sync_update_with_retry() -> None:
+                if retry is None:
+                    return _sync_update()
+
+                @retry.Retry(
+                    predicate=retry.if_exception_type(
+                        GoogleCloudError,
+                        ConnectionError,
+                        TimeoutError,
+                    ),
+                    initial=1.0,
+                    maximum=10.0,
+                    multiplier=2.0,
+                    deadline=60.0,
+                )
+                def _retry_wrapper():
+                    return _sync_update()
+
+                return _retry_wrapper()
+
+            try:
+                await run_in_thread(_sync_update_with_retry)
+            except Exception as e:
+                logger.error(
+                    "Failed to patch GCS bucket '%s': %s", bucket_name, e,
+                    exc_info=True,
+                )
+                raise
 
     async def teardown_gcs_notification(
         self, bucket_name: str, gcs_notification_id: str
@@ -888,7 +998,11 @@ class BucketService:
         await run_in_thread(_delete_notification)
 
     async def drop_storage(
-        self, catalog_id: str, conn: Optional[DbResource] = None
+        self,
+        catalog_id: str,
+        conn: Optional[DbResource] = None,
+        physical_schema: Optional[str] = None,
+        bucket_name: Optional[str] = None,
     ) -> bool:
         """Remove the GCS bucket and its DB link for a catalog.
 
@@ -897,25 +1011,54 @@ class BucketService:
         Returns True when cleanup completed successfully.
 
         Raises on unexpected GCS errors so callers can retry.
-        """
-        bucket_name = await self.get_storage_identifier(catalog_id)
 
-        # Fallback: if DB record is gone (e.g. schema already dropped), try deterministic name.
-        if not bucket_name:
+        Recreation-safe teardown path (#2298): a catalog hard-deleted and rapidly
+        recreated under a *new* schema would, on a ``catalog_id``-keyed DB lookup,
+        resolve to the *new* catalog's bucket and delete it. To target only the
+        *old* bucket, callers pass an explicit target captured at delete time:
+
+        * ``bucket_name`` — the authoritative name persisted on the old catalog's
+          config (preferred; correct even for legacy catalogs whose bucket name
+          does not embed the schema), or
+        * ``physical_schema`` — from which the name is reconstructed
+          deterministically (fallback when no persisted name was captured).
+
+        In either explicit-target mode the DB is never consulted for the name nor
+        mutated, leaving the live (recreated) catalog's bucket and config link
+        untouched. ``bucket_name`` wins when both are supplied.
+        """
+        explicit_target = physical_schema is not None or bucket_name is not None
+        if bucket_name is None and physical_schema is not None:
             try:
-                bucket_name = self.generate_bucket_name(catalog_id)
-                logger.info(
-                    "BucketService.drop_storage: DB record missing for %r; "
-                    "falling back to deterministic bucket name %r.",
-                    catalog_id, bucket_name,
+                bucket_name = self.generate_bucket_name(
+                    catalog_id, physical_schema=physical_schema
                 )
             except Exception as e:
                 logger.warning(
-                    "BucketService.drop_storage: cannot determine bucket name "
-                    "for catalog %r: %s",
-                    catalog_id, e,
+                    "BucketService.drop_storage: cannot derive schema-targeted "
+                    "bucket name for catalog %r (schema %r): %s",
+                    catalog_id, physical_schema, e,
                 )
-                return True  # Nothing to clean up.
+                return True  # Nothing safely targetable; idempotent success.
+        elif not explicit_target:
+            bucket_name = await self.get_storage_identifier(catalog_id)
+
+            # Fallback: if DB record is gone (e.g. schema already dropped), try deterministic name.
+            if not bucket_name:
+                try:
+                    bucket_name = self.generate_bucket_name(catalog_id)
+                    logger.info(
+                        "BucketService.drop_storage: DB record missing for %r; "
+                        "falling back to deterministic bucket name %r.",
+                        catalog_id, bucket_name,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "BucketService.drop_storage: cannot determine bucket name "
+                        "for catalog %r: %s",
+                        catalog_id, e,
+                    )
+                    return True  # Nothing to clean up.
 
         if not bucket_name:
             return True  # No bucket provisioned; idempotent success.
@@ -927,13 +1070,17 @@ class BucketService:
             # when a catalog-scoped config row actually exists and still carries a
             # name, so a catalog whose schema is already gone is never
             # resurrected and inherited defaults are never pinned at this tier.
-            persisted = await self.config_service.get_persisted_config(
-                GcpCatalogBucketConfig, catalog_id=catalog_id
-            )
-            if persisted and persisted.get("bucket_name"):
-                cfg = GcpCatalogBucketConfig.model_validate(persisted)
-                async with managed_transaction(self.engine) as conn:
-                    await self._write_bucket_name(conn, catalog_id, cfg, None)
+            # Recreation-safe path (#2298) only deletes the old physical bucket
+            # by name; it must never clear the config link, which now belongs to
+            # the freshly recreated catalog under a different schema.
+            if not explicit_target:
+                persisted = await self.config_service.get_persisted_config(
+                    GcpCatalogBucketConfig, catalog_id=catalog_id
+                )
+                if persisted and persisted.get("bucket_name"):
+                    cfg = GcpCatalogBucketConfig.model_validate(persisted)
+                    async with managed_transaction(self.engine) as conn:
+                        await self._write_bucket_name(conn, catalog_id, cfg, None)
 
             # Force-delete the bucket (empties objects then deletes the bucket).
             try:

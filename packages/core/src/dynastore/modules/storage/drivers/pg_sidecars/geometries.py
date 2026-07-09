@@ -56,6 +56,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     SimplificationAlgorithm,
 )
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.tools.db import quote_ident as _canonical_quote_ident
 from dynastore.tools.geospatial_exceptions import SridMismatchError
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,18 @@ _SIMPLIFY_SQL_FUNCTIONS: Dict[str, str] = {
     SimplificationAlgorithm.DOUGLAS_PEUCKER.value: "ST_Simplify",
     SimplificationAlgorithm.TOPOLOGY_PRESERVING.value: "ST_SimplifyPreserveTopology",
     SimplificationAlgorithm.VISVALINGAM_WHYATT.value: "ST_SimplifyVW",
+    # ST_SnapToGrid(geom, gridsize): O(n) coordinate-snap.  The gridsize maps
+    # directly to the ``simplification`` tolerance (source-CRS units), which the
+    # per-zoom defaults calibrate to ~half a MVT pixel width — precisely the
+    # right grid resolution.  Fastest pre-pass before ST_AsMVTGeom because it
+    # requires no recursive distance comparisons; sub-pixel rings collapse to
+    # degenerate geometry that ST_AsMVTGeom silently drops.
+    SimplificationAlgorithm.SNAP_TO_GRID.value: "ST_SnapToGrid",
 }
+# Default when no algorithm key matches.  The accurate topology-preserving function
+# is the safe fallback: it never produces self-intersecting rings and matches the
+# default TilesConfig.simplification_algorithm (TOPOLOGY_PRESERVING).
+# ST_SnapToGrid is available as an explicit opt-in via the SNAP_TO_GRID enum value.
 _DEFAULT_SIMPLIFY_SQL_FUNCTION = "ST_SimplifyPreserveTopology"
 
 
@@ -84,11 +96,11 @@ def _quote_ident(name: str) -> str:
     Unquoted identifiers are folded to lowercase by Postgres, which breaks
     consumers that reference the column by its original mixed/upper-case name.
     Idempotent: an already-quoted name is returned unchanged. See #719.
+
+    Thin wrapper around the canonical ``dynastore.tools.db.quote_ident``
+    (#2700) — kept as a local alias so call sites in this module don't churn.
     """
-    n = name.strip()
-    if n.startswith('"') and n.endswith('"'):
-        return n
-    return '"' + n.replace('"', '""') + '"'
+    return _canonical_quote_ident(name.strip())
 
 
 def _derive_bbox_from_shapely(geom: Any) -> Optional[Tuple[float, float, float, float]]:
@@ -265,8 +277,21 @@ class GeometriesSidecar(SidecarProtocol):
     def get_default_config(cls, context: Dict[str, Any]) -> Optional[GeometriesSidecarConfig]:
         """Auto-inject geometries sidecar by default.
 
-        Skipped for RECORDS collections which have no spatial component.
+        Skipped for RECORDS collections which have no spatial component,
+        unless the collection's ``CollectionInfo.allow_geometry`` capability
+        override (RFC #2550) forces the decision either way:
+
+        - ``allow_geometry is True`` → inject regardless of kind (e.g. a
+          RECORDS collection carrying a real footprint geometry).
+        - ``allow_geometry is False`` → never inject, regardless of kind.
+        - ``allow_geometry is None`` (default/unset) → fall back to the
+          kind-derived default below, unchanged from before.
         """
+        allow_geometry = context.get("allow_geometry")
+        if allow_geometry is True:
+            return GeometriesSidecarConfig()
+        if allow_geometry is False:
+            return None
         if context.get("collection_type") == "RECORDS":
             return None
         return GeometriesSidecarConfig()
@@ -827,25 +852,57 @@ class GeometriesSidecar(SidecarProtocol):
             sort_fields = {s.field for s in (request.sort or [])} if hasattr(request, "sort") and request.sort else set()
             all_needed = requested | filter_fields | sort_fields
 
-            if not skip_geom and (
-                self.config.geom_column in all_needed
-                or "geometry" in all_needed
-                or "*" in requested
-                or not requested
+            # #2829: a GROUP BY request must not pull in geometry/bbox/H3/S2/
+            # statistics columns that are neither grouped nor aggregated —
+            # PostgreSQL rejects any SELECT-list column that isn't. When
+            # ``group_by`` is set, ``_include`` narrows inclusion to exactly
+            # those field names and ignores ``default`` (the ordinary
+            # per-field requested/filter/sort/wildcard/empty-select rule
+            # below, preserved as-is for the non-grouped case).
+            group_by_fields = set(request.group_by) if request.group_by else None
+
+            def _include(*names: str, default: bool) -> bool:
+                if group_by_fields is not None:
+                    return any(n in group_by_fields for n in names)
+                return default
+
+            if not skip_geom and _include(
+                self.config.geom_column,
+                "geometry",
+                default=(
+                    self.config.geom_column in all_needed
+                    or "geometry" in all_needed
+                    or "*" in requested
+                    or not requested
+                ),
             ):
                 fields.append(f"ST_AsGeoJSON({alias}.{self.config.geom_column})::jsonb as {self.config.geom_column}")
 
-            if self.config.bbox_column and ("bbox" in all_needed or self.config.bbox_column in all_needed or "*" in requested):
+            if self.config.bbox_column and _include(
+                "bbox",
+                self.config.bbox_column,
+                default=(
+                    "bbox" in all_needed
+                    or self.config.bbox_column in all_needed
+                    or "*" in requested
+                ),
+            ):
                 fields.append(f"ST_AsGeoJSON({alias}.{self.config.bbox_column})::jsonb as {self.config.bbox_column}")
 
             if self.config.h3_resolutions:
                 for res in self.config.h3_resolutions:
-                    if f"h3_res{res}" in all_needed or "*" in requested:
+                    if _include(
+                        f"h3_res{res}",
+                        default=(f"h3_res{res}" in all_needed or "*" in requested),
+                    ):
                         fields.append(f"{alias}.h3_res{res} as h3_res{res}")
 
             if self.config.s2_resolutions:
                 for res in self.config.s2_resolutions:
-                    if f"s2_res{res}" in all_needed or "*" in requested:
+                    if _include(
+                        f"s2_res{res}",
+                        default=(f"s2_res{res}" in all_needed or "*" in requested),
+                    ):
                         fields.append(f"{alias}.s2_res{res} as s2_res{res}")
 
             # Add Statistics if requested — overlay-driven, COLUMNAR fields
@@ -853,14 +910,17 @@ class GeometriesSidecar(SidecarProtocol):
             # ``geom_stats`` column.
             for f in self._columnar_fields():
                 key = f.resolved_name
-                if key not in all_needed and "*" not in requested:
+                if not _include(
+                    key, default=(key in all_needed or "*" in requested)
+                ):
                     continue
                 if f.kind == ComputedKind.CENTROID:
                     fields.append(self._centroid_select_field(f, alias))
                 else:
                     fields.append(f"{alias}.{key} as {_quote_ident(key)}")
-            if self._has_jsonb_stats() and (
-                "geom_stats" in all_needed or "*" in requested
+            if self._has_jsonb_stats() and _include(
+                "geom_stats",
+                default=("geom_stats" in all_needed or "*" in requested),
             ):
                 fields.append(f"{alias}.geom_stats as geom_stats")
 
@@ -893,22 +953,9 @@ class GeometriesSidecar(SidecarProtocol):
 
         return fields
 
-    def get_join_clause(
-        self,
-        schema: str,
-        hub_table: str,
-        hub_alias: str = "h",
-        sidecar_alias: Optional[str] = None,
-        join_type: str = "LEFT",
-        extra_condition: Optional[str] = None,
-    ) -> str:
-        """Returns JOIN clause for geometry sidecar (geoid-only join)."""
-        alias = sidecar_alias or f"sc_{self.sidecar_id}"
-        table = f"{hub_table}_geometries"
-        on_clause = f"{hub_alias}.geoid = {alias}.geoid"
-        if extra_condition:
-            on_clause = f"{on_clause} {extra_condition}"
-        return f'{join_type} JOIN "{schema}"."{table}" {alias} ON {on_clause}'
+    # get_join_clause: uses the SidecarProtocol base default (plain
+    # hub.geoid = sidecar.geoid join against "{hub_table}_geometries",
+    # since sidecar_id is always "geometries").
 
     def get_spatial_condition(
         self,
@@ -952,7 +999,18 @@ class GeometriesSidecar(SidecarProtocol):
         target_srid = params.get("target_srid", source_srid)
         geom_col = f"{alias}.{self.config.geom_column}"
 
-        # 2. Transform Logic
+        # 2. Simplification — runs in source CRS so :simplification tolerances are
+        # interpreted in source units (degrees for EPSG:4326 collections, metres for
+        # EPSG:3857). The simplification_by_zoom defaults are degree-based; applying
+        # them before ST_Transform keeps ~5 km resolution at z=0 for 4326 sources.
+        simplification = params.get("simplification")
+        if simplification and simplification > 0:
+            algo = params.get("simplification_algorithm") or ""
+            func = _SIMPLIFY_SQL_FUNCTIONS.get(algo, _DEFAULT_SIMPLIFY_SQL_FUNCTION)
+            geom_col = f"{func}({geom_col}, :simplification)"
+
+        # 3. Transform — after simplification so the projection operates on already-
+        # reduced vertex counts rather than projecting full-complexity geometry first.
         if target_srid != source_srid:
             # ``ST_Transform`` is overloaded — ``(geometry, integer)`` and
             # ``(geometry, text)`` (a proj string). A bare untyped bind param
@@ -960,13 +1018,6 @@ class GeometriesSidecar(SidecarProtocol):
             # SRID ("expected str, got int"). The cast pins the param type to
             # integer (matching the tile-bounds expression below).
             geom_col = f"ST_Transform({geom_col}, CAST(:target_srid AS INTEGER))"
-
-        # 3. Simplification
-        simplification = params.get("simplification")
-        if simplification and simplification > 0:
-            algo = params.get("simplification_algorithm") or ""
-            func = _SIMPLIFY_SQL_FUNCTIONS.get(algo, _DEFAULT_SIMPLIFY_SQL_FUNCTION)
-            geom_col = f"{func}({geom_col}, :simplification)"
 
         # 4. Final Formatting
         geom_format = params.get("geom_format", "WKB")
@@ -1681,8 +1732,26 @@ class GeometriesSidecar(SidecarProtocol):
         queryable at the SQL layer for write policies but is hidden from
         API consumers by default to avoid leaking storage plumbing into
         Feature.properties.
+
+        ``bbox_xmin``/``bbox_ymin``/``bbox_xmax``/``bbox_ymax`` are the
+        scalar ``ST_XMin``/``ST_YMin``/``ST_XMax``/``ST_YMax`` columns
+        projected in place of the full geometry when ``skipGeometry=true``
+        (#2899), consumed by ``map_row_to_feature`` above to populate
+        ``feature.bbox``. Excluding them here keeps them out of the
+        attributes sidecar's whole-row context publish, so they don't
+        flatten onto the Feature root as foreign members duplicating
+        ``bbox``.
         """
-        cols = {"geom", "bbox_geom", "geohash"}
+        cols = {
+            "geom",
+            "geom_type",
+            "bbox_geom",
+            "geohash",
+            "bbox_xmin",
+            "bbox_ymin",
+            "bbox_xmax",
+            "bbox_ymax",
+        }
         if self._has_jsonb_stats():
             cols.add("geom_stats")
         for f in self._columnar_fields():

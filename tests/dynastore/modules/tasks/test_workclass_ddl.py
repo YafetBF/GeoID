@@ -54,6 +54,8 @@ from dynastore.modules.tasks.workclass_ddl import (
     STORAGE_INDEXES_DDL,
     STORAGE_PARTCREATE_FUNC_DDL,
     STORAGE_RETENTION_FUNC_DDL,
+    render_partition_create_ahead_ddl,
+    render_partition_retention_ddl,
     _WORKCLASS_CREATE_AHEAD_DAYS,
     _WORKCLASS_RETENTION_DAYS,
 )
@@ -111,11 +113,11 @@ def test_events_scope_lowercase_check():
     assert "CHECK (scope = lower(scope))" in sql
 
 
-def test_events_fairness_index_leads_schema_name():
-    """Fairness partial index must lead with schema_name and be WHERE status='PENDING'."""
+def test_events_fairness_index_leads_catalog_id():
+    """Fairness partial index must lead with catalog_id and be WHERE status='PENDING'."""
     sql = _render(EVENTS_INDEXES_DDL)
-    # The index columns must start with schema_name
-    assert "(schema_name, created_at)" in sql
+    # The index columns must start with catalog_id (the tenant-routing key)
+    assert "(catalog_id, created_at)" in sql
     assert "WHERE status = 'PENDING'" in sql
 
 
@@ -615,6 +617,74 @@ async def test_ensure_workclass_storage_exists_twice_no_error():
 
 
 # ---------------------------------------------------------------------------
+# Shared partition-management template (issue #2702) — pin the generated SQL
+# for all three (table, granularity, window, retention) parameterizations so
+# a future edit to the template cannot silently change what any of the three
+# workclass tables actually gets provisioned with.
+# ---------------------------------------------------------------------------
+
+
+def test_render_events_create_ahead_matches_module_constant():
+    rendered = render_partition_create_ahead_ddl(
+        table="events", granularity="day", window=_WORKCLASS_CREATE_AHEAD_DAYS
+    )
+    assert rendered == EVENTS_PARTCREATE_FUNC_DDL
+
+
+def test_render_events_retention_matches_module_constant():
+    rendered = render_partition_retention_ddl(
+        table="events", granularity="day", retention=_WORKCLASS_RETENTION_DAYS
+    )
+    assert rendered == EVENTS_RETENTION_FUNC_DDL
+
+
+def test_render_storage_create_ahead_matches_module_constant():
+    rendered = render_partition_create_ahead_ddl(
+        table="storage", granularity="day", window=_WORKCLASS_CREATE_AHEAD_DAYS
+    )
+    assert rendered == STORAGE_PARTCREATE_FUNC_DDL
+
+
+def test_render_storage_retention_matches_module_constant():
+    rendered = render_partition_retention_ddl(
+        table="storage", granularity="day", retention=_WORKCLASS_RETENTION_DAYS
+    )
+    assert rendered == STORAGE_RETENTION_FUNC_DDL
+
+
+def test_render_tasks_create_ahead_pinned():
+    """Pin the monthly (tasks.tasks) create-ahead rendering — 4-month window."""
+    rendered = render_partition_create_ahead_ddl(table="tasks", granularity="month", window=4)
+    assert 'CREATE OR REPLACE FUNCTION "{schema}"."create_partitions_{schema}_tasks"()' in rendered
+    assert "FOR i IN 0..3 LOOP" in rendered
+    assert "date_trunc('month', NOW())" in rendered
+    assert "start_date := target_date;" in rendered
+    assert "end_date := target_date + INTERVAL '1 month';" in rendered
+    assert "part_name   := 'tasks_' || to_char(target_date, 'YYYY_MM');" in rendered
+    assert "PARTITION OF \"{schema}\".tasks" in rendered
+
+
+def test_render_tasks_retention_pinned():
+    """Pin the monthly (tasks.tasks) retention rendering — 1-month retention."""
+    rendered = render_partition_retention_ddl(table="tasks", granularity="month", retention=1)
+    assert 'CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_tasks"()' in rendered
+    # Regression guard for #1998: must use date_trunc('day', ...), never 'daily'.
+    assert "date_trunc('day', NOW())" in rendered
+    assert "date_trunc('daily'" not in rendered
+    assert r"tasks_\d{4}_\d{2}" in rendered
+    assert r"\d{{4}}" not in rendered
+    assert "WHERE timestamp <" in rendered
+    assert "tasks_default" in rendered
+
+
+def test_render_functions_reject_unknown_granularity():
+    with pytest.raises(KeyError):
+        render_partition_create_ahead_ddl(table="tasks", granularity="week", window=1)
+    with pytest.raises(KeyError):
+        render_partition_retention_ddl(table="tasks", granularity="week", retention=1)
+
+
+# ---------------------------------------------------------------------------
 # Live-PG tests (skip when no PG is available)
 # ---------------------------------------------------------------------------
 
@@ -737,7 +807,7 @@ async def test_live_pg_events_table_structure(workclass_async_conn):
         col_names = {r["column_name"] for r in cols}
 
         expected = {
-            "event_id", "day", "shard", "schema_name", "scope", "status",
+            "event_id", "day", "shard", "catalog_id", "scope", "status",
             "payload", "claim_version", "owner_id", "locked_until",
             "retry_count", "max_retries", "created_at", "processed_at",
         }

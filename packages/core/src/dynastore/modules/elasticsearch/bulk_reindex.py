@@ -33,19 +33,51 @@ client/mappings imports — no extra import gating needed here.
 """
 from __future__ import annotations
 
+import json as _json
 import logging
-from typing import Any, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Iterator, List, Optional, Tuple
 
 # Module-level imports give tests a stable patch target:
 #   ``dynastore.modules.elasticsearch.bulk_reindex.<name>``.
 # The router does not import from bulk_reindex so there is no cycle.
 from dynastore.modules.storage.router import get_items_search_driver, get_write_drivers
 from dynastore.modules.storage.hints import Hint
+from dynastore.modules.storage.errors import EsBulkWriteError
 from dynastore.modules.elasticsearch.aliases import add_index_to_public_alias
 from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
 from dynastore.modules.elasticsearch.client import get_index_prefix
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReindexResult:
+    """Outcome of a :func:`reindex_collection_into_index` run.
+
+    ``total_written`` counts only documents ES actually acknowledged
+    (#2799) — never a batch-size arithmetic estimate.
+    ``rejected_docs`` collects the ``(id, reason)`` pairs for documents
+    ES rejected per-doc (already logged at ERROR by
+    :func:`~dynastore.modules.elasticsearch._mapping_errors.raise_on_bulk_errors_with_ladder`)
+    — the run keeps going past a rejected sub-chunk rather than aborting,
+    so a handful of known-bad documents (e.g. the geo_shape divergence
+    class, #2044) no longer hold the rest of the collection hostage.
+    It also carries a synthetic ``"<unacknowledged:...>"`` entry for any
+    document a sub-chunk read but neither ES nor the ladder ever
+    confirmed nor explicitly rejected, and a ``(id, reason)`` entry —
+    ``reason`` one of ``"refused_on_conflict"`` / ``"missing_id"`` — for
+    every document the writer skipped BEFORE submitting to ES at all
+    (#2826), so ``total_written + rejected`` always equals the number of
+    documents read from the source.
+    """
+
+    total_written: int
+    rejected_docs: List[Tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def rejected(self) -> int:
+        return len(self.rejected_docs)
 
 
 def get_es_client():
@@ -188,14 +220,85 @@ def _select_writer(
     )
 
 
+# Target ceiling for a single ES _bulk request body (estimated serialized
+# JSON size of all documents in one call).  OpenSearch's default
+# http.max_content_length is 100 MB; this leaves a 12× safety margin so
+# geometry-heavy docs (admin boundaries, networks) that can run 50–200 KB
+# each don't produce 413 responses.  Large read pages are split into
+# multiple sub-chunk writes — small docs accumulate more per call
+# automatically; no operator tuning needed.
+_MAX_BULK_BYTES: int = 8 * 1024 * 1024  # 8 MB
+
+
+_DEFAULT_READ_PAGE_SIZE: int = 2000
+
+
+def _resolve_read_page(
+    page_size: Optional[int],
+    writer_chunk: int,
+    default: int = _DEFAULT_READ_PAGE_SIZE,
+) -> int:
+    """Resolve the read-page (and write-chunk) size for a reindex run.
+
+    The read page and the write chunk are unrelated concerns: the write
+    side is already byte-bounded downstream by :func:`_iter_byte_bounded_chunks`,
+    so the writer's ``preferred_chunk_size`` adds nothing there. The read
+    side is the fragile one for geometry-heavy collections (large rows,
+    long-lived queries), so an operator-supplied ``page_size`` must govern
+    the read page verbatim rather than being silently overridden upward.
+
+    Resolution order:
+
+    1. ``page_size`` explicitly given (not ``None``) — used verbatim.
+    2. ``page_size`` is ``None`` — fall back to the writer's
+       ``preferred_chunk_size`` when it declares one (> 0).
+    3. Neither is available — fall back to *default*.
+    """
+    if page_size is not None:
+        return page_size
+    if writer_chunk > 0:
+        return writer_chunk
+    return default
+
+
+def _iter_byte_bounded_chunks(
+    items: List[Any],
+    max_bytes: int,
+) -> Iterator[List[Any]]:
+    """Yield sub-lists of items whose total estimated serialised JSON byte
+    size does not exceed *max_bytes*.
+
+    Each item's size is estimated via ``json.dumps`` with a plain encoder
+    (sufficient for a byte-count approximation; exact ES encoding may
+    differ slightly).  An item that individually exceeds *max_bytes* is
+    yielded alone — the caller must accept an oversized single-doc request
+    rather than infinite-loop or drop the item.
+    """
+    current_chunk: List[Any] = []
+    current_bytes = 0
+    for item in items:
+        try:
+            item_bytes = len(_json.dumps(item, ensure_ascii=False).encode("utf-8"))
+        except (TypeError, ValueError):
+            item_bytes = len(str(item).encode("utf-8"))
+        if current_chunk and current_bytes + item_bytes > max_bytes:
+            yield current_chunk
+            current_chunk = []
+            current_bytes = 0
+        current_chunk.append(item)
+        current_bytes += item_bytes
+    if current_chunk:
+        yield current_chunk
+
+
 async def reindex_collection_into_index(
     catalog_id: str,
     collection_id: str,
     *,
     driver_hint: Optional[str] = None,
     reader_ref: Optional[str] = None,
-    page_size: int = 500,
-) -> int:
+    page_size: Optional[int] = None,
+) -> ReindexResult:
     """Stream every item of a collection from the routing-resolved source-of-truth
     reader and bulk-write it via the routing-resolved secondary-index writer.
 
@@ -219,16 +322,58 @@ async def reindex_collection_into_index(
     equals the reader this function raises ``ValueError`` immediately — a reindex that
     reads and writes to the same driver is a no-op at best and a data hazard at worst.
 
-    Chunks are sized to ``max(page_size, writer.preferred_chunk_size)`` when the writer
-    declares a preference; otherwise ``page_size`` governs.
+    Doc build (#2732 step 2): each page is handed to the writer's own
+    ``write_entities()`` — the same write entry point used by direct STAC/Features
+    ingest and by the storage-plane drain's ``BulkIndexer`` adapter. For
+    :class:`~dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver`,
+    ``write_entities()`` re-resolves each item's canonical PG row via
+    :func:`~dynastore.modules.catalog.canonical_index_read.read_canonical_index_inputs`
+    and assembles the ``_source`` via
+    :func:`~dynastore.modules.elasticsearch.canonical_doc.build_canonical_index_doc` —
+    the identical function the drain's ``StorageDrainTask`` calls — so a rebuilt
+    index and a drain-written index converge on the same canonical shape for the
+    same stored item. The no-PG-row fallback (file-backed collections) is built via
+    :func:`~dynastore.modules.catalog.canonical_index_read.canonical_input_from_feature`,
+    also shared with the driver's ``Indexer``-protocol ``index()``/``index_bulk()``
+    methods. This function deliberately does NOT call the ``BulkIndexer``/
+    ``IndexableOp`` surface the drain uses directly: that would drop
+    ``write_entities()``'s ``ensure_storage()`` (index/mapping creation) and
+    geometry-simplification steps, neither of which the drain's adapter performs
+    today — see the PR description for the field-level comparison.
 
-    Write failures propagate: :class:`~dynastore.modules.storage.errors.EsBulkWriteError`
-    (and any other exception from ``write_entities``) are re-raised after logging the
-    failure count so the task can surface them and apply its ``on_failure`` policy.
-    The returned count reflects only successfully written documents.
+    The read page (and write chunk, before byte-bounded sub-chunking) is sized via
+    :func:`_resolve_read_page`: an explicitly supplied ``page_size`` governs verbatim;
+    when omitted (``None``), the writer's ``preferred_chunk_size`` is used as the
+    default, falling back to ``_DEFAULT_READ_PAGE_SIZE`` when neither is set.
+
+    Per-doc write rejections do not abort the run:
+    :class:`~dynastore.modules.storage.errors.EsBulkWriteError` is caught per
+    sub-chunk. ES's ``_bulk`` endpoint is per-item, so a rejection elsewhere
+    in a sub-chunk does not mean every other document was indexed (#2799):
+    ``total_written`` is credited only from ``exc.acknowledged`` — the ids ES
+    (or the geo_shape ladder) actually confirmed — and the rejected ids
+    (already logged at ERROR with their per-doc reason by
+    ``raise_on_bulk_errors_with_ladder``) are collected into the result. Any
+    id in the sub-chunk that lands in neither bucket (e.g. a write-policy
+    skip inside ``write_entities`` that predates the ``_bulk`` call) is
+    logged loudly and also folded into ``rejected_docs`` so the run's
+    self-report always satisfies ``total_written + rejected == docs read``.
+    Any other exception from ``write_entities`` still propagates immediately —
+    only known per-doc ES rejections are treated as recoverable.
+
+    A write-policy skip inside ``write_entities`` can also fire on the
+    SUCCESS path — no ``EsBulkWriteError`` raised at all, e.g.
+    ``on_conflict=REFUSE`` skipping an already-existing doc, or a source row
+    with no resolvable id (#2826). The writer surfaces these via a
+    ``.skipped`` attribute on the returned list (``(id, reason)`` pairs,
+    ``id`` is ``None`` when the reason IS the missing id); this function
+    folds them into ``rejected_docs`` the same way, so the invariant holds
+    on both paths.
 
     Alias enrolment: the writer's index is enrolled in the public alias once before
-    streaming begins (idempotent; best-effort).
+    streaming begins (idempotent; best-effort) — so the alias swap that makes the
+    successfully-written documents searchable happens regardless of any per-doc
+    rejections encountered later in the run.
 
     Args:
         catalog_id: Catalog owning the collection.
@@ -239,17 +384,19 @@ async def reindex_collection_into_index(
         reader_ref: Optional ``driver_ref`` override that selects the READ source
             directly (e.g. ``"items_duckdb_driver"`` for a file-backed collection).
             Takes precedence over the GEOMETRY_EXACT hint resolution.
-        page_size: Items per read page (and write chunk, unless the writer declares
-            a larger ``preferred_chunk_size``).
+        page_size: Items per read page. When given, governs the read page verbatim.
+            When omitted (``None``), defaults to the writer's ``preferred_chunk_size``
+            if it declares one, else ``_DEFAULT_READ_PAGE_SIZE``.
 
     Returns:
-        Number of documents successfully written to the target index.
+        :class:`ReindexResult` carrying the count of successfully written documents
+        plus any per-doc rejections encountered along the way.
 
     Raises:
         ValueError: If routing cannot resolve a valid reader/writer pair.
         RuntimeError: If required protocols are unavailable.
-        :class:`~dynastore.modules.storage.errors.EsBulkWriteError`: On ES bulk-write
-            rejection (propagated from the writer driver).
+        Exception: Any non-:class:`EsBulkWriteError` exception from ``write_entities``
+            still propagates (e.g. transport errors, mapping mismatches).
     """
     # --- Resolve reader: source-of-truth READ driver. ---
     # An explicit reader_ref (file-backed collections) takes precedence; otherwise
@@ -288,7 +435,7 @@ async def reindex_collection_into_index(
             catalog_id,
             collection_id,
         )
-        return 0
+        return ReindexResult(total_written=0)
 
     # --- Alias enrolment (idempotent). ---
     # Enrol the writer's index in the public alias so /search returns results
@@ -304,9 +451,10 @@ async def reindex_collection_into_index(
             catalog_id, collection_id, exc,
         )
 
-    # --- Determine chunk size from the writer's preference. ---
+    # --- Determine chunk size: explicit page_size wins verbatim; otherwise
+    #     fall back to the writer's preference, then the module default. ---
     writer_chunk = getattr(writer, "preferred_chunk_size", 0)
-    chunk_size = max(page_size, writer_chunk) if writer_chunk > 0 else page_size
+    chunk_size = _resolve_read_page(page_size, writer_chunk)
 
     logger.info(
         "reindex_collection_into_index: %s/%s  reader=%s  writer=%s  chunk_size=%d",
@@ -315,6 +463,7 @@ async def reindex_collection_into_index(
 
     total_written = 0
     offset = 0
+    rejected_docs: List[Tuple[str, str]] = []
 
     while True:
         # Collect a chunk from the reader.
@@ -330,23 +479,109 @@ async def reindex_collection_into_index(
         if not chunk:
             break
 
-        # Write the chunk to the target (raises on failure — no silent drop).
-        try:
-            written = await writer.write_entities(catalog_id, collection_id, chunk)
-            batch_count = len(written) if written is not None else len(chunk)
-        except Exception:
-            logger.error(
-                "reindex_collection_into_index: write_entities raised for %s/%s "
-                "at offset %d (%d docs in batch); propagating error. "
-                "Total successfully written before failure: %d.",
-                catalog_id, collection_id, offset, len(chunk), total_written,
-            )
-            raise
-
-        total_written += batch_count
+        # Split the read page into byte-bounded sub-chunks before writing to ES.
+        # Each sub-chunk produces one _bulk HTTP request; the byte ceiling
+        # (_MAX_BULK_BYTES) prevents 413 on geometry-heavy collections while
+        # still using large batches for lightweight docs.
+        for sub_chunk in _iter_byte_bounded_chunks(chunk, max_bytes=_MAX_BULK_BYTES):
+            try:
+                written = await writer.write_entities(catalog_id, collection_id, sub_chunk)
+                batch_count = len(written) if written is not None else len(sub_chunk)
+                # #2826: the writer can skip a document BEFORE it is ever
+                # submitted to ES's ``_bulk`` call (REFUSE on-conflict, no
+                # resolvable id) without raising — ``written`` is simply
+                # shorter, with no signal beyond a driver-side log line.
+                # Drivers that track this (currently the public ES items
+                # driver) surface it via ``.skipped`` on the returned list;
+                # fold each entry into ``rejected_docs`` here so the same
+                # ``total_written + rejected == docs read`` invariant the
+                # exception path already guarantees (#2799/#2825) also holds
+                # on the success path.
+                presubmit_skips = getattr(written, "skipped", None) or []
+                if presubmit_skips:
+                    rejected_docs.extend(
+                        (
+                            doc_id if doc_id is not None
+                            else f"<presubmit-skip:{catalog_id}/{collection_id}@offset={offset}>",
+                            reason,
+                        )
+                        for doc_id, reason in presubmit_skips
+                    )
+                    logger.error(
+                        "reindex_collection_into_index: %d document(s) in this "
+                        "sub-chunk for %s/%s at offset %d were skipped by the "
+                        "writer before submission to ES (%s) — folded into "
+                        "rejected_docs so the run's self-report stays truthful.",
+                        len(presubmit_skips), catalog_id, collection_id, offset,
+                        ", ".join(sorted({reason for _, reason in presubmit_skips})),
+                    )
+            except EsBulkWriteError as exc:
+                # ES's _bulk endpoint is per-item: by the time this error
+                # surfaces the HTTP request already completed and some
+                # non-rejected documents in the sub-chunk may be indexed —
+                # but NOT necessarily all of them (#2799): a sub-chunk is not
+                # all-or-nothing, so crediting ``len(sub_chunk) -
+                # len(exc.failures)`` as written silently over-counted
+                # documents that were neither acknowledged nor explicitly
+                # rejected. Credit only ``exc.acknowledged`` — the ids ES (or
+                # the geo_shape ladder) actually confirmed. Each rejected
+                # doc's reason is already logged at ERROR by
+                # raise_on_bulk_errors_with_ladder; one summary line per
+                # sub-chunk here avoids double-logging every id. Skip and
+                # keep going — a handful of known-bad documents must not
+                # hold the rest of the collection hostage (#2764).
+                batch_count = len(exc.acknowledged)
+                rejected_docs.extend(exc.failures)
+                logger.error(
+                    "reindex_collection_into_index: %d of %d document(s) rejected by "
+                    "ES for %s/%s at offset %d — skipping the rejected docs and "
+                    "continuing (per-doc reasons already logged above). "
+                    "%d acknowledged from this sub-chunk.",
+                    len(exc.failures), len(sub_chunk), catalog_id, collection_id,
+                    offset, batch_count,
+                )
+                # Reconcile: exc.acknowledged and exc.failures only cover the
+                # ids actually SUBMITTED to ES (write_entities may have
+                # skipped some sub_chunk docs earlier, e.g. a write-policy
+                # conflict) — but ANY gap between the two accounting-sourced
+                # docs and the number of docs this sub-chunk actually read
+                # must be surfaced rather than silently dropped, so the run's
+                # self-report keeps the invariant `acknowledged +
+                # reported-failures == docs read`. A false positive here
+                # (e.g. from a legitimate write-policy skip) is strictly
+                # preferable to a silent loss going unreported again.
+                unaccounted = len(sub_chunk) - batch_count - len(exc.failures)
+                if unaccounted > 0:
+                    logger.error(
+                        "reindex_collection_into_index: %d document(s) in this "
+                        "sub-chunk for %s/%s at offset %d were neither "
+                        "acknowledged by ES nor explicitly rejected (%d "
+                        "acknowledged, %d explicitly rejected, %d read) — "
+                        "counting them as unacknowledged so the run's "
+                        "self-report stays truthful.",
+                        unaccounted, catalog_id, collection_id, offset,
+                        batch_count, len(exc.failures), len(sub_chunk),
+                    )
+                    rejected_docs.extend(
+                        (
+                            f"<unacknowledged:{catalog_id}/{collection_id}@offset={offset}#{i}>",
+                            "unacknowledged: ES bulk write neither confirmed nor "
+                            "explicitly rejected this document",
+                        )
+                        for i in range(unaccounted)
+                    )
+            except Exception:
+                logger.error(
+                    "reindex_collection_into_index: write_entities raised for %s/%s "
+                    "at offset %d (%d docs in sub-chunk); propagating error. "
+                    "Total successfully written before failure: %d.",
+                    catalog_id, collection_id, offset, len(sub_chunk), total_written,
+                )
+                raise
+            total_written += batch_count
 
         if len(chunk) < chunk_size:
             break
         offset += chunk_size
 
-    return total_written
+    return ReindexResult(total_written=total_written, rejected_docs=rejected_docs)

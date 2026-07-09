@@ -40,6 +40,7 @@ from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.models.protocols.teardown_lane import TeardownLane
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.storage_location import StorageLocation
 from dynastore.models.protocols.typed_driver import (
@@ -135,8 +136,22 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
 
     # Collection ES is the canonical async secondary index + primary SEARCH
     # backend for collection metadata routing.  It auto-defaults into WRITE
-    # (as a secondary index, identified by ``is_collection_indexer``) and SEARCH.
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.WRITE})
+    # (as a secondary index, identified by ``is_collection_indexer``), SEARCH,
+    # and READ (hinted — only selected when the caller explicitly requests it
+    # via ``prefer:es`` or ``geometry_simplified``; default path stays on PG).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({
+        Operation.SEARCH, Operation.WRITE, Operation.READ,
+    })
+
+    # Hints this driver serves on the READ/SEARCH operations.
+    # GEOMETRY_SIMPLIFIED: ES stores the index-time simplified geometry.
+    # METADATA: generic "I want collection metadata" — declares this driver
+    #   participates in metadata reads at all.  There is no geometry at the
+    #   metadata level so geometry hints (GEOMETRY_EXACT) do not apply here.
+    supported_hints: ClassVar[FrozenSet[Hint]] = frozenset({
+        Hint.GEOMETRY_SIMPLIFIED,
+        Hint.METADATA,
+    })
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,
@@ -414,6 +429,7 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         metadata: Dict[str, Any],
         *,
         db_resource: Optional[Any] = None,
+        lifecycle_status: Optional[str] = None,
     ) -> None:
         client = self._get_client()
         if not client:
@@ -424,6 +440,8 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
         # access containers, attributes under properties (unknown→extras lane).
         # ``extent`` is enriched first (bbox→geo_shape, temporal→date_range) and
         # carried opaquely as a reserved structural member.
+        # ``lifecycle_status`` (when non-None) is stamped on ``system`` so the
+        # ES search filter can exclude mid-provisioning collections.
         from dynastore.modules.elasticsearch.collection_canonical import (
             build_canonical_collection_doc,
         )
@@ -435,6 +453,7 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             catalog_id=catalog_id,
             collection_id=collection_id,
             known_fields=build_known_fields(),
+            lifecycle_status=lifecycle_status,
         )
 
         try:
@@ -442,7 +461,14 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 index=index_name,
                 id=_doc_id(catalog_id, collection_id),
                 body=doc,
-                params={"routing": catalog_id, "refresh": "wait_for"},
+                # No "refresh": "wait_for" — under job load (bulk collection
+                # creation) it holds the shared AsyncOpenSearch client's
+                # connection pool for up to request_timeout * max_retries per
+                # write, exhausting the pool and stalling every write behind
+                # it. PG is the system of record for collections; ES is a
+                # best-effort secondary index that refreshes on its own
+                # interval (default 1s).
+                params={"routing": catalog_id},
             )
         except Exception as exc:
             from dynastore.modules.elasticsearch._mapping_errors import (
@@ -512,7 +538,11 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                     "CollectionElasticsearchDriver.index: refused payload with "
                     "type='Feature'; STAC items belong on the items-tier index."
                 )
-            await self.upsert_metadata(ctx.catalog, op.entity_id, payload)
+            lifecycle_status = getattr(ctx, "lifecycle_status", None)
+            await self.upsert_metadata(
+                ctx.catalog, op.entity_id, payload,
+                lifecycle_status=lifecycle_status,
+            )
         elif op.op_type == "delete":
             await self.delete_metadata(ctx.catalog, op.entity_id)
         else:
@@ -584,16 +614,44 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                     index=index_name,
                     id=doc_id,
                     body={"doc": {"_deleted": True}},
-                    params={"routing": catalog_id, "refresh": "wait_for"},
+                    params={"routing": catalog_id},
                 )
             else:
                 await client.delete(
                     index=index_name,
                     id=doc_id,
-                    params={"routing": catalog_id, "refresh": "wait_for"},
+                    params={"routing": catalog_id},
                 )
         except Exception as e:
             logger.debug("delete_metadata ES error for %s/%s: %s", catalog_id, collection_id, e)
+
+    async def clear_lifecycle_status(
+        self,
+        catalog_id: str,
+        collection_id: str,
+    ) -> None:
+        """Remove the ``system.lifecycle_status`` transitional marker from a
+        collection doc via a targeted partial update.
+
+        Called by the provisioning finalizer once async init completes so the
+        collection becomes visible in ES-primary searches without a full
+        re-upsert.  Mirrors the soft-delete partial update at
+        :meth:`delete_metadata`.  Silently no-ops when the ES client is
+        unavailable or the document is absent (404); errors are propagated
+        so callers can wrap in best-effort handling.
+        """
+        client = self._get_client()
+        if not client:
+            return
+
+        index_name = self._index_name()
+        doc_id = _doc_id(catalog_id, collection_id)
+        await client.update(
+            index=index_name,
+            id=doc_id,
+            body={"doc": {"system": {"lifecycle_status": None}}},
+            params={"routing": catalog_id},
+        )
 
     async def search_metadata(
         self,
@@ -628,10 +686,30 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
 
         index_name = self._index_name()
 
+        from dynastore.models.protocols.entity_store import CollectionLifecycle
+
         must_clauses: List[Dict[str, Any]] = []
         filter_clauses: List[Dict[str, Any]] = [
             {"term": {"catalog_id": catalog_id}},
             {"bool": {"must_not": [{"term": {"_deleted": True}}]}},
+            # Exclude collections whose async provisioning or hard-delete teardown
+            # is still in flight.  Docs WITHOUT ``system.lifecycle_status`` (the
+            # common active case, and all legacy-indexed docs) are NOT matched by
+            # this terms filter and therefore remain visible — back-compat safe.
+            {
+                "bool": {
+                    "must_not": [
+                        {
+                            "terms": {
+                                "system.lifecycle_status": [
+                                    CollectionLifecycle.PROVISIONING.value,
+                                    CollectionLifecycle.DELETING.value,
+                                ]
+                            }
+                        }
+                    ]
+                }
+            },
         ]
         if visible_ids is not None:
             filter_clauses.append({"terms": {"id": sorted(visible_ids)}})

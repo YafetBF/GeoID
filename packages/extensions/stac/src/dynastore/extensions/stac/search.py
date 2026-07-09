@@ -23,10 +23,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
 
-from dynastore.models.protocols import CatalogsProtocol
+from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.query_builder import (
     FieldSelection,
-    FilterCondition,
     FilterOperator,
     QueryRequest,
 )
@@ -86,7 +85,12 @@ class ItemSearchRequest(BaseModel):
     intersects: Optional[Dict[str, Any]] = None
     filter: Optional[Union[AttributeFilter, QueryFilter]] = None
     filter_lang: str = "cql2-json"
-    limit: int = Field(10, ge=1, le=1000)
+    # ``None`` means "use the configured default"; any supplied value is
+    # clamped to the configured maximum rather than rejected (OGC API -
+    # Features Part 1 Core /req/core/fc-limit-response-1). Resolved in
+    # ``search_items()`` against ``StacPluginConfig.default_limit`` /
+    # ``max_limit``.
+    limit: Optional[int] = Field(None, ge=1)
     offset: int = Field(0, ge=0)
     aggregations: Optional[List[AggregationRule]] = Field(None, alias="aggregate")
     sortby: Optional[List[str]] = Field(
@@ -117,7 +121,9 @@ class CollectionSearchRequest(BaseModel):
             "GET form accepts a comma-separated string; POST accepts a list."
         ),
     )
-    limit: int = Field(10, ge=1, le=1000)
+    # See ``ItemSearchRequest.limit`` — same "clamp, don't reject" contract,
+    # resolved in ``search_collections()``.
+    limit: Optional[int] = Field(None, ge=1)
     offset: int = Field(0, ge=0)
     sortby: Optional[str] = Field(
         None,
@@ -461,6 +467,7 @@ def _inject_search_hints(
     features: list,
     cat_id: str,
     cids: list,
+    coll_ext_id_map: Optional[Dict[str, str]] = None,
 ) -> list:
     """Inject the catalog/collection hints the STAC search serializer reads.
 
@@ -472,7 +479,17 @@ def _inject_search_hints(
     reads — the same hints the PostgreSQL path injects. The collection hint
     prefers the item's own ``collection`` and falls back to the sole requested
     collection when only one is in scope.
+
+    ``coll_ext_id_map`` maps internal collection ids to their public external
+    labels; when provided, both the per-feature ``collection`` attribute and
+    the ``cids`` fallback are translated before being stored as the hint so the
+    STAC item serializer emits the public id on every search result.
     """
+    def _ext(internal: str) -> str:
+        if coll_ext_id_map:
+            return coll_ext_id_map.get(internal, internal)
+        return internal
+
     for feat in features:
         if feat.properties is None:
             feat.properties = {}
@@ -480,7 +497,7 @@ def _inject_search_hints(
         coll_id = getattr(feat, "collection", None)
         if not coll_id and len(cids) == 1:
             coll_id = cids[0]
-        feat.properties.setdefault("_collection_id", coll_id or "")
+        feat.properties.setdefault("_collection_id", _ext(coll_id or ""))
     return features
 
 
@@ -490,6 +507,8 @@ async def _maybe_dispatch_to_es_search(
     *,
     principals: Optional[List[str]] = None,
     principal: Optional[Any] = None,
+    coll_ext_id_map: Optional[Dict[str, str]] = None,
+    had_explicit_scope: bool = True,
 ) -> Optional[Tuple[list, int, Optional[Dict[str, Any]]]]:
     """Dispatch a structural search to the catalog's routing-pinned items
     SEARCH driver, when one is configured and search-capable.
@@ -524,6 +543,24 @@ async def _maybe_dispatch_to_es_search(
     ``filter`` is now translated to ES Query DSL (shared CQL2→ES translator,
     queryables SSOT field mapping) and served by the ES driver too, instead of
     forcing the PG path.
+
+    ``had_explicit_scope`` distinguishes a caller-supplied ``collections=``
+    filter (bounded by what the caller asked for — the per-collection
+    verification loop below is cheap) from an auto-expanded, catalog-wide
+    scope (``_expand_collections_for_search`` rewriting a bare ``/search``
+    to every collection of the catalog — bounded only by the catalog's
+    collection count). For the latter, resolving the driver once per
+    collection turned a 1,971-collection catalog's unscoped search into a
+    45s+ hang: each resolution is a cache-keyed-per-collection config lookup
+    (``router._resolve_driver_ids_cached``), so a cold cache after a large
+    harvest meant ~2,000 sequential config round trips before the ES query
+    even ran (#2865). An auto-expanded scope instead resolves the driver
+    ONCE at catalog scope (``collection_id=None``, the documented
+    catalog-level resolution) — the same result a per-collection
+    resolution would give in the common case (no per-collection routing
+    override), matching the config waterfall's own shape where the
+    collection tier is a rare override over the catalog default, not the
+    default itself.
     """
     cids = search_request.collections or []
     if not cids:
@@ -539,20 +576,29 @@ async def _maybe_dispatch_to_es_search(
     # router resolves the driver that advertises ``ATTRIBUTE_FILTER``.
     search_hints = frozenset({Hint.ATTRIBUTE_FILTER}) if has_filter else frozenset()
 
-    # Resolve the items SEARCH driver per collection. All collections must
-    # resolve to the same driver class to be served in a single query;
-    # otherwise defer to the PG per-collection logic.
     driver: Any = None
-    for cid in cids:
+    if had_explicit_scope:
+        # Explicit, caller-bounded scope: resolve every collection so a
+        # genuinely mixed-driver selection still falls through to PG.
+        for cid in cids:
+            try:
+                resolved = await get_items_search_driver(cat_id, cid, hints=search_hints)
+            except Exception:
+                return None
+            candidate = resolved.driver
+            if driver is None:
+                driver = candidate
+            elif type(candidate) is not type(driver):
+                return None  # mixed drivers — PG path
+    else:
+        # Auto-expanded, catalog-wide scope: one catalog-level resolution
+        # instead of one per collection — see the ``had_explicit_scope``
+        # note above.
         try:
-            resolved = await get_items_search_driver(cat_id, cid, hints=search_hints)
+            resolved = await get_items_search_driver(cat_id, None, hints=search_hints)
         except Exception:
             return None
-        candidate = resolved.driver
-        if driver is None:
-            driver = candidate
-        elif type(candidate) is not type(driver):
-            return None  # mixed drivers — PG path
+        driver = resolved.driver
 
     if driver is None:
         return None
@@ -565,6 +611,21 @@ async def _maybe_dispatch_to_es_search(
     # Only ES items drivers honor the structural QueryRequest dimensions on
     # their streaming read/count path today; anything else → PG path.
     if not getattr(driver, "is_es_items_driver", False):
+        return None
+
+    # Routing-honouring fallback (#2894): the ES driver is the configured
+    # search primary, but if its per-tenant items index does not exist (a
+    # recreated catalog whose index has not been (re)provisioned, or one
+    # that never ran the ES-secondary drain) it cannot serve. ``read_entities``
+    # / ``count_entities`` both degrade an index-missing failure to an empty
+    # result (``ignore_unavailable`` / a swallowed ``NotFoundError``) rather
+    # than raising, so the ``try/except`` below never observes it — without
+    # this check STAC search would return a confident ``numberMatched: 0``
+    # for data that is safely persisted in PostgreSQL. Mirrors the same guard
+    # ``item_query._try_driver_dispatch`` and
+    # ``extensions.tools.query.maybe_dispatch_items_to_search_driver`` apply.
+    _index_check = getattr(driver, "index_available", None)
+    if _index_check is not None and not await _index_check(cat_id):
         return None
 
     # CQL2 filter → ES Query DSL. Only proceed when the driver advertises
@@ -633,8 +694,56 @@ async def _maybe_dispatch_to_es_search(
 
     # read_entities already rebuilt the read contract; only inject the
     # serializer's catalog/collection hints — see :func:`_inject_search_hints`.
-    _inject_search_hints(features, cat_id, cids)
+    _inject_search_hints(features, cat_id, cids, coll_ext_id_map=coll_ext_id_map)
     return features, total, None
+
+
+async def _resolve_scoped_collection_ids(
+    catalogs: Any, cat_id: str, external_ids: List[str],
+) -> Tuple[List[str], Dict[str, str]]:
+    """Resolve an explicit ``collections=`` filter list to internal ids.
+
+    Both the ES canonical docs and the PG-backed hydration path key
+    ``collection_id`` on the immutable INTERNAL id (see #2653), so a
+    caller-supplied EXTERNAL id must be resolved before it reaches the
+    search dispatch or it silently matches zero documents (#2786).
+
+    Mirrors ``_ItemsElasticsearchBase._resolve_internal_ids``'s convention
+    (elasticsearch.py): resolve the catalog id first, then each collection id
+    scoped to it, via ``allow_missing=True``.
+
+    An id shaped like an internal id (``is_internal_physical_name``) is
+    rejected outright rather than resolved — passing it through would let it
+    match its own internal-keyed documents directly, leaking the internal-id
+    namespace onto the REST filter surface (same class of leak as #2325). An
+    id that simply fails to resolve as an external label is dropped the same
+    way the PG fallback below already treats an unknown collection (excluded
+    from ``target_collections``, contributing zero matches rather than
+    raising) — so a mixed list of known/unknown ids still serves the known
+    ones.
+
+    Returns ``(internal_ids, coll_ext_id_map)`` where ``coll_ext_id_map`` maps
+    each resolved internal id back to the external id the caller supplied, for
+    response-side restoration.
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    internal_cat = await catalogs.resolve_catalog_id(cat_id, allow_missing=True)
+    resolved_cat_id = internal_cat if internal_cat is not None else cat_id
+
+    internal_ids: List[str] = []
+    coll_ext_id_map: Dict[str, str] = {}
+    for external_id in external_ids:
+        if is_internal_physical_name(external_id, "col"):
+            continue
+        internal_id = await catalogs.collections.resolve_collection_id(
+            resolved_cat_id, external_id, allow_missing=True
+        )
+        if internal_id is None:
+            continue
+        internal_ids.append(internal_id)
+        coll_ext_id_map[internal_id] = external_id
+    return internal_ids, coll_ext_id_map
 
 
 async def _expand_collections_for_search(
@@ -642,7 +751,7 @@ async def _expand_collections_for_search(
     cat_id: str,
     search_request: ItemSearchRequest,
     db_resource: DbResource,
-) -> ItemSearchRequest:
+) -> Tuple[ItemSearchRequest, Dict[str, str]]:
     """Scope an unscoped search to ALL collections of the catalog.
 
     The search-driver dispatch requires explicit collection scoping to
@@ -653,22 +762,38 @@ async def _expand_collections_for_search(
     ``ids``-only lookups) answered ``numberMatched: 0`` while the same query
     scoped with ``collections=`` matched.
 
-    Returns the request unchanged when it is already scoped or the catalog
-    has no collections; otherwise returns a copy scoped to every collection
-    id (one ``list_collections`` round-trip — the PG fallback reuses the
-    explicit scope instead of enumerating again).
+    Returns a tuple of (request, coll_ext_id_map) where ``coll_ext_id_map``
+    maps each internal collection id to its public external label, needed by
+    both the ES dispatch's response-side hint injection and the PG hydration
+    path's ``feature.properties["_collection_id"]`` restoration.
+
+    Returns the request unchanged when the catalog has no collections;
+    otherwise returns a copy scoped to every collection id. An unscoped
+    request is expanded to every collection of the catalog (one
+    ``list_collection_id_pairs`` round-trip — id/external_id pairs only, no
+    per-collection metadata hydration). An explicitly-scoped request has its
+    external collection ids resolved to internal ids (see
+    :func:`_resolve_scoped_collection_ids`) — unresolvable/internal-shaped
+    ids are dropped rather than passed through.
     """
     if search_request.collections:
-        return search_request
-    all_cids = [
-        c.id
-        for c in await catalogs.list_collections(
-            cat_id, limit=1000, ctx=DriverContext(db_resource=db_resource)
+        internal_ids, coll_ext_id_map = await _resolve_scoped_collection_ids(
+            catalogs, cat_id, search_request.collections
         )
-    ]
+        return (
+            search_request.model_copy(update={"collections": internal_ids}),
+            coll_ext_id_map,
+        )
+    pairs = await catalogs.list_collection_id_pairs(
+        cat_id, ctx=DriverContext(db_resource=db_resource)
+    )
+    coll_ext_id_map: Dict[str, str] = {
+        cid: (ext_id or cid) for cid, ext_id in (pairs or [])
+    }
+    all_cids = list(coll_ext_id_map.keys())
     if not all_cids:
-        return search_request
-    return search_request.model_copy(update={"collections": all_cids})
+        return search_request, coll_ext_id_map
+    return search_request.model_copy(update={"collections": all_cids}), coll_ext_id_map
 
 
 async def search_items(
@@ -688,12 +813,35 @@ async def search_items(
     assert search_request.catalog_id is not None, "search_request.catalog_id required"
     cat_id: str = search_request.catalog_id
 
+    # Resolve default/clamp the page size against the configured policy
+    # (OGC API - Features Part 1 Core /req/core/fc-limit-response-1): an
+    # over-max ``limit`` is capped, never rejected. Must run before any
+    # downstream use of ``search_request.limit`` (dispatch, SQL LIMIT, links).
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+    search_request.limit = resolve_page_limit(
+        search_request.limit,
+        default_limit=stac_config.default_limit,
+        max_limit=stac_config.max_limit,
+    )
+
     # An unscoped request is rewritten to explicitly scope all collections of
-    # the catalog so the routing-aware dispatch below can serve it; see
-    # :func:`_expand_collections_for_search`.
-    search_request = await _expand_collections_for_search(
+    # the catalog so the routing-aware dispatch below can serve it; an
+    # explicitly-scoped request has its external collection ids resolved to
+    # internal ids (#2786). See :func:`_expand_collections_for_search`.
+    # The function also returns an internal→external collection id map used
+    # throughout the search response to emit public ids, not internal tokens.
+    had_explicit_scope = bool(search_request.collections)
+    search_request, _coll_ext_id_map = await _expand_collections_for_search(
         catalogs, cat_id, search_request, db_resource
     )
+    if had_explicit_scope and not search_request.collections:
+        # Every explicitly-requested collection failed to resolve as a live
+        # external id (unknown, or internal-id-shaped and rejected outright).
+        # Zero matches — same convention the PG fallback's "no
+        # target_collections" branch below applies — never fall through to
+        # the unscoped-expansion path, which would silently search every
+        # collection in the catalog instead.
+        return [], 0, None
 
     # ── Routing-aware search-driver dispatch (issues #222, #989) ──────
     # For structural-filter-only requests (no CQL2 ``filter``), dispatch to
@@ -704,6 +852,7 @@ async def search_items(
     # QueryOptimizer SQL path below. See :func:`_maybe_dispatch_to_es_search`.
     search_dispatch_result = await _maybe_dispatch_to_es_search(
         cat_id, search_request, principals=principals, principal=principal,
+        coll_ext_id_map=_coll_ext_id_map, had_explicit_scope=had_explicit_scope,
     )
     if search_dispatch_result is not None:
         return search_dispatch_result
@@ -730,26 +879,74 @@ async def search_items(
         )
     ]
 
-    async def _check_layer_def(cid):
-        from dynastore.modules.storage.router import get_driver
-        from dynastore.modules.storage.routing_config import Operation
-        driver = await get_driver(Operation.READ, cat_id, cid)
-        return await driver.get_driver_config(
-            cat_id, cid, db_resource=db_resource
-        )
+    # Layer-config resolution (#2865 PG-fallback fix). `initial_collection_ids`
+    # can be the full auto-expanded catalog (a bare `/search`), so resolving
+    # the READ driver AND its layer config once PER COLLECTION reproduced the
+    # same O(collections) shape the merged ES-dispatch fix addressed for
+    # driver resolution alone (#2873) — thousands of sequential round trips on
+    # the single `db_resource` connection right after a large harvest.
+    #
+    # Mirrors that fix here, split the same way ``_maybe_dispatch_to_es_search``
+    # is: an explicitly-scoped request (``had_explicit_scope`` — bounded by
+    # what the caller asked for, never the whole catalog) keeps the original
+    # per-collection driver + config resolution unchanged. An auto-expanded
+    # scope resolves the READ driver ONCE at catalog level
+    # (``collection_id=None``); when that driver is the PostgreSQL items
+    # driver (the case this fix targets) every collection's layer config is
+    # fetched in ONE batched query (``ConfigsProtocol.get_configs_batch``)
+    # instead of one ``get_config`` round trip per collection. Any other
+    # driver class, or a missing ``ConfigsProtocol``, falls back to the
+    # original per-collection loop — ``get_driver_config`` is polymorphic
+    # per driver class, so the PG-shaped batch call would be wrong there.
+    from dynastore.modules.storage.router import get_driver
+    from dynastore.modules.storage.routing_config import Operation
 
     # Sequential — every check forwards the SAME `db_resource` (a live
     # asyncpg Connection); concurrent SELECTs over a single wire deadlock
     # asyncpg's single-stream protocol (regression observed in PRs #28,
-    # #32, #43).
-    results = [await _check_layer_def(cid) for cid in initial_collection_ids]
+    # #32, #43). `get_driver_config` is polymorphic per driver class
+    # (postgresql/bigquery/iceberg/duckdb each return their own config
+    # type), so this per-collection resolution is the only correct path
+    # for a non-PostgreSQL READ driver.
+    async def _check_layer_def(cid: str):
+        driver = await get_driver(Operation.READ, cat_id, cid)
+        return await driver.get_driver_config(cat_id, cid, db_resource=db_resource)
 
-    # Store configs map
-    collection_configs = {
-        initial_collection_ids[i]: config
-        for i, config in enumerate(results)
-        if config is not None
-    }
+    async def _per_collection_layer_defs() -> Dict[str, Any]:
+        results = [await _check_layer_def(cid) for cid in initial_collection_ids]
+        return {
+            initial_collection_ids[i]: config
+            for i, config in enumerate(results)
+            if config is not None
+        }
+
+    collection_configs: Dict[str, Any] = {}
+    if had_explicit_scope:
+        collection_configs = await _per_collection_layer_defs()
+    else:
+        # Auto-expanded (bare `/search`) scope: one catalog-level driver
+        # resolution — raises, same as the old per-collection loop, when no
+        # READ driver is configured for the catalog at all.
+        from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver
+
+        catalog_driver = await get_driver(Operation.READ, cat_id, None)
+        configs = get_protocol(ConfigsProtocol)
+        if isinstance(catalog_driver, ItemsPostgresqlDriver) and configs is not None:
+            # The common case this fix targets: batch the config fetch
+            # instead of one round trip per collection.
+            from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+            collection_configs = await configs.get_configs_batch(
+                ItemsPostgresqlDriverConfig, cat_id, initial_collection_ids,
+                ctx=DriverContext(db_resource=db_resource),
+            )
+        else:
+            # A non-PostgreSQL READ driver (BigQuery/Iceberg/DuckDB) — the
+            # batched fetch above assumes ItemsPostgresqlDriverConfig, which
+            # would be the wrong config type here — or ConfigsProtocol is
+            # unavailable. Fall back to the original per-collection loop
+            # rather than silently returning no results.
+            collection_configs = await _per_collection_layer_defs()
+
     target_collections = list(collection_configs.keys())
 
     if not target_collections:
@@ -846,14 +1043,38 @@ async def search_items(
     # blob must be splatted into individual row keys before mapping, because the
     # COLUMNAR attribute mapper reads ``row[col]`` rather than the blob.
     collection_attr_columnar: set = set()
+    # Per-collection wire-shape flag: does STAC expose the authored
+    # ``external_id`` as the item id, or the stable ``geoid``? Driven by
+    # ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` (default False →
+    # geoid) so STAC honours the same policy as Features and GET /items/{id}
+    # (#3070). Consumed by the fragment and hydration id projections below.
+    collection_ext_id_as_fid: dict = {}
+    from dynastore.extensions.tools.query import resolve_items_read_policy
 
     for collection_id in target_collections:
         config = collection_configs[collection_id]
 
+        # Resolve the wire-shape policy so this collection's STAC id honours
+        # ``external_id_as_feature_id`` — the geoid by default, the authored
+        # external_id only when the collection opts in — and thread it into the
+        # optimizer so the ``id`` filter (POST /search ``ids=``) keys on the same
+        # expression the id projection uses.
+        _read_policy = await resolve_items_read_policy(cat_id, collection_id)
+        _ext_id_as_fid = bool(
+            getattr(
+                getattr(_read_policy, "feature_type", None),
+                "external_id_as_feature_id",
+                False,
+            )
+        )
+        collection_ext_id_as_fid[collection_id] = _ext_id_as_fid
+
         # Instantiate QueryOptimizer for this collection — STAC search needs
         # the stac_metadata sidecar in the SELECT/JOIN.
         from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
-        optimizer = QueryOptimizer(config, consumer=ConsumerType.STAC)
+        optimizer = QueryOptimizer(
+            config, consumer=ConsumerType.STAC, read_policy=_read_policy
+        )
 
         # --- Query Request Construction ---
 
@@ -918,15 +1139,21 @@ async def search_items(
 
         # Attribute Filters -> Attributes Sidecar
         if search_request.ids:
-            # Use "id" field (aliased external_id)
-            # Operator "IN" with tuple.
-            query_filters.append(
-                FilterCondition(
-                    field="id",
-                    operator=FilterOperator.IN,
-                    value=list(search_request.ids),
-                )
+            # Match the item id honouring ``external_id_as_feature_id`` (#3070):
+            # the SAME policy-gated expression the id projection uses, so a
+            # client can round-trip whatever id it was shown — the geoid by
+            # default, the authored external_id when the collection opts in.
+            # (The old ``field="id"`` filter always keyed on the external_id
+            # column, which after the policy-honouring projection would no longer
+            # match a geoid id.) ``h.geoid::text`` keeps the comparison textual so
+            # a foreign/non-uuid id can't raise a uuid-cast error.
+            _id_filter_expr = (
+                "COALESCE(sc_attributes.external_id, h.geoid::text)"
+                if _ext_id_as_fid
+                else "h.geoid::text"
             )
+            raw_where_clauses.append(f"{_id_filter_expr} = ANY(:_stac_id_filter)")
+            query_params["_stac_id_filter"] = list(search_request.ids)
 
         # Datetime is usually handled in where_sql (from build_filter_clause).
         # We added where_sql to raw_where.
@@ -1031,10 +1258,15 @@ async def search_items(
                 raw_selects.append(
                     "(sc_attributes.attributes->>'datetime')::timestamptz as valid_from"
                 )
-            # Use raw select for ID coalescence
-            # QueryOptimizer uses sc_attributes for the attributes sidecar
+            # Project the item id honouring ``external_id_as_feature_id``
+            # (#3070): the authored external_id only when the collection opts
+            # in, else the stable geoid. Kept identical to the hydration and
+            # ``id``-filter expressions so the candidate cursor round-trips.
+            # QueryOptimizer uses sc_attributes for the attributes sidecar.
             raw_selects.append(
                 "COALESCE(sc_attributes.external_id, h.geoid::text) as id"
+                if _ext_id_as_fid
+                else "h.geoid::text as id"
             )
 
         elif not req_stac:
@@ -1278,8 +1510,18 @@ async def search_items(
             # COLUMNAR attribute sidecars have no ``attributes`` blob column;
             # reconstruct it from the declared property columns (#1253 follow-up).
             attr_select = collection_attr_projection.get(coll_id, "s.attributes")
+            # Item id honours ``external_id_as_feature_id`` (#3070): geoid by
+            # default, the authored external_id only when the collection opts
+            # in. ``s.external_id`` is always projected as its own column (the
+            # STAC generator / expose merge may still read it) — only the ``id``
+            # alias is policy-gated. This is the id that surfaces to the client.
+            _id_expr = (
+                "COALESCE(s.external_id, h.geoid::text) as id"
+                if collection_ext_id_as_fid.get(coll_id, False)
+                else "h.geoid::text as id"
+            )
             select_parts.append(
-                ", COALESCE(s.external_id, h.geoid::text) as id"
+                f", {_id_expr}"
                 ", s.external_id"
                 f"{validity_select}"
                 f", {attr_select} as attributes, s.asset_id"
@@ -1360,12 +1602,12 @@ async def search_items(
     # Resolve the read policy once per collection (STAC search may span
     # several), so the row mapper surfaces ``feature_type.expose`` computed
     # values onto ``feature.properties`` for the STAC item generator to read.
-    # NOTE: STAC search keeps its own native id projection — the hydration
-    # SQL above aliases ``COALESCE(s.external_id, h.geoid::text) AS id`` for
-    # every row, which is the STAC Item convention (items key on external_id).
-    # ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` therefore does
-    # NOT override the STAC item id on this path by design; only the expose
-    # merge is honoured here.
+    # The hydration SQL above already gated the ``AS id`` projection on
+    # ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` (#3070), so the
+    # id surfaced here (via the row's ``id`` column) already honours the policy —
+    # geoid by default, the authored external_id only when the collection opts
+    # in — matching Features and GET /items/{id}. This resolution additionally
+    # drives the expose merge.
     _read_policy_by_collection: Dict[str, Any] = {}
 
     async def _read_policy_for(collection_id: str) -> Any:
@@ -1408,7 +1650,10 @@ async def search_items(
                     for _hk in _HYDRATION_INTERNAL_FIELDS:
                         feature.properties.pop(_hk, None)
                     feature.properties["_catalog_id"] = item_data["catalog_id"]
-                    feature.properties["_collection_id"] = item_data["collection_id"]
+                    _internal_coll_id = item_data["collection_id"]
+                    feature.properties["_collection_id"] = (
+                        _coll_ext_id_map.get(_internal_coll_id, _internal_coll_id)
+                    )
                     rows.append(feature)
             else:
                 rows.append(item_data)
@@ -1454,8 +1699,22 @@ async def search_items(
 
 
 async def search_collections(
-    db_resource: DbResource, search_request: CollectionSearchRequest
+    db_resource: DbResource,
+    search_request: CollectionSearchRequest,
+    *,
+    default_limit: int = 10,
+    max_limit: int = 1000,
 ) -> Tuple[List[Collection], int]:
+    # Resolve default/clamp the page size against the configured policy
+    # (OGC API - Features Part 1 Core /req/core/fc-limit-response-1): an
+    # over-max ``limit`` is capped, never rejected. Callers pass the
+    # ``StacPluginConfig`` policy; the literal fallbacks above only apply to
+    # (test) callers that don't.
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+    search_request.limit = resolve_page_limit(
+        search_request.limit, default_limit=default_limit, max_limit=max_limit,
+    )
+
     # Listing visibility: this search builds its own SQL (it does not go
     # through the routed collection drivers), so it translates the
     # request's constraints itself — the catalog-level constraint narrows
@@ -1497,7 +1756,7 @@ async def search_collections(
         # Search all catalogs the caller may see.
         # We query the catalog registry directly to find all active physical schemas
         catalog_query = (
-            "SELECT id, physical_schema FROM catalog.catalogs WHERE deleted_at IS NULL"
+            "SELECT id FROM catalog.catalogs WHERE deleted_at IS NULL"
         )
         try:
             rows = await DQLQuery(
@@ -1507,7 +1766,7 @@ async def search_collections(
             logger.warning(f"Failed to retrieve catalog schemas for global search: {e}")
             return [], 0
         for row in rows or []:
-            cid, schema = row.get("id"), row.get("physical_schema")
+            cid, schema = row.get("id"), row.get("id")
             if not cid or not schema:
                 continue
             if visible_catalogs is not None and cid not in visible_catalogs:
@@ -1536,7 +1795,11 @@ async def search_collections(
         where_clauses.append("mc.keywords @> CAST(:keywords AS jsonb)")
         params["keywords"] = str(search_request.keywords).replace("'", '"')
 
-    # STAC Collection Search `q` — free-text across id, title (all languages), description
+    # STAC Collection Search `q` — free-text across id, title (English), description (English).
+    # `title` and `description` are JSONB localized objects ({"en": "...", "fr": "..."}).
+    # Applying lower() directly to a jsonb column raises UndefinedFunctionError in Postgres
+    # because there is no lower(jsonb) overload.  Extract the English text value with the
+    # ->>'en' accessor (returns text, NULL when the key is absent) before calling lower().
     if search_request.q:
         q_conditions = []
         for idx, term in enumerate(search_request.q):
@@ -1544,8 +1807,8 @@ async def search_collections(
             params[p] = f"%{term.lower()}%"
             q_conditions.append(
                 f"(lower(c.id) LIKE :{p} "
-                f"OR lower(mc.description) LIKE :{p} "
-                f"OR lower(mc.title::text) LIKE :{p})"
+                f"OR lower(mc.description->>'en') LIKE :{p} "
+                f"OR lower(mc.title->>'en') LIKE :{p})"
             )
         if q_conditions:
             where_clauses.append("(" + " AND ".join(q_conditions) + ")")
@@ -1572,11 +1835,19 @@ async def search_collections(
     # ``collection_stac`` (links / assets / extent / providers /
     # summaries / item_assets).  Text-match filters land on the CORE
     # alias (``mc``), spatial filters on the STAC alias (``ms``).
+    # ``external_id`` must be selected alongside the internal ``id`` so
+    # ``Collection.model_validate(row)`` below populates it — without it the
+    # model's ``external_id`` field stays None and
+    # ``BaseMetadata._serialize_public_id`` (shared_models.py) has nothing to
+    # swap onto the wire ``id``, leaking the internal ``col_...`` token on
+    # every collection this query serves (Collection Search branch and the
+    # PG plain-listing fallback both consume it via
+    # ``_pg_collections_to_stac_dicts`` in stac_service.py). Refs #2853.
     _meta_cols = (
-        "c.id, c.catalog_id, "
+        "c.id, c.external_id, c.catalog_id, "
         "mc.title, mc.description, mc.keywords, mc.license, "
         "ms.links, ms.assets, ms.extent, ms.providers, ms.summaries, "
-        "ms.item_assets, mc.extra_metadata"
+        "ms.item_assets, ms.stac_extensions, mc.extra_metadata"
     )
     union_queries = []
     for idx, (cid, schema) in enumerate(target_pairs):

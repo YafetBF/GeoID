@@ -18,8 +18,8 @@
 
 import logging
 import json
-from typing import Optional, Dict, Any, Type, Union
-from dynastore.tools.cache import cached
+from typing import Optional, Dict, Any, List, Tuple, Type, Union
+from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 from dynastore.modules.storage.router import invalidate_router_cache
 
 
@@ -41,7 +41,7 @@ def _materialise_ref_row(row: Optional[Dict[str, Any]], ref_key: str) -> Optiona
             row["class_key"],
         )
         return None
-    return cls.model_validate(row["config_data"])
+    return _validate_stored_config(cls, row["config_data"])
 
 
 def _maybe_bust_router(cls: Type["PluginConfig"], catalog_id: Optional[str], collection_id: Optional[str]) -> None:
@@ -61,11 +61,10 @@ def _maybe_bust_router(cls: Type["PluginConfig"], catalog_id: Optional[str], col
         return
     invalidate_router_cache(catalog_id, collection_id)
 from dynastore.modules.db_config.query_executor import (
-    DQLQuery,
-    ResultHandler,
     managed_transaction,
     DbResource,
 )
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 from dynastore.models.driver_context import DriverContext
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.json import CustomJSONEncoder
@@ -73,13 +72,18 @@ from dynastore.tools.json import CustomJSONEncoder
 # Class-as-identity config API.
 from dynastore.models.plugin_config import PluginConfig, require_config_class, resolve_config_class
 from dynastore.modules.db_config.platform_config_service import (
-    _register_schema,
     enforce_config_immutability,
     restore_system_assigned_fields,
     run_apply_handlers,
     run_validate_handlers,
 )
+from dynastore.modules.db_config.stored_config_read import _validate_stored_config
 from dynastore.modules.db_config.locking_tools import check_table_exists
+from dynastore.modules.db_config.config_version import (
+    decode_config_version,
+    encode_config_version,
+)
+from dynastore.modules.db_config.exceptions import ConfigVersionConflictError
 from dynastore.modules.db_config.typed_store.ddl import (
     CATALOG_CONFIGS_TABLE,
     COLLECTION_CONFIGS_TABLE,
@@ -133,10 +137,11 @@ def _resolve(config_cls: "Union[str, Type[PluginConfig]]") -> "tuple[Type[Plugin
 
 @cached(
     maxsize=8192,
-    ttl=300,
+    ttl=DEFAULT_CONFIG_CACHE_TTL,
     namespace="catalog_config",
     ignore=["engine", "catalog_manager"],
-    l1_ttl=2,
+    l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
+    condition=lambda v: v is not None,
 )
 async def _catalog_config_cache(
     engine: DbResource,
@@ -161,10 +166,11 @@ async def _catalog_config_cache(
 
 @cached(
     maxsize=16384,
-    ttl=300,
+    ttl=DEFAULT_CONFIG_CACHE_TTL,
     namespace="collection_config",
     ignore=["engine", "catalog_manager"],
-    l1_ttl=2,
+    l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
+    condition=lambda v: v is not None,
 )
 async def _collection_config_cache(
     engine: DbResource,
@@ -225,6 +231,37 @@ def invalidate_collection_config_cache(catalog_id: str, collection_id: str) -> N
     clear_prefix = getattr(_collection_config_cache, "cache_clear_prefix", None)
     if clear_prefix is not None:
         clear_prefix(sub_ns)
+
+
+def invalidate_catalog_config_caches(internal_catalog_id: str) -> None:
+    """Drop every catalog- and collection-config cache entry for a catalog.
+
+    Catalog delete/reclaim and re-creation have no lifecycle-invalidation hook
+    into ``_catalog_config_cache`` / ``_collection_config_cache`` today (#2895):
+    a config resolved just before a delete stays cached for up to the L2 TTL
+    (300s) and would be served to a reclaimed catalog id that reuses the same
+    internal id. Same ``cache_clear_prefix`` mechanism as
+    ``invalidate_collection_config_cache`` — the catalog-config key format is
+    ``catalog_config|repr(catalog_id)|repr(class_key)`` and the
+    collection-config key format is
+    ``collection_config|repr(catalog_id)|repr(collection_id)|repr(class_key)``,
+    so a prefix of just ``repr(catalog_id)`` on each covers every class_key
+    (and, for collections, every collection) under this catalog.
+
+    ``internal_catalog_id`` must already be the immutable internal id — every
+    read (``get_catalog_config_internal_cached`` /
+    ``get_collection_config_internal_cached``) and write invalidation in this
+    module key on that form (see ``ConfigService._internal_catalog_id``).
+    """
+    cat_sub_ns = f"catalog_config|{repr(internal_catalog_id)}"
+    cat_clear_prefix = getattr(_catalog_config_cache, "cache_clear_prefix", None)
+    if cat_clear_prefix is not None:
+        cat_clear_prefix(cat_sub_ns)
+
+    col_sub_ns = f"collection_config|{repr(internal_catalog_id)}"
+    col_clear_prefix = getattr(_collection_config_cache, "cache_clear_prefix", None)
+    if col_clear_prefix is not None:
+        col_clear_prefix(col_sub_ns)
 
 
 # ==============================================================================
@@ -310,7 +347,13 @@ class ConfigService(ConfigsProtocol):
             if class_key in config_snapshot:
                 data = config_snapshot[class_key]
                 if data:
-                    return cls.model_validate(data)
+                    # Snapshots built from ``list_catalog_configs`` carry
+                    # already-validated instances; only raw dicts (e.g. a
+                    # stored-row shape written before a field rename) need the
+                    # tolerant-read treatment.
+                    if isinstance(data, cls):
+                        return data
+                    return _validate_stored_config(cls, data)
             # Authoritative snapshot: skip DB tiers, fall through to platform.
             catalog_id = None
             collection_id = None
@@ -328,24 +371,17 @@ class ConfigService(ConfigsProtocol):
         # live platform/code default — so a later default change does not
         # silently re-resolve into collections that already inherited it. The
         # snapshot is schema-id-gated: on a class-schema change the entry is
-        # ignored and we keep the live ``base`` above (see config_snapshot).
+        # ignored and we keep the live ``base`` above. Shared with the
+        # composed-config view via ``resolve_catalog_snapshot_base`` so the
+        # two paths agree by construction (#2830).
         from dynastore.modules.catalog.config_snapshot import (
-            SNAPSHOT_REF_KEY,
-            select_snapshot_base,
+            resolve_catalog_snapshot_base,
         )
-        try:
-            snapshot_blob = await self.get_catalog_config_internal_cached(
-                catalog_id, SNAPSHOT_REF_KEY
-            )
-            snap_base = select_snapshot_base(snapshot_blob, cls)
-            if snap_base is not None:
-                base = snap_base
-        except Exception:  # noqa: BLE001 — snapshot is best-effort; never block a read
-            logger.debug(
-                "defaults-snapshot base resolution failed for %s — using live default",
-                class_key,
-                exc_info=True,
-            )
+        snap_base = await resolve_catalog_snapshot_base(
+            cls, catalog_id, self.get_catalog_defaults_snapshot,
+        )
+        if snap_base is not None:
+            base = snap_base
 
         # Collect per-tier deltas top-down.
         deltas: list[dict] = []
@@ -385,8 +421,16 @@ class ConfigService(ConfigsProtocol):
                     if phys_schema and await check_table_exists(
                         conn, COLLECTION_CONFIGS_TABLE, phys_schema
                     ):
+                        # Issue #2430: Resolve to internal ID for lookup
+                        try:
+                            resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                                catalog_id, collection_id, allow_missing=True
+                            )
+                            internal_collection_id = resolved.id
+                        except Exception:
+                            internal_collection_id = collection_id
                         collection_delta = await _cq.select_collection_config(phys_schema).execute(
-                            conn, collection_id=collection_id, ref_key=class_key
+                            conn, collection_id=internal_collection_id, ref_key=class_key
                         )
                     else:
                         collection_delta = None
@@ -398,18 +442,162 @@ class ConfigService(ConfigsProtocol):
 
         # Merge base.model_dump() with deltas in order (catalog → collection).
         # mode="python" preserves native types for round-trip re-validation.
+        # ``_validate_stored_config`` strips keys the live class schema no
+        # longer declares (warning logged) so a stored delta written by an
+        # older deploy (field later removed) never injects an unknown key
+        # that would cause extra_forbidden on validation.  The class default
+        # for the missing field is used instead.
         merged: Dict[str, Any] = base.model_dump(mode="python")
         for delta in deltas:
             merged.update(delta)
-        return cls.model_validate(merged)
+        return _validate_stored_config(cls, merged)
+
+    async def get_configs_batch(
+        self,
+        config_cls: "Union[str, Type[PluginConfig]]",
+        catalog_id: str,
+        collection_ids: "List[str]",
+        ctx: Optional[DriverContext] = None,
+    ) -> "Dict[str, PluginConfig]":
+        """Resolve the same waterfall as :meth:`get_config` for many collections
+        of one catalog in a bounded number of round trips (#2865 PG-fallback
+        fix).
+
+        ``get_config`` called once per collection with ``ctx.db_resource`` set
+        bypasses the L1/L2 caches by design (a live connection means "read
+        through", e.g. inside an open transaction) and re-does the catalog-tier
+        work — physical-schema resolution, table-existence checks, catalog
+        delta fetch — on every call even though none of it varies by
+        collection. For a large catalog (thousands of collections) that is
+        thousands of redundant round trips on a single connection.
+
+        This fetches the catalog-tier delta ONCE and the collection-tier
+        deltas for every id in ``collection_ids`` in a SINGLE
+        ``collection_id = ANY(...)`` query, then applies the identical
+        base → catalog → collection merge :meth:`get_config` uses. Only
+        meaningful when ``ctx.db_resource`` is set; without it, per-collection
+        resolution already goes through the (cheap, already-cached)
+        ``get_collection_config_internal_cached`` path.
+
+        Returns a config for every id in ``collection_ids`` (never partial).
+        """
+        cls, class_key = _resolve(config_cls)
+        db_resource = ctx.db_resource if ctx else None
+
+        base = await self._get_platform_config_service().get_config(
+            cls, ctx=DriverContext(db_resource=db_resource) if db_resource else None
+        )
+
+        from dynastore.modules.catalog.config_snapshot import (
+            resolve_catalog_snapshot_base,
+        )
+        snap_base = await resolve_catalog_snapshot_base(
+            cls, catalog_id, self.get_catalog_defaults_snapshot,
+        )
+        if snap_base is not None:
+            base = snap_base
+
+        catalog_delta: Optional[dict] = None
+        collection_delta_by_id: Dict[str, dict] = {}
+
+        if not db_resource:
+            catalog_delta = await self.get_catalog_config_internal_cached(catalog_id, class_key)
+            for cid in collection_ids:
+                delta = await self.get_collection_config_internal_cached(
+                    catalog_id, cid, class_key
+                )
+                if delta:
+                    collection_delta_by_id[cid] = delta
+        else:
+            async with managed_transaction(db_resource) as conn:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True,
+                )
+                if phys_schema:
+                    if await check_table_exists(conn, CATALOG_CONFIGS_TABLE, phys_schema):
+                        catalog_delta = await _cq.select_catalog_config(phys_schema).execute(
+                            conn, ref_key=class_key,
+                        )
+                    if collection_ids and await check_table_exists(
+                        conn, COLLECTION_CONFIGS_TABLE, phys_schema
+                    ):
+                        internal_to_external: Dict[str, str] = {}
+                        internal_ids: List[str] = []
+                        for cid in collection_ids:
+                            try:
+                                resolved = await (
+                                    self._get_catalog_manager().collections.resolve_collection_ids(
+                                        catalog_id, cid, allow_missing=True,
+                                    )
+                                )
+                                internal_id = resolved.id
+                            except Exception:
+                                internal_id = cid
+                            internal_ids.append(internal_id)
+                            internal_to_external[internal_id] = cid
+                        rows = await _cq.select_collection_configs_batch(phys_schema).execute(
+                            conn, collection_ids=internal_ids, ref_key=class_key,
+                        )
+                        for row in rows:
+                            raw_id: str = row["collection_id"]
+                            ext_id: str = internal_to_external.get(raw_id, raw_id)
+                            collection_delta_by_id[ext_id] = row["config_data"]
+
+        result: Dict[str, PluginConfig] = {}
+        base_dump: Optional[Dict[str, Any]] = None
+        for cid in collection_ids:
+            delta = collection_delta_by_id.get(cid)
+            if not catalog_delta and not delta:
+                result[cid] = base
+                continue
+            if base_dump is None:
+                base_dump = base.model_dump(mode="python")
+            merged = dict(base_dump)
+            if catalog_delta:
+                merged.update(catalog_delta)
+            if delta:
+                merged.update(delta)
+            result[cid] = _validate_stored_config(cls, merged)
+        return result
+
+    async def _internal_catalog_id(self, catalog_id: str) -> str:
+        """Normalize ``catalog_id`` to its immutable internal id for cache keys.
+
+        ``resolve_catalog_id`` is external-only (returns ``None`` for an
+        already-internal id, by design — see its docstring), so the
+        None-guard leaves an already-internal id unchanged. Every
+        ``_catalog_config_cache`` / ``_collection_config_cache`` read and
+        invalidation call site goes through this so the two agree on the same
+        key regardless of which id form the caller holds (#2895).
+        """
+        resolved = await self._get_catalog_manager().resolve_catalog_id(
+            catalog_id, allow_missing=True
+        )
+        return resolved if resolved is not None else catalog_id
 
     async def get_catalog_config_internal_cached(
         self, catalog_id: str, class_key: str
     ) -> Optional[dict]:
         assert self.engine is not None, "ConfigService.engine not initialised"
+        catalogs = self._get_catalog_manager()
+        catalog_id = await self._internal_catalog_id(catalog_id)
         return await _catalog_config_cache(
-            self.engine, self._get_catalog_manager(), catalog_id, class_key
+            self.engine, catalogs, catalog_id, class_key
         )
+
+    async def get_catalog_defaults_snapshot(
+        self, catalog_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the catalog's frozen defaults-snapshot blob (#1079 c), or ``None``.
+
+        Raw ``{class_key: {"schema_id": ..., "data": ...}}`` blob written by
+        :meth:`snapshot_catalog_defaults` at catalog creation. Shared accessor
+        both this method's own ``get_config`` and the composed-config view
+        (``extensions/configs``) call so they resolve the snapshot base
+        identically (#2830).
+        """
+        from dynastore.modules.catalog.config_snapshot import SNAPSHOT_REF_KEY
+        return await self.get_catalog_config_internal_cached(catalog_id, SNAPSHOT_REF_KEY)
 
     async def get_persisted_config(
         self,
@@ -436,12 +624,103 @@ class ConfigService(ConfigsProtocol):
             return None
         return await getter(class_key)
 
+    async def get_config_versioned(
+        self,
+        config_cls: "Union[str, Type[PluginConfig]]",
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        ctx: Optional[DriverContext] = None,
+    ) -> "Tuple[PluginConfig, Optional[str]]":
+        """Versioned read for CAS writes (#2707) — see ConfigsProtocol.
+
+        Platform scope delegates to ``PlatformConfigService.get_config_versioned``.
+        Catalog/collection scope resolves ``config`` through the normal
+        ``get_config`` waterfall, then pairs it with the CAS token read
+        directly from that tier's own row (bypassing
+        ``_catalog_config_cache`` / ``_collection_config_cache`` — the
+        token must reflect the true current row).
+        """
+        cls, class_key = _resolve(config_cls)
+        db_resource = ctx.db_resource if ctx else None
+
+        if catalog_id is None and collection_id is None:
+            platform_svc = self._get_platform_config_service()
+            getter = getattr(platform_svc, "get_config_versioned", None)
+            if getter is None:
+                return await self.get_config(cls, ctx=ctx), None
+            return await getter(
+                cls, ctx=DriverContext(db_resource=db_resource) if db_resource else None
+            )
+
+        resolved = await self.get_config(cls, catalog_id, collection_id, ctx)
+
+        if collection_id is not None:
+            if catalog_id is None:
+                raise ValueError("catalog_id is required when collection_id is provided")
+            validate_sql_identifier(catalog_id)
+            validate_sql_identifier(collection_id)
+            try:
+                resolved_ids = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved_ids.id
+            except Exception:
+                internal_collection_id = collection_id
+            async with managed_transaction(db_resource or self.engine) as conn:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+                )
+                if not phys_schema or not await check_table_exists(
+                    conn, COLLECTION_CONFIGS_TABLE, phys_schema
+                ):
+                    return resolved, None
+                row = await _cq.select_collection_config_versioned(phys_schema).execute(
+                    conn, collection_id=internal_collection_id, ref_key=class_key
+                )
+            return resolved, (encode_config_version(row["updated_at"]) if row else None)
+
+        # collection_id is None here, and the (catalog_id is None and
+        # collection_id is None) case already returned above — so catalog_id
+        # must be set.
+        assert catalog_id is not None
+        validate_sql_identifier(catalog_id)
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+            )
+            if not phys_schema or not await check_table_exists(
+                conn, CATALOG_CONFIGS_TABLE, phys_schema
+            ):
+                return resolved, None
+            row = await _cq.select_catalog_config_versioned(phys_schema).execute(
+                conn, ref_key=class_key
+            )
+        return resolved, (encode_config_version(row["updated_at"]) if row else None)
+
     async def get_collection_config_internal_cached(
         self, catalog_id: str, collection_id: str, class_key: str
     ) -> Optional[dict]:
         assert self.engine is not None, "ConfigService.engine not initialised"
+
+        # Issue #2430: Resolve to internal ID for consistent cache lookup.
+        # After migration, all configs are keyed on internal ID. During migration
+        # window, this may return None for old external-ID-keyed rows; the caller
+        # should handle that gracefully.
+        catalogs = self._get_catalog_manager()
+        try:
+            resolved = await catalogs.collections.resolve_collection_ids(
+                catalog_id, collection_id, allow_missing=True
+            )
+            internal_collection_id = resolved.id
+        except Exception:
+            # Fall back to original ID if resolution fails
+            internal_collection_id = collection_id
+
+        # #2895: also normalize catalog_id (see _internal_catalog_id).
+        catalog_id = await self._internal_catalog_id(catalog_id)
+
         return await _collection_config_cache(
-            self.engine, self._get_catalog_manager(), catalog_id, collection_id, class_key
+            self.engine, catalogs, catalog_id, internal_collection_id, class_key
         )
 
     async def set_config(
@@ -452,6 +731,7 @@ class ConfigService(ConfigsProtocol):
         collection_id: Optional[str] = None,
         check_immutability: bool = True,
         ctx: Optional[DriverContext] = None,
+        expected_version: Optional[str] = None,
     ) -> "PluginConfig":
         """Persist a config and return it.
 
@@ -460,6 +740,11 @@ class ConfigService(ConfigsProtocol):
         place before the upsert, so callers (and the configs API route)
         get the *effective* stored shape rather than ``None``.  #738/#747
         — returning the config is what replaces the silent ``200 + null``.
+
+        ``expected_version`` (#2707): see ConfigsProtocol — ``None``
+        writes unconditionally; a token from ``get_config_versioned``
+        makes this an atomic compare-and-set at the tier implied by
+        ``(catalog_id, collection_id)``.
         """
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
@@ -469,17 +754,20 @@ class ConfigService(ConfigsProtocol):
             await self._set_collection_config(
                 catalog_id, collection_id, cls, config,
                 check_immutability=check_immutability, db_resource=db_resource,
+                expected_version=expected_version,
             )
         elif catalog_id is not None:
             await self._set_catalog_config(
                 catalog_id, cls, config,
                 check_immutability=check_immutability, db_resource=db_resource,
+                expected_version=expected_version,
             )
         else:
             await self._get_platform_config_service().set_config(
                 cls, config,
                 check_immutability=check_immutability,
                 ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+                expected_version=expected_version,
             )
         return config
 
@@ -527,16 +815,9 @@ class ConfigService(ConfigsProtocol):
             )
             if not phys_schema:
                 return
-            # ``catalog_configs.schema_id`` is NOT NULL with a FK into
-            # ``configs.schemas``. Register a fixed sentinel schema (ON CONFLICT
-            # DO NOTHING) so the reserved blob row satisfies the constraint
-            # without inventing a PluginConfig class for the snapshot envelope.
-            await _cq.register_schema.execute(
-                conn,
-                schema_id=SNAPSHOT_REF_KEY,
-                class_key=SNAPSHOT_REF_KEY,
-                schema_json="{}",
-            )
+            # ``catalog_configs.schema_id`` is NOT NULL; the reserved snapshot
+            # blob has no PluginConfig class, so it carries the sentinel ref as
+            # its schema_id (schemas are no longer persisted in a registry).
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
                 ref_key=SNAPSHOT_REF_KEY,
@@ -546,7 +827,10 @@ class ConfigService(ConfigsProtocol):
             )
 
         _catalog_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, SNAPSHOT_REF_KEY
+            self.engine,
+            self._get_catalog_manager(),
+            await self._internal_catalog_id(catalog_id),
+            SNAPSHOT_REF_KEY,
         )
 
     async def _enforce_first_write_against_inherited(
@@ -644,7 +928,7 @@ class ConfigService(ConfigsProtocol):
         Shared by the catalog and collection ``_set_*_config`` paths; the
         scope-specific select stays at the call site (explicit per tier).
         """
-        current_config = cls.model_validate(current_data) if current_data else None
+        current_config = _validate_stored_config(cls, current_data) if current_data else None
         restore_system_assigned_fields(cls, config, current_config)
         if current_config is not None:
             await enforce_config_immutability(
@@ -663,9 +947,23 @@ class ConfigService(ConfigsProtocol):
         config: PluginConfig,
         check_immutability: bool = True,
         db_resource: Optional[DbResource] = None,
+        expected_version: Optional[str] = None,
     ) -> None:
         validate_sql_identifier(catalog_id)
         class_key = cls.class_key()
+
+        # #2435: a config with no explicitly-set fields serialises to {} under
+        # exclude_unset=True.  {} is falsy at read time — the waterfall skips it —
+        # so the row provides no value.  Return early to avoid an unnecessary write
+        # transaction and spurious config-cache / router-cache invalidation.
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write at catalog scope (%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, catalog_id,
+            )
+            return
 
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
@@ -683,21 +981,40 @@ class ConfigService(ConfigsProtocol):
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, None, conn)
 
-            await _register_schema(conn, config)
-
-            await _cq.upsert_catalog_config(phys_schema).execute(
-                conn,
-                ref_key=class_key,
-                class_key=class_key,
-                schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
-            )
+            if expected_version is not None:
+                rowcount = await _cq.cas_update_catalog_config(phys_schema).execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                    expected_version=decode_config_version(expected_version),
+                )
+                if rowcount == 0:
+                    raise ConfigVersionConflictError(
+                        f"set_config({class_key!r}) at catalog {catalog_id!r}: "
+                        f"expected_version {expected_version!r} no longer matches "
+                        f"the stored row (or the row is absent) — a concurrent "
+                        f"writer changed it. Re-read via get_config_versioned "
+                        f"and retry."
+                    )
+            else:
+                await _cq.upsert_catalog_config(phys_schema).execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                )
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, catalog_id, None, conn)
 
         _catalog_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, class_key
+            self.engine,
+            self._get_catalog_manager(),
+            await self._internal_catalog_id(catalog_id),
+            class_key,
         )
         _maybe_bust_router(cls, catalog_id, None)
 
@@ -709,10 +1026,37 @@ class ConfigService(ConfigsProtocol):
         config: PluginConfig,
         check_immutability: bool = True,
         db_resource: Optional[DbResource] = None,
+        expected_version: Optional[str] = None,
     ) -> None:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         class_key = cls.class_key()
+
+        # #2435: a config with no explicitly-set fields serialises to {} under
+        # exclude_unset=True.  {} is falsy at read time — the waterfall skips it —
+        # so the row provides no value.  Return early to avoid an unnecessary write
+        # transaction and spurious config-cache / router-cache invalidation.
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write at collection scope (%s/%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, catalog_id, collection_id,
+            )
+            return
+
+        # Issue #2430: Resolve collection_id to immutable internal ID for persistence.
+        # This ensures configs are keyed on the stable internal ID, not the mutable
+        # external_id. Both forms (external or internal) are accepted at the API
+        # boundary, but persistence always uses internal ID.
+        catalogs = self._get_catalog_manager()
+        resolved = await catalogs.collections.resolve_collection_ids(
+            catalog_id, collection_id, allow_missing=True
+        )
+        # Use internal ID for all persistence operations
+        internal_collection_id = resolved.id
+        # Keep original for cache invalidation (handles both forms)
+        original_collection_id = collection_id
 
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
@@ -724,41 +1068,59 @@ class ConfigService(ConfigsProtocol):
             # always succeeds — every sub-config resolves from the waterfall,
             # so a minimal Collection can be materialised without the caller
             # first hitting `POST /collections`.
-            await self._get_catalog_manager().ensure_collection_exists(
-                catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
+            await catalogs.ensure_collection_exists(
+                catalog_id, internal_collection_id, ctx=DriverContext(db_resource=conn)
             )
 
             if check_immutability:
                 current_data = await _cq.select_collection_config_for_update(phys_schema).execute(
                     conn,
-                    collection_id=collection_id,
+                    collection_id=internal_collection_id,
                     ref_key=class_key,
                 )
                 await self._enforce_write_immutability(
-                    cls, config, current_data, catalog_id, collection_id, conn
+                    cls, config, current_data, catalog_id, internal_collection_id, conn
                 )
 
             # Phase 2 — validate (pre-persist).
-            await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
+            await run_validate_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
-            await _register_schema(conn, config)
-
-            await _cq.upsert_collection_config(phys_schema).execute(
-                conn,
-                collection_id=collection_id,
-                ref_key=class_key,
-                class_key=class_key,
-                schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
-            )
+            if expected_version is not None:
+                rowcount = await _cq.cas_update_collection_config(phys_schema).execute(
+                    conn,
+                    collection_id=internal_collection_id,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                    expected_version=decode_config_version(expected_version),
+                )
+                if rowcount == 0:
+                    raise ConfigVersionConflictError(
+                        f"set_config({class_key!r}) at {catalog_id!r}/"
+                        f"{internal_collection_id!r}: expected_version "
+                        f"{expected_version!r} no longer matches the stored row "
+                        f"(or the row is absent) — a concurrent writer changed "
+                        f"it. Re-read via get_config_versioned and retry."
+                    )
+            else:
+                await _cq.upsert_collection_config(phys_schema).execute(
+                    conn,
+                    collection_id=internal_collection_id,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                )
 
             # Phase 3 — apply (post-persist, best-effort).
-            await run_apply_handlers(cls, config, catalog_id, collection_id, conn)
+            await run_apply_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, collection_id, class_key
+            self.engine, catalogs, await self._internal_catalog_id(catalog_id),
+            internal_collection_id, class_key
         )
-        _maybe_bust_router(cls, catalog_id, collection_id)
+        _maybe_bust_router(cls, catalog_id, original_collection_id)
 
     async def list_configs(
         self,
@@ -775,6 +1137,16 @@ class ConfigService(ConfigsProtocol):
 
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn)
@@ -785,14 +1157,10 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return {"total": 0, "results": []}
 
-                rows = await _cq.list_collection_configs_paginated(phys_schema).execute(
-                    conn,
-                    collection_id=collection_id,
-                    limit=limit,
-                    offset=offset,
+                rows, total = await _cq.list_collection_configs_paginated(
+                    conn, phys_schema, internal_collection_id, limit, offset
                 )
 
-            total = rows[0]["total_count"] if rows else 0
             results = []
             for r in rows:
                 ck: str = r["class_key"]
@@ -802,7 +1170,7 @@ class ConfigService(ConfigsProtocol):
                     continue
                 results.append({
                     "plugin_id": ck,
-                    "config": cls.model_validate(r["config_data"]).model_dump(),
+                    "config": _validate_stored_config(cls, r["config_data"]).model_dump(),
                 })
             return {"total": total, "results": results}
 
@@ -818,11 +1186,10 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, CATALOG_CONFIGS_TABLE, phys_schema):
                     return {"total": 0, "results": []}
 
-                rows = await _cq.list_catalog_configs_paginated(phys_schema).execute(
-                    conn, limit=limit, offset=offset
+                rows, total = await _cq.list_catalog_configs_paginated(
+                    conn, phys_schema, limit, offset
                 )
 
-            total = rows[0]["total_count"] if rows else 0
             results = []
             for r in rows:
                 ck: str = r["class_key"]
@@ -834,7 +1201,7 @@ class ConfigService(ConfigsProtocol):
                     continue
                 results.append({
                     "plugin_id": ck,
-                    "config": cls.model_validate(r["config_data"]).model_dump(),
+                    "config": _validate_stored_config(cls, r["config_data"]).model_dump(),
                 })
             return {"total": total, "results": results}
         else:
@@ -873,7 +1240,7 @@ class ConfigService(ConfigsProtocol):
             if cls is None:
                 logger.warning("Skipping catalog_configs row for unknown class_key %r", class_key)
                 continue
-            configs[class_key] = cls.model_validate(row["config_data"])
+            configs[class_key] = _validate_stored_config(cls, row["config_data"])
         return configs
 
     # -----------------------------------------------------------------
@@ -894,6 +1261,16 @@ class ConfigService(ConfigsProtocol):
                 raise ValueError("catalog_id is required when collection_id is provided")
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
@@ -903,7 +1280,7 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return {}
                 rows = await _cq.list_collection_refs(phys_schema).execute(
-                    conn, collection_id=collection_id
+                    conn, collection_id=internal_collection_id
                 )
             return {r["ref_key"]: r["class_key"] for r in rows}
 
@@ -948,6 +1325,16 @@ class ConfigService(ConfigsProtocol):
                 raise ValueError("catalog_id is required when collection_id is provided")
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
@@ -957,7 +1344,7 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return None
                 row = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                    conn, collection_id=collection_id, ref_key=ref_key
+                    conn, collection_id=internal_collection_id, ref_key=ref_key
                 )
             return _materialise_ref_row(row, ref_key)
 
@@ -1055,6 +1442,16 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(catalog_id)
         class_key = cls.class_key()
 
+        # #2435: skip write when no fields were explicitly set (see _set_catalog_config).
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write (by-ref=%r) at catalog scope (%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, ref_key, catalog_id,
+            )
+            return
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
                 catalog_id, conn, reensure_on_missing=False
@@ -1075,28 +1472,29 @@ class ConfigService(ConfigsProtocol):
                     )
                 if check_immutability:
                     await enforce_config_immutability(
-                        cls.model_validate(existing["config_data"]), config,
+                        _validate_stored_config(cls, existing["config_data"]), config,
                         catalog_id=catalog_id, collection_id=None, conn=conn,
                     )
 
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, None, conn)
 
-            await _register_schema(conn, config)
-
             await _cq.upsert_catalog_config(phys_schema).execute(
                 conn,
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, catalog_id, None, conn)
 
         _catalog_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, class_key
+            self.engine,
+            self._get_catalog_manager(),
+            await self._internal_catalog_id(catalog_id),
+            class_key,
         )
         _maybe_bust_router(cls, catalog_id, None)
 
@@ -1114,57 +1512,73 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(collection_id)
         class_key = cls.class_key()
 
+        # #2435: skip write when no fields were explicitly set (see _set_collection_config).
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write (by-ref=%r) at collection scope (%s/%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, ref_key, catalog_id, collection_id,
+            )
+            return
+
+        # Issue #2430: Resolve collection_id to immutable internal ID for persistence.
+        catalogs = self._get_catalog_manager()
+        resolved = await catalogs.collections.resolve_collection_ids(
+            catalog_id, collection_id, allow_missing=True
+        )
+        internal_collection_id = resolved.id
+        original_collection_id = collection_id
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
                 catalog_id, conn, reensure_on_missing=False
             )
-            await self._get_catalog_manager().ensure_collection_exists(
-                catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
+            await catalogs.ensure_collection_exists(
+                catalog_id, internal_collection_id, ctx=DriverContext(db_resource=conn)
             )
 
             existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                conn, collection_id=collection_id, ref_key=ref_key
+                conn, collection_id=internal_collection_id, ref_key=ref_key
             )
             if existing:
                 stored_class_key = existing["class_key"]
                 if stored_class_key != class_key:
                     raise ValueError(
                         f"set_config_by_ref({ref_key!r}) at "
-                        f"{catalog_id}/{collection_id}: row stored as "
+                        f"{catalog_id}/{internal_collection_id}: row stored as "
                         f"class_key={stored_class_key!r}, refusing to "
                         f"overwrite with class_key={class_key!r}."
                     )
                 if check_immutability:
                     await enforce_config_immutability(
-                        cls.model_validate(existing["config_data"]), config,
-                        catalog_id=catalog_id, collection_id=collection_id, conn=conn,
+                        _validate_stored_config(cls, existing["config_data"]), config,
+                        catalog_id=catalog_id, collection_id=internal_collection_id, conn=conn,
                     )
 
             # Phase 2 — validate (pre-persist).
-            await run_validate_handlers(cls, config, catalog_id, collection_id, conn)
-
-            await _register_schema(conn, config)
+            await run_validate_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
             await _cq.upsert_collection_config(phys_schema).execute(
                 conn,
-                collection_id=collection_id,
+                collection_id=internal_collection_id,
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
-            await run_apply_handlers(cls, config, catalog_id, collection_id, conn)
+            await run_apply_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
             self.engine,
-            self._get_catalog_manager(),
-            catalog_id,
-            collection_id,
+            catalogs,
+            await self._internal_catalog_id(catalog_id),
+            internal_collection_id,
             class_key,
         )
-        _maybe_bust_router(cls, catalog_id, collection_id)
+        _maybe_bust_router(cls, catalog_id, original_collection_id)
 
     async def delete_config_by_ref(
         self,
@@ -1181,6 +1595,16 @@ class ConfigService(ConfigsProtocol):
                 raise ValueError("catalog_id is required when collection_id is provided")
             validate_sql_identifier(catalog_id)
             validate_sql_identifier(collection_id)
+
+            # Issue #2430: Resolve to internal ID for lookup
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                internal_collection_id = collection_id
+
             async with managed_transaction(db_resource or self.engine) as conn:
                 phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                     catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
@@ -1190,17 +1614,18 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return False
                 existing = await _cq.select_collection_config_by_ref(phys_schema).execute(
-                    conn, collection_id=collection_id, ref_key=ref_key
+                    conn, collection_id=internal_collection_id, ref_key=ref_key
                 )
                 if not existing:
                     return False
                 stored_class_key = existing["class_key"]
                 await _cq.delete_collection_config(phys_schema).execute(
-                    conn, collection_id=collection_id, ref_key=ref_key,
+                    conn, collection_id=internal_collection_id, ref_key=ref_key,
                 )
             _collection_config_cache.cache_invalidate(
                 self.engine, self._get_catalog_manager(),
-                catalog_id, collection_id, stored_class_key,
+                await self._internal_catalog_id(catalog_id),
+                internal_collection_id, stored_class_key,
             )
             cls = resolve_config_class(stored_class_key)
             if cls is not None:
@@ -1227,7 +1652,8 @@ class ConfigService(ConfigsProtocol):
                     conn, ref_key=ref_key,
                 )
             _catalog_config_cache.cache_invalidate(
-                self.engine, self._get_catalog_manager(), catalog_id, stored_class_key,
+                self.engine, self._get_catalog_manager(),
+                await self._internal_catalog_id(catalog_id), stored_class_key,
             )
             cls = resolve_config_class(stored_class_key)
             if cls is not None:
@@ -1257,6 +1683,17 @@ class ConfigService(ConfigsProtocol):
             validate_sql_identifier(catalog_id)
         if collection_id:
             validate_sql_identifier(collection_id)
+
+        # Issue #2430: Resolve collection_id to internal ID
+        internal_collection_id = collection_id
+        if collection_id and catalog_id:
+            try:
+                resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved.id
+            except Exception:
+                pass
 
         async with managed_transaction(db_resource or self.engine) as conn:
             if catalog_id:
@@ -1300,17 +1737,17 @@ class ConfigService(ConfigsProtocol):
 
                 sql += " ORDER BY level, collection_id, class_key LIMIT :limit OFFSET :offset;"
 
-                rows = await DQLQuery(
-                    sql, result_handler=ResultHandler.ALL_DICTS
-                ).execute(
+                rows, total = await list_page_with_count(
                     conn,
-                    collection_id=collection_id,
-                    query=f"%{query}%" if query else None,
+                    sql,
+                    {
+                        "collection_id": internal_collection_id,
+                        "query": f"%{query}%" if query else None,
+                    },
                     limit=limit,
                     offset=offset,
                 )
 
-                total = rows[0]["total_count"] if rows else 0
                 results = []
                 for r in rows:
                     class_key: str = r["class_key"]
@@ -1323,7 +1760,7 @@ class ConfigService(ConfigsProtocol):
                             "catalog_id": catalog_id,
                             "collection_id": r.get("collection_id"),
                             "plugin_id": class_key,
-                            "config": cls.model_validate(r["config_data"]).model_dump(),
+                            "config": _validate_stored_config(cls, r["config_data"]).model_dump(),
                         }
                     )
                 return {"total": total, "results": results}
@@ -1388,7 +1825,8 @@ class ConfigService(ConfigsProtocol):
 
             if rows_affected > 0:
                 _catalog_config_cache.cache_invalidate(
-                    self.engine, self.catalog_manager, catalog_id, class_key
+                    self.engine, self.catalog_manager,
+                    await self._internal_catalog_id(catalog_id), class_key,
                 )
                 _maybe_bust_router(cls, catalog_id, None)
                 return True
@@ -1404,6 +1842,16 @@ class ConfigService(ConfigsProtocol):
         class_key = cls.class_key()
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+
+        # Issue #2430: Resolve to internal ID for lookup
+        try:
+            resolved = await self._get_catalog_manager().collections.resolve_collection_ids(
+                catalog_id, collection_id, allow_missing=True
+            )
+            internal_collection_id = resolved.id
+        except Exception:
+            internal_collection_id = collection_id
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._get_catalog_manager().resolve_physical_schema(
                 catalog_id, ctx=DriverContext(db_resource=conn)
@@ -1416,7 +1864,7 @@ class ConfigService(ConfigsProtocol):
 
             rows_affected = await _cq.delete_collection_config(phys_schema).execute(
                 conn,
-                collection_id=collection_id,
+                collection_id=internal_collection_id,
                 ref_key=class_key,
             )
 
@@ -1424,8 +1872,8 @@ class ConfigService(ConfigsProtocol):
                 _collection_config_cache.cache_invalidate(
                     self.engine,
                     self.catalog_manager,
-                    catalog_id,
-                    collection_id,
+                    await self._internal_catalog_id(catalog_id),
+                    internal_collection_id,
                     class_key,
                 )
                 _maybe_bust_router(cls, catalog_id, collection_id)

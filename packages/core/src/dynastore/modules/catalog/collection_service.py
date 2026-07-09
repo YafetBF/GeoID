@@ -18,9 +18,12 @@
 
 import logging
 import json
-from typing import List, Optional, Any, Dict, Union, Set
-from dynastore.tools.cache import cached
+from typing import FrozenSet, List, Optional, Any, Dict, Tuple, Union, Set, TYPE_CHECKING
+from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 from dynastore.models.driver_context import DriverContext
+
+if TYPE_CHECKING:
+    from dynastore.models.resolved_ids import ResolvedCollectionIds
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -36,7 +39,7 @@ from dynastore.modules.catalog.catalog_config import (
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.protocols.entity_store import CollectionLifecycle
 from dynastore.tools.discovery import get_protocol
-from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.db import validate_sql_identifier, InvalidIdentifierError
 from dynastore.tools.async_utils import signal_bus
 from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry, LifecycleContext
 from dynastore.modules.catalog.event_service import CatalogEventType, emit_event
@@ -63,7 +66,13 @@ def _unmark_confirmed_active(catalog_id: str, collection_id: str) -> None:
     _confirmed_active.discard((catalog_id, collection_id))
 
 
-@cached(maxsize=1024, namespace="collection_model", ignore=["service"])
+@cached(
+    maxsize=1024,
+    namespace="collection_model",
+    ignore=["service"],
+    ttl=DEFAULT_CONFIG_CACHE_TTL,
+    l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
+)
 async def _collection_model_cache(
     service: "CollectionService", catalog_id: str, collection_id: str
 ) -> Optional[Collection]:
@@ -73,10 +82,14 @@ async def _collection_model_cache(
     every ``CollectionService`` instance shares one cache entry per collection.
     A module-level cache (single decorator closure → single backend) is what
     makes ``cache_invalidate`` from any instance visible to reads issued
-    through any other instance; an instance-bound cache would give each
-    service its own backend, so a write+invalidate on one instance would leave
-    stale entries readable through another (e.g. the facade-internal service
-    vs. the standalone one).
+    through any other; an instance-bound cache would give each service its own
+    backend, so a write+invalidate on one instance would leave stale entries
+    readable through another (e.g. the facade-internal service vs. the
+    standalone one).
+
+    TTL bounds staleness: ``ttl=300`` (5 min) ensures L2 self-heals even if
+    invalidation or fresh ``set`` is dropped by an unreliable Valkey (#2328).
+    ``l1_ttl=2`` tightens cross-pod L1 window (same pattern as config/router).
     """
     return await service._get_collection_model_db(catalog_id, collection_id)
 
@@ -123,21 +136,162 @@ def _invalidate_collection_lifecycle_caches(catalog_id: str, collection_id: str)
     invalidate_collection_config_cache(catalog_id, collection_id)
 
 
-def _make_collection_exists_query(phys_schema: str) -> DQLQuery:
-    """SELECT id FROM ``phys_schema``.collections by id (non-deleted only).
+@cached(
+    maxsize=4096,
+    ttl=300,
+    namespace="collection_external_id",
+    ignore=["service"],
+    condition=lambda v: v is not None,
+)
+async def _collection_external_id_cache(
+    service: "CollectionService", catalog_id: str, external_id: str
+) -> Optional[str]:
+    """Resolve a collection's internal ``id`` from its public ``external_id``.
 
-    Used as a pre-check on read/update paths. Factoring keeps the SELECT
-    projection and deleted_at filter in one place.
+    Keyed on ``(catalog_id, external_id)`` — ``service`` is ignored for
+    keying so every ``CollectionService`` instance shares one cache entry.
+    A plain string round-trips losslessly; ``condition`` keeps misses out
+    so a just-created collection resolves immediately.  The cache is a
+    pure accelerator — on any miss the registry SELECT is the source of
+    truth.
+    """
+    return await service._get_collection_id_by_external_id_db(catalog_id, external_id)
+
+
+def _invalidate_collection_external_id_cache(catalog_id: str, external_id: str) -> None:
+    """Drop the external_id → internal id cache entry for a collection.
+
+    Called on create (in case a tombstone was reclaimed) and on future
+    rename/delete operations.  ``service`` is ignored for keying.
+    """
+    _collection_external_id_cache.cache_invalidate(None, catalog_id, external_id)
+
+
+@cached(
+    maxsize=4096,
+    ttl=300,
+    namespace="collection_internal_to_external_id",
+    ignore=["service"],
+    condition=lambda v: v is not None,
+)
+async def _collection_internal_to_external_id_cache(
+    service: "CollectionService", catalog_id: str, internal_id: str
+) -> Optional[str]:
+    """Resolve a collection's public ``external_id`` from its immutable internal ``id``.
+
+    Keyed on ``(catalog_id, internal_id)`` — ``service`` is ignored for
+    keying so every ``CollectionService`` instance shares one cache entry.
+    The cache is a pure accelerator; on any miss the registry SELECT is the
+    source of truth.  ``condition`` keeps misses out so a renamed collection
+    resolves to its new label immediately.
+    """
+    return await service._get_collection_external_id_by_internal_id_db(catalog_id, internal_id)
+
+
+def _invalidate_collection_internal_to_external_id_cache(
+    catalog_id: str, internal_id: str
+) -> None:
+    """Drop the internal → external_id cache entry for a collection.
+
+    Called on rename so the new external label is picked up immediately.
+    """
+    _collection_internal_to_external_id_cache.cache_invalidate(None, catalog_id, internal_id)
+
+
+# PK constraint name for {schema}.collections (``id VARCHAR NOT NULL PRIMARY KEY``).
+# asyncpg surfaces the constraint name on UniqueViolationError.
+_COLLECTION_PK_CONSTRAINT = "collections_pkey"
+# Maximum retries for internal-id PK regeneration.
+_COLLECTION_PK_MAX_RETRIES = 5
+
+
+async def _insert_collection_row_with_pk_retry(
+    conn: Any,
+    *,
+    phys_schema: str,
+    external_id: str,
+    catalog_id: str,
+    lifecycle_status: Optional[str],
+) -> str:
+    """Insert the ``{schema}.collections`` registry row, regenerating the internal id
+    on a PK collision (rare after the entropy widening, but guarded for correctness).
+
+    Returns the committed ``internal_id``.
+
+    Only PK clashes (constraint ``collections_pkey`` / pgcode 23505 on the ``id``
+    column) trigger a retry.  A unique violation on ``external_id``
+    (``collections_external_uq``) is a genuine user conflict and is re-raised
+    immediately — it must NOT be retried.
+    """
+    import logging as _logging
+    from dynastore.modules.catalog.catalog_service import generate_physical_name as _gen
+    from dynastore.modules.db_config.exceptions import UniqueViolationError as _UVE
+
+    _logger = _logging.getLogger(__name__)
+
+    insert_sql = (
+        f'INSERT INTO "{phys_schema}".collections (id, external_id, catalog_id, lifecycle_status) '
+        "VALUES (:id, :external_id, :catalog_id, :lifecycle_status) "
+        "RETURNING id;"
+    )
+
+    for attempt in range(_COLLECTION_PK_MAX_RETRIES):
+        internal_id = _gen("col")
+        try:
+            await DQLQuery(insert_sql, result_handler=ResultHandler.SCALAR_ONE).execute(
+                conn,
+                id=internal_id,
+                external_id=external_id,
+                catalog_id=catalog_id,
+                lifecycle_status=lifecycle_status,
+            )
+            return internal_id
+        except Exception as exc:
+            orig = getattr(exc, "orig", exc)
+            pgcode = getattr(orig, "pgcode", None)
+            constraint = getattr(orig, "constraint_name", None) or ""
+            is_unique = pgcode == "23505" or isinstance(exc, _UVE) or isinstance(orig, _UVE)
+            is_pk_clash = is_unique and (
+                constraint == _COLLECTION_PK_CONSTRAINT
+                or "collections_pkey" in str(exc).lower()
+                or "collections_pkey" in str(orig).lower()
+            )
+            if is_unique and not is_pk_clash:
+                # external_id unique-constraint violation — real user conflict.
+                if not isinstance(exc, _UVE):
+                    raise _UVE(
+                        f"Collection '{external_id}' already exists in catalog '{catalog_id}'"
+                    ) from exc
+                raise
+            if is_pk_clash and attempt < _COLLECTION_PK_MAX_RETRIES - 1:
+                _logger.warning(
+                    "_insert_collection_row_with_pk_retry: PK clash on attempt %d "
+                    "(internal_id=%r); regenerating",
+                    attempt, internal_id,
+                )
+                continue
+            raise
+    raise AssertionError("_insert_collection_row_with_pk_retry: exhausted attempts")
+
+
+def _make_collection_exists_query(phys_schema: str) -> DQLQuery:
+    """SELECT id and external_id from ``phys_schema``.collections by id (non-deleted only).
+
+    Returns a single row dict so callers can read both the internal id (PK) and
+    the renamable public label (external_id) in one round-trip.  Used as a
+    pre-check on read/update paths and to populate external_id on the returned
+    Collection model so the output-boundary serializer can project the public
+    label as ``"id"``.
     """
     return DQLQuery(
-        f'SELECT id FROM "{phys_schema}".collections '
+        f'SELECT id, external_id FROM "{phys_schema}".collections '
         "WHERE id = :id AND deleted_at IS NULL;",
-        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+        result_handler=ResultHandler.ONE_OR_NONE,
     )
 
 
 def _make_collection_list_ids_query(phys_schema: str) -> DQLQuery:
-    """SELECT ids of non-deleted collections in ``phys_schema``, paginated.
+    """SELECT ids of ACTIVE collections in ``phys_schema``, paginated.
 
     The thin PG ``collections`` registry is the authoritative existence
     ledger for every collection regardless of where its metadata lives (ES,
@@ -145,11 +299,37 @@ def _make_collection_list_ids_query(phys_schema: str) -> DQLQuery:
     the configured READ router, so a pure-ES (or DuckDB-only) catalog lists
     its collections even when the ES SEARCH index is empty or lagged. Stable
     ``ORDER BY id`` makes ``limit``/``offset`` pagination deterministic.
+
+    ``lifecycle_status IS NULL`` hides mid-provisioning and mid-hard-delete
+    rows (#2194 / #2066): the overlay is set to ``'provisioning'`` or
+    ``'deleting'`` while async init or teardown is in flight, and cleared
+    back to NULL once ACTIVE.  A direct GET-by-id still resolves it so a
+    client polling a known id can watch progress.
     """
     return DQLQuery(
         f'SELECT id FROM "{phys_schema}".collections '
-        "WHERE deleted_at IS NULL ORDER BY id LIMIT :limit OFFSET :offset;",
+        "WHERE deleted_at IS NULL AND lifecycle_status IS NULL "
+        "ORDER BY id LIMIT :limit OFFSET :offset;",
         result_handler=ResultHandler.ALL_SCALARS,
+    )
+
+
+def _make_collection_list_id_pairs_query(phys_schema: str) -> DQLQuery:
+    """SELECT (id, external_id) of every ACTIVE collection in ``phys_schema``.
+
+    Unlike :func:`_make_collection_list_ids_query`, this returns both columns
+    already present on the thin PG registry row and is unpaginated — callers
+    that only need the internal/external id mapping (not the full hydrated
+    :class:`Collection` model) can build it from a single round-trip instead
+    of hydrating every collection via the routed metadata store. Same
+    ``deleted_at``/``lifecycle_status`` visibility predicate as the ids-only
+    query, so provisioning/deleting collections stay hidden.
+    """
+    return DQLQuery(
+        f'SELECT id, external_id FROM "{phys_schema}".collections '
+        "WHERE deleted_at IS NULL AND lifecycle_status IS NULL "
+        "ORDER BY id;",
+        result_handler=ResultHandler.ALL,
     )
 
 
@@ -203,6 +383,194 @@ class CollectionService:
             catalog_id, ctx=DriverContext(db_resource=db_resource) if db_resource else None
         )
 
+    async def _get_collection_id_by_external_id_db(
+        self, catalog_id: str, external_id: str
+    ) -> Optional[str]:
+        """Authoritative external_id → internal id lookup against the tenant collections table.
+
+        Resolves the catalog's physical schema first via the registered
+        ``CatalogsProtocol`` (bypasses the ``self._resolve_physical_schema``
+        wrapper so that unit tests which patch that wrapper for delete/create
+        paths do not inadvertently trigger resolution here).  When no
+        ``CatalogsProtocol`` is registered the lookup cannot proceed and returns
+        ``None`` (passthrough — caller treats the id as already-internal).
+        The cold-miss fallback behind ``_collection_external_id_cache``.
+        """
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            return None
+        phys_schema = await catalogs.resolve_physical_schema(catalog_id)
+        if not phys_schema:
+            return None
+        async with managed_transaction(self.engine) as conn:
+            return await DQLQuery(
+                f'SELECT id FROM "{phys_schema}".collections '
+                "WHERE external_id = :external_id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, external_id=external_id)
+
+    async def _get_collection_external_id_by_internal_id_db(
+        self, catalog_id: str, internal_id: str
+    ) -> Optional[str]:
+        """Authoritative internal id → external_id lookup against the tenant collections table.
+
+        The cold-miss fallback behind ``_collection_internal_to_external_id_cache``.
+        Returns ``None`` when no ``CatalogsProtocol`` is registered, the catalog
+        schema cannot be resolved, or no live collection carries that internal id.
+        """
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            return None
+        phys_schema = await catalogs.resolve_physical_schema(catalog_id)
+        if not phys_schema:
+            return None
+        async with managed_transaction(self.engine) as conn:
+            return await DQLQuery(
+                f'SELECT external_id FROM "{phys_schema}".collections '
+                "WHERE id = :internal_id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, internal_id=internal_id)
+
+    async def resolve_collection_external_id(
+        self,
+        catalog_id: str,
+        internal_id: str,
+        allow_missing: bool = True,
+    ) -> Optional[str]:
+        """Resolve the public ``external_id`` for a collection from its immutable internal ``id``.
+
+        Used by the item read path to project the stored internal collection id
+        back to the client-visible label.  Goes through
+        ``_collection_internal_to_external_id_cache`` — a lossless string cache.
+
+        Returns the external_id string, or ``None`` when ``allow_missing=True``
+        (default) — callers can fall back to returning ``internal_id`` as-is so
+        a missing cache/DB row degrades gracefully.  Raises ``ValueError`` when
+        ``allow_missing=False``.
+        """
+        external_id = await _collection_internal_to_external_id_cache(
+            self, catalog_id, internal_id
+        )
+        if not external_id and not allow_missing:
+            raise ValueError(
+                f"Collection with internal id '{internal_id}' not found in catalog '{catalog_id}'."
+            )
+        return external_id
+
+    async def resolve_collection_ids(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> "ResolvedCollectionIds":
+        """Resolve a collection's IDs (internal + external) from either form.
+
+        This is the canonical resolution point for config persistence (Issue #2430).
+        Accepts either an external_id or an internal_id and returns both,
+        ensuring callers always have the immutable internal ID for persistence.
+
+        Args:
+            catalog_id: The catalog ID (can be external or internal).
+            collection_id: The collection ID (can be external or internal).
+            allow_missing: If False (default), raises ValueError when not found.
+
+        Returns:
+            ResolvedCollectionIds with both id (internal) and external_id.
+
+        Raises:
+            ValueError: When the collection is not found and allow_missing=False.
+        """
+        from dynastore.models.resolved_ids import ResolvedCollectionIds
+        from dynastore.modules.catalog.catalog_service import (
+            is_internal_physical_name as _is_internal_name,
+        )
+
+        # Resolve catalog_id to internal form first
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols import CatalogsProtocol
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+
+        # Determine if collection_id is already internal
+        if _is_internal_name(collection_id, "col"):
+            # Already internal - look up external_id
+            internal_id = collection_id
+            external_id = await self.resolve_collection_external_id(
+                catalog_id, internal_id, allow_missing=allow_missing
+            )
+            if external_id is None:
+                if not allow_missing:
+                    raise ValueError(
+                        f"Collection with internal id '{internal_id}' not found in catalog '{catalog_id}'."
+                    )
+                # Not found but allow_missing=True - return what we have
+                external_id = internal_id
+        else:
+            # External ID - resolve to internal
+            external_id = collection_id
+            internal_id = await self.resolve_collection_id(
+                catalog_id, external_id, allow_missing=allow_missing
+            )
+            if internal_id is None:
+                if not allow_missing:
+                    raise ValueError(
+                        f"Collection '{external_id}' not found in catalog '{catalog_id}'."
+                    )
+                # Not found but allow_missing=True - return what we have
+                internal_id = external_id
+
+        return ResolvedCollectionIds(
+            id=internal_id,
+            external_id=external_id,
+            catalog_id=catalog_id,
+        )
+
+    async def resolve_collection_id(
+        self,
+        catalog_id: str,
+        external_id: str,
+        allow_missing: bool = False,
+    ) -> Optional[str]:
+        """Resolve the immutable internal ``id`` for a collection from its public ``external_id``.
+
+        Authoritative source: the tenant ``{schema}.collections`` registry.
+        Goes through ``_collection_external_id_cache`` — a lossless string
+        cache.  The cache is a pure accelerator; on any miss the registry
+        SELECT is the source of truth.
+
+        Returns the internal id string, or ``None`` / raises ``ValueError``
+        depending on ``allow_missing``.
+        """
+        internal_id = await _collection_external_id_cache(self, catalog_id, external_id)
+        if not internal_id and not allow_missing:
+            raise ValueError(
+                f"Collection '{external_id}' not found in catalog '{catalog_id}'."
+            )
+        return internal_id
+
+    async def _to_internal_collection_id(
+        self, catalog_id: str, collection_id: str
+    ) -> str:
+        """Map a logical (``external_id``) collection id to its immutable
+        internal ``id`` for use as a storage/config/lifecycle key.
+
+        Dual-accept passthrough: resolves ``external_id`` → internal ``id`` when
+        the value is a public label; when the resolver finds no match the value
+        is already an internal id (or genuinely absent), so it is returned
+        unchanged and the downstream ``WHERE id = …`` query decides MISSING.
+        This mirrors the resolve-then-key idiom in :meth:`delete_collection`
+        and keeps internal-keyed registry rows reachable from logical-id
+        request boundaries.
+        """
+        internal_id = await self.resolve_collection_id(
+            catalog_id, collection_id, allow_missing=True
+        )
+        return internal_id if internal_id is not None else collection_id
+
     async def _get_pg_driver(self):
         """Get the query-fallback (PostgreSQL) storage driver instance."""
         from dynastore.tools.discovery import get_protocols
@@ -227,6 +595,9 @@ class CollectionService:
         Does NOT raise — use :meth:`ensure_alive` when a hard failure is
         appropriate.
         """
+        collection_id = await self._to_internal_collection_id(
+            catalog_id, collection_id
+        )
         try:
             lc = await self._get_lifecycle(catalog_id, collection_id, db_resource)
         except Exception:
@@ -244,6 +615,9 @@ class CollectionService:
         the lifecycle gate.  Fail-closed: any unexpected lookup error also
         raises ``CollectionNotAliveError``.
         """
+        collection_id = await self._to_internal_collection_id(
+            catalog_id, collection_id
+        )
         try:
             lc = await self._get_lifecycle(catalog_id, collection_id, db_resource)
         except Exception as exc:
@@ -386,6 +760,9 @@ class CollectionService:
           (diverged state), remove any stale confirmation and return False so
           the caller's lazy-activation path re-provisions via ensure_storage.
         """
+        collection_id = await self._to_internal_collection_id(
+            catalog_id, collection_id
+        )
         phys_table = await self.resolve_physical_table(
             catalog_id, collection_id, db_resource=db_resource
         )
@@ -503,7 +880,14 @@ class CollectionService:
                 collection_id=collection_id,
                 ctx=DriverContext(db_resource=conn),
             )
-            if resolved_routing:
+            if resolved_routing and resolved_routing.model_fields_set:
+                # Guard: only persist when at least one field was explicitly set
+                # (i.e. get_config returned a delta from the waterfall, not a
+                # bare code-default). A code-default ItemsRoutingConfig() has
+                # empty model_fields_set, so model_dump(exclude_unset=True)
+                # produces {}. {} is falsy at read time — the waterfall skips
+                # it — making the write a no-op that wastes a transaction and
+                # triggers spurious cache invalidation (#2435).
                 await configs.set_config(
                     ItemsRoutingConfig,
                     resolved_routing,
@@ -535,6 +919,9 @@ class CollectionService:
         process-local confirmed-active set so subsequent ``is_active`` calls
         skip the DB existence probe.
         """
+        collection_id = await self._to_internal_collection_id(
+            catalog_id, collection_id
+        )
         db_resource = ctx.db_resource if ctx else None
         async with managed_transaction(db_resource or self.engine) as conn:
             await self._activate_collection(
@@ -553,29 +940,45 @@ class CollectionService:
             )
 
     async def _get_collection_model_logic(
-        self, catalog_id: str, collection_id: str, conn: DbResource
+        self,
+        catalog_id: str,
+        collection_id: str,
+        conn: DbResource,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
         phys_schema = await self._resolve_physical_schema(catalog_id, db_resource=conn)
         if not phys_schema:
             return None
 
         # 1. Verify existence in thin PG registry (always PG — thin registry is authoritative).
-        exists = await _make_collection_exists_query(phys_schema).execute(
+        #    Also fetch external_id in the same round-trip so the returned model can expose
+        #    the renamable public label at the serialization boundary.
+        registry_row = await _make_collection_exists_query(phys_schema).execute(
             conn, id=collection_id
         )
-        if not exists:
+        if not registry_row:
             return None
+        registry = dict(registry_row._mapping) if hasattr(registry_row, "_mapping") else dict(registry_row)
+        collection_external_id: Optional[str] = registry.get("external_id")
 
         # 2. Read metadata via the router — fan-out across every registered
-        # CollectionStore driver (PG Core + PG Stac by default;
-        # ES joins in when the elasticsearch scope is installed).  The
+        # CollectionStore driver (PG Core + PG Stac by default).  The
         # router merges the per-domain slices into one dict.
+        #
+        # Hints are threaded straight through.  An empty hint set keeps the
+        # existing merge-all behaviour (byte-identical default read).  A
+        # non-empty hint set lets a deployment whose routing config declares
+        # hinted READ drivers prefer one driver's view (first-non-None);
+        # see ``get_collection_metadata``.
         from dynastore.modules.catalog.collection_router import (
             get_collection_metadata as _route_get_metadata,
         )
 
         meta_dict = await _route_get_metadata(
-            catalog_id, collection_id, db_resource=conn,
+            catalog_id, collection_id,
+            hints=hints,
+            db_resource=conn,
         ) or {}
 
         # Deserialize JSONB columns
@@ -591,10 +994,12 @@ class CollectionService:
 
         data = {
             "id": collection_id,
+            "external_id": collection_external_id,
             "title": meta_dict.get("title"),
             "description": meta_dict.get("description"),
             "keywords": meta_dict.get("keywords"),
             "license": meta_dict.get("license"),
+            "stac_extensions": meta_dict.get("stac_extensions"),
             "links": meta_dict.get("links"),
             "assets": meta_dict.get("assets"),
             "extent": meta_dict.get("extent"),
@@ -620,17 +1025,33 @@ class CollectionService:
         collection_id: str,
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
         """Retrieves a collection by ID, localized."""
+        # Phase 2: resolve external→internal ids at the public boundary.
+        # catalog_id and collection_id come from HTTP path params (external).
+        # allow_missing=True + passthrough so callers holding already-internal
+        # ids fall through; genuinely missing items are caught by get_collection_model.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+        _col_internal = await self.resolve_collection_id(
+            catalog_id, collection_id, allow_missing=True
+        )
+        if _col_internal is not None:
+            collection_id = _col_internal
+
         db_resource = ctx.db_resource if ctx else None
         collection_model = await self.get_collection_model(
-            catalog_id, collection_id, db_resource=db_resource
+            catalog_id, collection_id, db_resource=db_resource, hints=hints,
         )
         if not collection_model:
             return None
 
         # Localize
-        from dynastore.tools.discovery import get_protocol
         from dynastore.models.protocols.localization import LocalizationProtocol
         loc = get_protocol(LocalizationProtocol)
         if loc:
@@ -655,11 +1076,33 @@ class CollectionService:
         catalog_id: str,
         collection_id: str,
         db_resource: Optional[DbResource] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> Optional[Collection]:
+        """Return the collection metadata model, optionally hint-routed.
+
+        Cache behaviour (requirement B):
+        - When ``hints`` is empty the result is served from the shared
+          ``_collection_model_cache`` (keyed by catalog_id + collection_id).
+          The cache entry is populated via ``_get_collection_model_db``
+          on the no-hint merge-all path, so the cached model is the full
+          default envelope (byte-identical to the pre-hints baseline).
+        - When ``hints`` is non-empty the cache is bypassed entirely so
+          a geometry_simplified read cannot be served a cached
+          default-shaped model and vice-versa.
+        """
         if db_resource:
             async with managed_transaction(db_resource) as conn:
                 return await self._get_collection_model_logic(
-                    catalog_id, collection_id, conn
+                    catalog_id, collection_id, conn, hints=hints,
+                )
+        if hints:
+            # Bypass cache: hinted read must never serve a differently-hinted
+            # cached model (e.g. a geometry_simplified ES copy being returned
+            # when a geometry_exact PG model is in cache, or vice-versa).
+            async with managed_transaction(self.engine) as conn:
+                return await self._get_collection_model_logic(
+                    catalog_id, collection_id, conn, hints=hints,
                 )
         return await _collection_model_cache(self, catalog_id, collection_id)
 
@@ -700,17 +1143,76 @@ class CollectionService:
         collection_id: str,
         lang: str = "en",
     ) -> None:
-        if not await self.get_collection_model(
-            catalog_id, collection_id, db_resource=db_resource
-        ):
-            # If lang is not '*', we provide a simple string which create_collection will localize
-            # If lang is '*', we provide the default 'en' dictionary
-            title = {"en": collection_id} if lang == "*" else collection_id
+        # Phase 2: catalog_id here may be either external or already-resolved
+        # internal (when called from CatalogService.ensure_collection_exists
+        # after its own resolution step).  collection_id is always external (the
+        # public label supplied by the caller).
+        #
+        # Resolve the catalog external_id -> internal id ONCE up front and feed
+        # the internal form to BOTH the existence check and create_collection.
+        # The existence check resolves the catalog's physical schema from this
+        # catalog_id (via resolve_physical_schema); create_collection resolves
+        # external -> internal itself before targeting the schema.  Fed
+        # different forms, the two can land on different schemas: the existence
+        # SELECT then misses a collection that the subsequent INSERT collides
+        # with on collections_external_uq.  Resolving once keeps both on the
+        # same schema.  (#2353 family.)
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+
+        # An already-internal collection_id (col_<token>) can only reach here by
+        # having been resolved external -> internal upstream (e.g. the item write
+        # boundary in item_service.upsert resolves before calling
+        # ensure_physical_table_exists -> set_config -> _set_collection_config ->
+        # ensure_collection_exists).  A successful resolution means the collection
+        # provably exists.  resolve_collection_id is forward-only (external ->
+        # internal) and would MISS an internal id, driving a spurious
+        # create_collection that the internal-id-shape guard then rejects with
+        # InvalidIdentifierError ("... is reserved ...").  So an internal-shaped id
+        # is a no-op: it already exists, by construction.  (#2353 family.)
+        from dynastore.modules.catalog.catalog_service import (
+            is_internal_physical_name as _is_internal_name,
+        )
+        if _is_internal_name(collection_id, "col"):
+            return
+
+        # Use resolve_collection_id to check existence via the external_id index
+        # rather than get_collection_model (which is keyed on internal id and
+        # would always miss on an external collection_id).
+        existing = await self.resolve_collection_id(
+            catalog_id, collection_id, allow_missing=True
+        )
+        if existing is not None:
+            # Already exists; nothing to do.
+            return
+        # If lang is not '*', we provide a simple string which create_collection will localize
+        # If lang is '*', we provide the default 'en' dictionary
+        title = {"en": collection_id} if lang == "*" else collection_id
+        from dynastore.modules.db_config.exceptions import UniqueViolationError
+        try:
             await self.create_collection(
                 catalog_id,
                 {"id": collection_id, "title": title},
                 lang=lang,
                 ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+            )
+        except UniqueViolationError:
+            # Idempotent ensure-semantics.  A concurrent or retried caller can
+            # win the race between our existence check and the INSERT (TOCTOU),
+            # surfacing as a collections_external_uq violation.  The collection
+            # now provably exists, which is exactly what this method guarantees,
+            # so the conflict is benign here.  This is load-bearing for
+            # ingestion: those tasks retry on failure, and a non-idempotent
+            # create would fail the whole job on the second attempt.  The
+            # explicit create_collection API path is unchanged and still raises
+            # (HTTP 409) on a genuine user-initiated duplicate.
+            logger.info(
+                "ensure_collection_exists: collection '%s' already present in "
+                "catalog '%s' (concurrent/retry create); treating as success.",
+                collection_id, catalog_id,
             )
 
     async def create_collection(
@@ -734,6 +1236,39 @@ class CollectionService:
         )
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_model.id)
+        # Invariant: the public collection external_id must never collide with the
+        # internal id space (``col_<13 base32>``).  Keeping the spaces disjoint is
+        # what lets resolve_collection_id resolve strictly forward and keeps
+        # internal ids off the public API surface (mirrors create_catalog).
+        from dynastore.modules.catalog.catalog_service import (
+            is_internal_physical_name as _is_internal_name,
+        )
+        if _is_internal_name(collection_model.id, "col"):
+            raise InvalidIdentifierError(
+                f"Collection id '{collection_model.id}' is reserved: it matches "
+                "the internal id format 'col_<token>'. Collection ids are public "
+                "labels and must not use the internal id shape."
+            )
+        # Phase 2: resolve external catalog_id → internal at the public boundary.
+        # The collection external_id is split from internal_id below (lines
+        # external_id = collection_model.id / internal_id = _gen("col")), so
+        # only the catalog lookup needs resolving here.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+            # If _cat_internal is None the existing get_catalog_model check below
+            # will raise ValueError("Catalog '...' does not exist.") as before.
+
+        # Split public label from internal key.  The user-supplied ``id`` is
+        # the renamable public label (external_id); a generated opaque key
+        # becomes the immutable internal ``id`` (PK).  All downstream storage
+        # (ES, GCS, IAM, item tables) continues to key on ``id`` unchanged.
+        from dynastore.modules.catalog.catalog_service import generate_physical_name as _gen
+        external_id = collection_model.id
+        internal_id = _gen("col")
+        collection_model.id = internal_id
 
         async with managed_transaction(db_resource or self.engine) as conn:
             # Check catalog exists
@@ -749,27 +1284,34 @@ class CollectionService:
                 raise ValueError(f"No physical schema found for catalog '{catalog_id}'")
 
             logger.info(
-                f"[LIFECYCLE] Creating collection '{catalog_id}:{collection_model.id}' in schema '{phys_schema}'"
+                f"[LIFECYCLE] Creating collection '{catalog_id}:{external_id}' "
+                f"(internal_id='{collection_model.id}') in schema '{phys_schema}'"
             )
 
             # #317: reclaim a soft-deleted (tombstoned) id. A prior default
             # (soft) DELETE leaves the collections row with deleted_at set plus
             # its physical table, metadata sidecars and configs intact. Purge
-            # that residue here so the id is reused as a clean, fresh
+            # that residue here so the external_id is reused as a clean, fresh
             # collection. A still-live row (deleted_at IS NULL) is left
             # untouched, so the INSERT below raises the usual conflict.
             tombstoned = await DQLQuery(
-                f'SELECT 1 FROM "{phys_schema}".collections WHERE id = :id AND deleted_at IS NOT NULL;',
+                f'SELECT id FROM "{phys_schema}".collections '
+                "WHERE external_id = :external_id AND deleted_at IS NOT NULL;",
                 result_handler=ResultHandler.ONE_OR_NONE,
-            ).execute(conn, id=collection_model.id)
+            ).execute(conn, external_id=external_id)
             if tombstoned is not None:
+                # Reclaim: purge storage keyed on the OLD internal id, then the
+                # INSERT below uses the newly generated internal_id.
+                old_internal_id = tombstoned[0] if tombstoned else collection_model.id
                 logger.info(
                     f"[LIFECYCLE] Reclaiming soft-deleted collection "
-                    f"'{catalog_id}:{collection_model.id}' for reuse (#317)"
+                    f"'{catalog_id}:{external_id}' (old_internal='{old_internal_id}') "
+                    f"for reuse (#317)"
                 )
                 await self._purge_collection_storage(
-                    conn, phys_schema, catalog_id, collection_model.id
+                    conn, phys_schema, catalog_id, old_internal_id
                 )
+                _invalidate_collection_external_id_cache(catalog_id, external_id)
 
             # Get driver config (default/platform config only - collection doesn't exist yet,
             # so we must NOT pass db_resource here; querying collection_configs in a nested
@@ -828,20 +1370,28 @@ class CollectionService:
             #    async init window closes; the finalizer below flips it to
             #    ACTIVE. With no async initializers the row is ACTIVE on commit
             #    (lifecycle_status NULL) — no pointless provisioning window.
+            #
+            # _insert_collection_row_with_pk_retry regenerates the internal id
+            # and retries up to 5 times on a PK (id) clash only. A unique
+            # violation on external_id is a genuine user conflict and bubbles
+            # immediately as UniqueViolationError → HTTP 409.
             provisioning = lifecycle_registry.has_async_collection_initializers()
-            insert_sql = f"""
-                INSERT INTO "{phys_schema}".collections (id, catalog_id, lifecycle_status)
-                VALUES (:id, :catalog_id, :lifecycle_status)
-                RETURNING id;
-            """
-            await DQLQuery(insert_sql, result_handler=ResultHandler.SCALAR_ONE).execute(
+            committed_collection_id = await _insert_collection_row_with_pk_retry(
                 conn,
-                id=collection_model.id,
+                phys_schema=phys_schema,
+                external_id=external_id,
                 catalog_id=catalog_id,
                 lifecycle_status=(
                     CollectionLifecycle.PROVISIONING.value if provisioning else None
                 ),
             )
+            # Update the model to the committed internal id (may differ from
+            # the placeholder set before the INSERT if PK regeneration occurred).
+            collection_model.id = committed_collection_id
+
+            # Stamp external_id on the model so metadata drivers and callers
+            # can round-trip it without re-querying the registry.
+            collection_model.external_id = external_id  # type: ignore[attr-defined]
 
             # 4. Run infrastructure hooks (events partition, logs, proxy —
             #    hub/sidecars are handled by write_driver.ensure_storage() below).
@@ -938,10 +1488,23 @@ class CollectionService:
             await _route_upsert_metadata(
                 catalog_id, collection_model.id, metadata_payload,
                 db_resource=conn,
+                lifecycle_status=(
+                    CollectionLifecycle.PROVISIONING.value if provisioning else None
+                ),
             )
 
             # Steps 8 & 9 (write_policy + schema persistence) moved to
             # step 5b above so ensure_storage can honour constraints.
+
+            # Emit domain event so _on_collection_creation listeners (e.g.
+            # tasks/event_driver.py) can fan out a collection_creation outbox
+            # row, giving /events + /logs parity with catalog_creation.
+            await emit_event(
+                CatalogEventType.COLLECTION_CREATION,
+                catalog_id=catalog_id,
+                collection_id=collection_model.id,
+                db_resource=conn,
+            )
 
         # Resolve physical_table for async lifecycle context (PG driver only; None for others).
         # Use db_resource when available so uncommitted catalog/collection rows are visible.
@@ -955,6 +1518,7 @@ class CollectionService:
 
         # Invalidate liveness/routing caches post-commit (#2066).
         _invalidate_collection_lifecycle_caches(catalog_id, collection_model.id)
+        _invalidate_collection_external_id_cache(catalog_id, external_id)
 
         # Trigger async lifecycle
         config_snapshot = {}
@@ -980,6 +1544,21 @@ class CollectionService:
             async def _finalize_provisioning() -> None:
                 await self._set_lifecycle_status(_cat_id, _col_id, None)
                 _invalidate_collection_lifecycle_caches(_cat_id, _col_id)
+                # Clear the transitional marker from the ES secondary index so
+                # the collection becomes visible in q-based searches.  Best-effort:
+                # a transient ES failure must not block finalization — PG is the
+                # system of record and the ACTIVE state is already committed above.
+                from dynastore.modules.catalog.collection_router import (
+                    _clear_collection_es_lifecycle_status,
+                )
+                try:
+                    await _clear_collection_es_lifecycle_status(_cat_id, _col_id)
+                except Exception as _exc:
+                    logger.warning(
+                        "ES lifecycle clear failed (best-effort) for %s/%s: %s — "
+                        "collection will appear in ES after the next full reindex",
+                        _cat_id, _col_id, _exc,
+                    )
 
             _on_complete = _finalize_provisioning
 
@@ -1013,7 +1592,17 @@ class CollectionService:
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
+        *,
+        hints: FrozenSet = frozenset(),
     ) -> List[Collection]:
+        # Phase 2: resolve external catalog_id → internal at the public boundary.
+        # Passthrough when no mapping exists so callers with already-internal ids work.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+
         db_resource = ctx.db_resource if ctx else None
 
         # A filtered listing (free-text ``q``) must go through the SEARCH-
@@ -1062,11 +1651,44 @@ class CollectionService:
             collections: List[Collection] = []
             for collection_id in ids:
                 model = await self._get_collection_model_logic(
-                    catalog_id, collection_id, conn
+                    catalog_id, collection_id, conn, hints=hints,
                 )
                 if model is not None:
                     collections.append(model)
             return collections
+
+    async def list_collection_id_pairs(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> List[Tuple[str, Optional[str]]]:
+        """List every active collection's (internal id, external_id) pair.
+
+        Reads straight off the thin PG registry — no per-collection metadata
+        hydration — for callers that only need the internal/external id
+        mapping (e.g. scoping an unbounded search to every collection of a
+        catalog). Unpaginated: returns every row matching the same
+        ``deleted_at``/``lifecycle_status`` visibility predicate as
+        :func:`list_collections`.
+        """
+        # Phase 2: resolve external catalog_id → internal at the public boundary.
+        # Passthrough when no mapping exists so callers with already-internal ids work.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+
+        db_resource = ctx.db_resource if ctx else None
+
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._resolve_physical_schema(
+                catalog_id, db_resource=conn
+            )
+            if not phys_schema:
+                return []
+            rows = await _make_collection_list_id_pairs_query(phys_schema).execute(conn)
+            return [(row[0], row[1]) for row in (rows or [])]
 
     async def update_collection(
         self,
@@ -1079,6 +1701,18 @@ class CollectionService:
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+        # Phase 2: resolve external→internal ids at the public boundary.
+        # Passthrough when no mapping exists so callers with already-internal ids work.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+        _col_internal = await self.resolve_collection_id(
+            catalog_id, collection_id, allow_missing=True
+        )
+        if _col_internal is not None:
+            collection_id = _col_internal
 
         from dynastore.models.localization import validate_language_consistency
 
@@ -1106,6 +1740,16 @@ class CollectionService:
             if not exists:
                 return None
 
+            # Mirrors CatalogService.update_catalog's CATALOG_UPDATE emit
+            # placement (signals mutation intent before the write lands).
+            await emit_event(
+                CatalogEventType.COLLECTION_UPDATE,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                db_resource=conn,
+                operation="metadata_update",
+            )
+
             # Fan-out metadata writes via the collection-metadata router.
             from dynastore.modules.catalog.collection_router import (
                 upsert_collection_metadata as _route_upsert_metadata,
@@ -1117,6 +1761,16 @@ class CollectionService:
             await _route_upsert_metadata(
                 catalog_id, collection_id, metadata_payload,
                 db_resource=conn,
+            )
+
+            # Mirrors CatalogService.update_catalog's AFTER_CATALOG_UPDATE
+            # emit placement (fires once the write is persisted).
+            await emit_event(
+                CatalogEventType.AFTER_COLLECTION_UPDATE,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                db_resource=conn,
+                operation="metadata_update",
             )
 
             # Fetch the post-write state inside the TX so the caller's
@@ -1138,6 +1792,122 @@ class CollectionService:
         _invalidate_collection_model_cache(catalog_id, collection_id)
 
         return fresh
+
+    async def rename_collection(
+        self,
+        catalog_internal_id: str,
+        collection_internal_id: str,
+        new_external_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> "tuple[str, str]":
+        """Rename a collection's public label (external_id) within a catalog.
+
+        The internal immutable ``id`` (PK) is unchanged. All downstream stores
+        (ES, GCS, IAM, item tables) are keyed on the internal id and require no
+        update — this method issues exactly one SQL UPDATE row.
+
+        Args:
+            catalog_internal_id:    The immutable internal id of the owning catalog.
+            collection_internal_id: The immutable internal id of the collection.
+            new_external_id:        The desired new public label.
+            ctx:                    Optional driver context.
+
+        Returns:
+            ``(prev_external_id, new_external_id)`` tuple.
+
+        Raises:
+            CollectionRenameConflictError: if another live collection in the same
+                catalog already has ``external_id = new_external_id``.
+            ValueError: if no live collection row exists for the given internal ids.
+        """
+        validate_sql_identifier(new_external_id)
+
+        from dynastore.modules.db_config.exceptions import CollectionRenameConflictError
+
+        db_resource = ctx.db_resource if ctx else None
+
+        phys_schema = await self._resolve_physical_schema(
+            catalog_internal_id, db_resource=db_resource
+        )
+        if not phys_schema:
+            raise ValueError(f"Catalog '{catalog_internal_id}' not found.")
+
+        async with managed_transaction(db_resource or self.engine) as conn:
+            # Fetch current row to confirm existence and retrieve the current external_id.
+            current = await DQLQuery(
+                f'SELECT id, external_id FROM "{phys_schema}".collections '
+                "WHERE id = :id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.ONE_OR_NONE,
+            ).execute(conn, id=collection_internal_id)
+            if current is None:
+                raise ValueError(
+                    f"Collection with internal id '{collection_internal_id}' "
+                    f"not found in catalog '{catalog_internal_id}'."
+                )
+            _row = dict(current._mapping) if hasattr(current, "_mapping") else dict(current)
+            prev_external_id: str = _row["external_id"]
+
+            if prev_external_id == new_external_id:
+                # No-op: already has the requested label.
+                return (prev_external_id, new_external_id)
+
+            # Check no OTHER live collection in the same catalog holds the new label.
+            conflict = await DQLQuery(
+                f'SELECT id FROM "{phys_schema}".collections '
+                "WHERE external_id = :external_id AND deleted_at IS NULL AND id != :id;",
+                result_handler=ResultHandler.ONE_OR_NONE,
+            ).execute(conn, external_id=new_external_id, id=collection_internal_id)
+            if conflict is not None:
+                raise CollectionRenameConflictError(catalog_internal_id, new_external_id)
+
+            # Lifecycle: BEFORE -> UPDATE -> AFTER, mirroring the
+            # BEFORE/AFTER_COLLECTION_HARD_DELETION bracket used by
+            # delete_collection. A listener failure must not corrupt the
+            # rename — emit_event defaults to raise_on_error=False, so sync
+            # listener exceptions are logged and swallowed rather than
+            # propagated.
+            await emit_event(
+                CatalogEventType.BEFORE_COLLECTION_UPDATE,
+                catalog_id=catalog_internal_id,
+                collection_id=collection_internal_id,
+                db_resource=conn,
+                operation="rename",
+                old_external_id=prev_external_id,
+                new_external_id=new_external_id,
+            )
+
+            await DQLQuery(
+                f'UPDATE "{phys_schema}".collections '
+                "SET external_id = :new_external_id, updated_at = NOW() "
+                "WHERE id = :id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.ROWCOUNT,
+            ).execute(conn, new_external_id=new_external_id, id=collection_internal_id)
+
+            await emit_event(
+                CatalogEventType.AFTER_COLLECTION_UPDATE,
+                catalog_id=catalog_internal_id,
+                collection_id=collection_internal_id,
+                db_resource=conn,
+                operation="rename",
+                old_external_id=prev_external_id,
+                new_external_id=new_external_id,
+            )
+
+        # Invalidate both prev and new external_id cache entries and the model cache.
+        _invalidate_collection_external_id_cache(catalog_internal_id, prev_external_id)
+        _invalidate_collection_external_id_cache(catalog_internal_id, new_external_id)
+        # Also invalidate the reverse (internal → external) cache so the read path
+        # immediately surfaces the new label instead of the stale one.
+        _invalidate_collection_internal_to_external_id_cache(
+            catalog_internal_id, collection_internal_id
+        )
+        _invalidate_collection_model_cache(catalog_internal_id, collection_internal_id)
+
+        logger.info(
+            "[RENAME] Collection catalog=%r internal_id=%r: external_id '%s' → '%s'",
+            catalog_internal_id, collection_internal_id, prev_external_id, new_external_id,
+        )
+        return (prev_external_id, new_external_id)
 
     async def _purge_collection_storage(
         self,
@@ -1255,6 +2025,19 @@ class CollectionService:
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+        # Phase 2: resolve external→internal ids at the public boundary.
+        # allow_missing=True + passthrough so callers holding already-internal ids
+        # fall through; genuinely missing collections are caught by _get_lifecycle.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+        _col_internal = await self.resolve_collection_id(
+            catalog_id, collection_id, allow_missing=True
+        )
+        if _col_internal is not None:
+            collection_id = _col_internal
 
         # Unit A (#2066): lifecycle gate BEFORE any teardown. Resolve the
         # authoritative state up front so the hard-delete purge — which emits
@@ -1508,6 +2291,19 @@ class CollectionService:
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+        # Phase 2: resolve external→internal ids at the public boundary.
+        # Passthrough when no mapping exists; genuinely missing items raise from
+        # _get_collection_model_logic below.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+        _col_internal = await self.resolve_collection_id(
+            catalog_id, collection_id, allow_missing=True
+        )
+        if _col_internal is not None:
+            collection_id = _col_internal
 
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_physical_schema(
@@ -1566,4 +2362,3 @@ class CollectionService:
 
             _invalidate_collection_model_cache(catalog_id, collection_id)
             return True
-

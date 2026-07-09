@@ -18,11 +18,21 @@
 
 # dynastore/extensions/tiles/tiles_models.py
 
-from typing import List, Optional, Dict, Any
+from typing import List, Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field, ConfigDict
 import uuid
 
 class Link(BaseModel):
+    """OGC API Tiles link entry.
+
+    Deliberately distinct from the canonical ``dynastore.models.shared_models.Link``:
+    ``title`` here is a plain ``str``, not a ``LocalizedText``. The Tile Matrix
+    Set / tileset wire responses must never emit a language-keyed dict for a
+    link title — see ``tests/dynastore/extensions/tiles/unit/test_tms_link_wire_shape.py``.
+    Swapping to the canonical model would require routing every Tiles response
+    through the ``resolve_links``/i18n pipeline first; left as a follow-up.
+    """
+
     href: str
     rel: str
     type: Optional[str] = None
@@ -87,3 +97,25 @@ class TileMatrixSetRef(BaseModel):
 
 class TileMatrixSetList(BaseModel):
     tileMatrixSets: List[TileMatrixSetRef]
+
+class TileSetItem(BaseModel):
+    """A single tileset entry in an OGC API Tiles tilesets list (§7.1).
+
+    Each entry carries at minimum:
+    - ``id``: tileset identifier (matches the TMS id for the tile resource).
+    - ``dataType``: ``'vector'`` for MVT tilesets, ``'map'`` for raster map-tile
+      tilesets, ``'coverage'`` for coverage tilesets.
+    - ``links``: at least a ``rel='self'`` link pointing to the tileset-metadata
+      resource and a ``rel='http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme'``
+      link pointing to the TileMatrixSet definition.
+    """
+
+    id: str
+    dataType: Literal["vector", "map", "coverage"]
+    title: Optional[str] = None
+    links: List[Link]
+
+class TileSetList(BaseModel):
+    """OGC API Tiles tilesets list response (§7.1, req. 15)."""
+
+    tilesets: List[TileSetItem]

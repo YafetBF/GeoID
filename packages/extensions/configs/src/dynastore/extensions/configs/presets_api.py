@@ -47,6 +47,10 @@ from pydantic import BaseModel, Field, ValidationError
 from dynastore.modules import get_protocol
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.modules.iam.iam_service import IamService
+from dynastore.extensions.tools.resolvers import (
+    resolve_catalog_or_404,
+    resolve_collection_or_404,
+)
 
 # Single sub-router with no prefix of its own; ``ConfigsService`` mounts it
 # via ``include_router`` so every path here inherits the ``/configs`` prefix
@@ -107,9 +111,7 @@ async def _assert_catalog_exists(catalog_id: str) -> None:
     catalogs = get_protocol(CatalogsProtocol)
     if catalogs is None:
         return
-    model = await catalogs.get_catalog_model(catalog_id)
-    if model is None:
-        raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+    await resolve_catalog_or_404(catalogs, catalog_id, use_model=True)
 
 
 async def _assert_collection_exists(catalog_id: str, collection_id: str) -> None:
@@ -122,12 +124,10 @@ async def _assert_collection_exists(catalog_id: str, collection_id: str) -> None
     catalogs = get_protocol(CatalogsProtocol)
     if catalogs is None:
         return
-    collection = await catalogs.collections.get_collection(catalog_id, collection_id)
-    if collection is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
-        )
+    await resolve_collection_or_404(
+        catalogs.collections, catalog_id, collection_id,
+        detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
+    )
 
 
 def _preset_reachable_at(preset, url_tier: "PresetTier") -> bool:  # noqa: F821
@@ -679,19 +679,25 @@ async def unapply_collection_preset(
 async def dry_run_platform_preset(
     request: Request,  # type: ignore[reportGeneralTypeIssues]
     preset_name: str,
+    params_body: Optional[Dict[str, Any]] = Body(
+        default=None,
+        description=(
+            "Optional preset params, validated against the preset's "
+            "params_model. Omit (or send an empty body) to preview the "
+            "preset's defaults."
+        ),
+    ),
 ):
     from dynastore.models.protocols import DatabaseProtocol
-    from dynastore.modules.storage.presets import (
-        NoParams,
-        PresetTier,
-    )
+    from dynastore.modules.storage.presets import PresetTier
     from dynastore.modules.storage.presets.lifecycle import _build_context, dry_run_preset as _dry_run
 
-    _resolve_preset_for_scope(preset_name, PresetTier.PLATFORM)
+    preset = _resolve_preset_for_scope(preset_name, PresetTier.PLATFORM)
+    params = _coerce_params(preset, params_body) or preset.params_model()
     db_proto = get_protocol(DatabaseProtocol)
     engine = db_proto.engine if db_proto else None
     ctx = _build_context(engine, principal=None, scope="platform")
-    plan = await _dry_run(preset_name, "platform", NoParams(), ctx)
+    plan = await _dry_run(preset_name, "platform", params, ctx)
     return {
         "preset_name": plan.preset_name,
         "scope_key": plan.scope_key,
@@ -711,21 +717,27 @@ async def dry_run_catalog_preset(
     request: Request,  # type: ignore[reportGeneralTypeIssues]
     catalog_id: str,
     preset_name: str,
+    params_body: Optional[Dict[str, Any]] = Body(
+        default=None,
+        description=(
+            "Optional preset params, validated against the preset's "
+            "params_model. Omit (or send an empty body) to preview the "
+            "preset's defaults."
+        ),
+    ),
 ):
     from dynastore.models.protocols import DatabaseProtocol
-    from dynastore.modules.storage.presets import (
-        NoParams,
-        PresetTier,
-    )
+    from dynastore.modules.storage.presets import PresetTier
     from dynastore.modules.storage.presets.lifecycle import _build_context, dry_run_preset as _dry_run
 
     await _assert_catalog_exists(catalog_id)
-    _resolve_preset_for_scope(preset_name, PresetTier.CATALOG)
+    preset = _resolve_preset_for_scope(preset_name, PresetTier.CATALOG)
+    params = _coerce_params(preset, params_body) or preset.params_model()
     scope_key = f"catalog:{catalog_id}"
     db_proto = get_protocol(DatabaseProtocol)
     engine = db_proto.engine if db_proto else None
     ctx = _build_context(engine, principal=None, scope=scope_key)
-    plan = await _dry_run(preset_name, scope_key, NoParams(), ctx)
+    plan = await _dry_run(preset_name, scope_key, params, ctx)
     return {
         "preset_name": plan.preset_name,
         "scope_key": plan.scope_key,
@@ -746,22 +758,28 @@ async def dry_run_collection_preset(
     catalog_id: str,
     collection_id: str,
     preset_name: str,
+    params_body: Optional[Dict[str, Any]] = Body(
+        default=None,
+        description=(
+            "Optional preset params, validated against the preset's "
+            "params_model. Omit (or send an empty body) to preview the "
+            "preset's defaults."
+        ),
+    ),
 ):
     from dynastore.models.protocols import DatabaseProtocol
-    from dynastore.modules.storage.presets import (
-        NoParams,
-        PresetTier,
-    )
+    from dynastore.modules.storage.presets import PresetTier
     from dynastore.modules.storage.presets.lifecycle import _build_context, dry_run_preset as _dry_run
 
     await _assert_catalog_exists(catalog_id)
     await _assert_collection_exists(catalog_id, collection_id)
-    _resolve_preset_for_scope(preset_name, PresetTier.COLLECTION)
+    preset = _resolve_preset_for_scope(preset_name, PresetTier.COLLECTION)
+    params = _coerce_params(preset, params_body) or preset.params_model()
     scope_key = f"catalog:{catalog_id}/collection:{collection_id}"
     db_proto = get_protocol(DatabaseProtocol)
     engine = db_proto.engine if db_proto else None
     ctx = _build_context(engine, principal=None, scope=scope_key)
-    plan = await _dry_run(preset_name, scope_key, NoParams(), ctx)
+    plan = await _dry_run(preset_name, scope_key, params, ctx)
     return {
         "preset_name": plan.preset_name,
         "scope_key": plan.scope_key,

@@ -26,8 +26,6 @@ system osgeo bindings).
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 
 import pytest
 
@@ -87,7 +85,148 @@ def test_can_read_matches_extensions():
     assert not PyogrioReader.can_read("gs://b/x/file.parquet")
 
 
-def test_priority_is_tail_fallback():
-    # Strictly behind GdalOsgeoReader (priority=10); higher number = later.
-    assert PyogrioReader.priority == 100
+def test_priority_is_ahead_of_gdal_osgeo():
+    # Strictly ahead of GdalOsgeoReader (priority=100); lower number = earlier.
+    assert PyogrioReader.priority == 10
     assert PyogrioReader.reader_id == "pyogrio"
+
+
+# ---------------------------------------------------------------------------
+# Chunked streaming: never materialises the full GeoDataFrame at once
+# ---------------------------------------------------------------------------
+
+
+_GEOJSON_LARGE = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"name": f"feat_{i}", "val": i},
+            "geometry": {"type": "Point", "coordinates": [float(i), float(i)]},
+        }
+        for i in range(10)
+    ],
+}
+
+
+@pytest.fixture()
+def geojson_large_path(tmp_path):
+    p = tmp_path / "large.geojson"
+    p.write_text(__import__("json").dumps(_GEOJSON_LARGE))
+    return str(p)
+
+
+def test_open_chunked_yields_all_features(geojson_large_path):
+    """Chunked read (read_batch_size=3) must yield all 10 features, regardless
+    of how many pyogrio read_dataframe calls are made internally."""
+    reader = PyogrioReader()
+    with reader.open(geojson_large_path, read_batch_size=3) as records:
+        feats = list(records)
+    assert len(feats) == 10
+    vals = {f["properties"]["val"] for f in feats}
+    assert vals == set(range(10))
+
+
+def test_open_chunk_size_forwarded_to_pyogrio(geojson_large_path):
+    """read_batch_size opt must page through pyogrio.read_dataframe via
+    skip_features/max_features — read_dataframe has no chunksize kwarg,
+    it's not a chunked-generator API (#2964 follow-up: the previous
+    ``chunksize=`` call silently no-op'd as an unrecognised GDAL open
+    option and iterated the returned GeoDataFrame's column names)."""
+    import pyogrio
+    from unittest.mock import patch
+
+    # Build a realistic stand-in: two pages of GeoDataFrames
+    import geopandas as gpd
+    all_feats = _GEOJSON_LARGE
+    gdf = gpd.GeoDataFrame.from_features(all_feats["features"])
+
+    page1 = gdf.iloc[:5].copy()
+    page2 = gdf.iloc[5:].copy()
+    empty = gdf.iloc[:0].copy()
+
+    with patch.object(
+        pyogrio, "read_dataframe", side_effect=[page1, page2, empty],
+    ) as mock_rdf:
+        reader = PyogrioReader()
+        with reader.open(geojson_large_path, read_batch_size=5) as records:
+            feats = list(records)
+
+    assert mock_rdf.call_count == 3
+    first_kwargs = mock_rdf.call_args_list[0].kwargs
+    assert first_kwargs.get("skip_features") == 0
+    assert first_kwargs.get("max_features") == 5
+    second_kwargs = mock_rdf.call_args_list[1].kwargs
+    assert second_kwargs.get("skip_features") == 5
+    assert second_kwargs.get("max_features") == 5
+    assert len(feats) == 10
+
+
+# ---------------------------------------------------------------------------
+# Offset resume (GeoID #2958): native skip_features seek, not a per-row
+# discard after the fact.
+# ---------------------------------------------------------------------------
+
+
+def test_supports_offset_seek_flag_is_true():
+    assert PyogrioReader.supports_offset_seek is True
+
+
+def test_open_offset_skips_correct_records(geojson_large_path):
+    """A real (unmocked) offset resume must yield only the rows from
+    ``offset`` onward, in order."""
+    reader = PyogrioReader()
+    with reader.open(geojson_large_path, offset=7) as records:
+        feats = list(records)
+    vals = [f["properties"]["val"] for f in feats]
+    assert vals == [7, 8, 9]
+
+
+def test_open_offset_zero_yields_all_records(geojson_large_path):
+    reader = PyogrioReader()
+    with reader.open(geojson_large_path, offset=0) as records:
+        feats = list(records)
+    assert len(feats) == 10
+
+
+def test_open_offset_seeds_first_pyogrio_call_via_skip_features(geojson_large_path):
+    """The resume ``offset`` must seed the FIRST pyogrio.read_dataframe call's
+    ``skip_features`` — not be re-discarded afterward by the caller — and
+    subsequent pages must continue counting from that seed, not from 0."""
+    import pyogrio
+    from unittest.mock import patch
+
+    import geopandas as gpd
+    gdf = gpd.GeoDataFrame.from_features(_GEOJSON_LARGE["features"])
+    page1 = gdf.iloc[7:10].copy()
+    empty = gdf.iloc[:0].copy()
+
+    with patch.object(
+        pyogrio, "read_dataframe", side_effect=[page1, empty],
+    ) as mock_rdf:
+        reader = PyogrioReader()
+        with reader.open(geojson_large_path, read_batch_size=5, offset=7) as records:
+            feats = list(records)
+
+    first_kwargs = mock_rdf.call_args_list[0].kwargs
+    assert first_kwargs.get("skip_features") == 7, (
+        "PyogrioReader.open(offset=7) did not seed the first "
+        "pyogrio.read_dataframe call's skip_features with the resume offset"
+    )
+    assert len(feats) == 3
+
+
+def test_open_does_not_use_gpd_read_file():
+    """The reader must not call gpd.read_file — that materialises the entire
+    dataset in memory. Chunked pyogrio.read_dataframe is the required path."""
+    import inspect
+    from dynastore.tasks.ingestion.readers.pyogrio_reader import PyogrioReader as _R
+    src = inspect.getsource(_R.open)
+    assert "gpd.read_file" not in src, (
+        "PyogrioReader.open still calls gpd.read_file, which loads the whole "
+        "GeoDataFrame into memory. Replace with paginated pyogrio.read_dataframe calls."
+    )
+    assert "pyogrio.read_dataframe" in src, (
+        "PyogrioReader.open must use pyogrio.read_dataframe, paginated via "
+        "skip_features/max_features, to avoid materialising the full source in memory."
+    )

@@ -27,6 +27,7 @@ import asyncio
 from dynastore.tools.plugin import ProtocolPlugin
 from dynastore.tools.discovery import register_plugin
 from dynastore.tools.async_utils import LoopLocalLock, LoopLocalSemaphore
+from dynastore.tools.execution_context import task_run_scope
 from dynastore.modules.concurrency import get_background_executor
 from dynastore.modules.tasks.dispatcher import _SERVICE_NAME
 
@@ -180,19 +181,38 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
         )
         _terminal = await _resolve_routing_terminal(context.task_type)
 
+        # Per-execution timeout override takes priority over the routing-config
+        # ceiling; cpu/memory are not applicable to in-process runners.
+        _exec_ovr = context.execution_overrides
+        _effective_timeout: Optional[float] = (
+            float(_exec_ovr.timeout_seconds)
+            if _exec_ovr and _exec_ovr.timeout_seconds
+            else _terminal.timeout_seconds
+        )
+        if _exec_ovr and (_exec_ovr.cpu or _exec_ovr.memory):
+            logger.debug(
+                "SyncRunner: cpu/memory overrides not applicable for in-process "
+                "execution of '%s' — ignored.", context.task_type,
+            )
+
         try:
             logger.info(f"Executing sync task '{job.task_id}'...")
             await tasks_mgr.update_task(context.engine, job.task_id, TaskUpdate(status=TaskStatusEnum.RUNNING), schema=context.db_schema)
 
-            # Hydrate and execute, bounded by the routing deadline when set.
+            # Hydrate and execute, bounded by the effective deadline when set.
             hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-            if _terminal.timeout_seconds:
-                result = await asyncio.wait_for(
-                    task_instance.run(hydrated_payload),
-                    timeout=_terminal.timeout_seconds,
-                )
-            else:
-                result = await task_instance.run(hydrated_payload)
+            # ``context.db_schema`` is the task's own catalog_id (or the
+            # "platform"/"system" sentinel for cross-tenant work) — passed
+            # through so in-run index-dispatch absorption stays scoped to
+            # this task's own catalog (#2716).
+            with task_run_scope(catalog=context.db_schema):
+                if _effective_timeout:
+                    result = await asyncio.wait_for(
+                        task_instance.run(hydrated_payload),
+                        timeout=_effective_timeout,
+                    )
+                else:
+                    result = await task_instance.run(hydrated_payload)
 
             # OGC API - Processes Part 1 requires ``GET /jobs/{id}/results`` to work
             # for both async AND sync executions when status=successful. Persist
@@ -218,7 +238,7 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
             # 201 + Location instead of blocking the request to the gateway
             # timeout. With any other on_timeout policy the timeout surfaces as
             # an error to the caller (#2221).
-            timeout_s = _terminal.timeout_seconds
+            timeout_s = _effective_timeout
             logger.warning(
                 "SyncRunner: task '%s' (%s) exceeded %ss — dead-lettering and "
                 "applying on_timeout policy.",
@@ -293,7 +313,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
         # Used by signal_stop to cancel a local task directly.  Done-callbacks
         # remove entries so the dict stays bounded to live tasks only.
         self._task_registry: dict[str, asyncio.Task] = {}
-        self._max_concurrency = 100
+        self._max_concurrency = 4
         # BackgroundRunner is registered as a module-level singleton at import
         # (register_default_runners()), so a raw asyncio.Semaphore() here would
         # bind to the first loop that blocks on it and break when reused from
@@ -303,6 +323,11 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
     def can_handle(self, task_type: str) -> bool:
         return get_task_instance(task_type) is not None
+
+    # Connections reserved for serving/other work when clamping drain concurrency.
+    # The drain may use at most pool_total - _SERVING_RESERVE connections so the
+    # serving path is never starved (root cause of the pool-exhaustion incident).
+    _SERVING_RESERVE: int = 2
 
     @asynccontextmanager
     async def lifespan(self, app_state: object) -> AsyncGenerator[None, None]:
@@ -318,6 +343,29 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     self._semaphore = LoopLocalSemaphore(self._max_concurrency)
         except Exception as exc:  # noqa: BLE001 — keep default concurrency on any read failure
             logger.debug("BackgroundRunner: concurrency config unavailable (%s) — default %d", exc, self._max_concurrency)
+
+        # Pool-aware clamp: effective drain concurrency may not exceed the
+        # DB connection pool capacity minus the serving reserve, regardless of
+        # the configured value.  DBConfigModule (priority 0) populates
+        # app_state.db_config before any other module's lifespan runs, so the
+        # attribute is present by the time BackgroundRunner.lifespan executes.
+        db_cfg = getattr(app_state, "db_config", None)
+        if db_cfg is not None:
+            pool_total: int = getattr(db_cfg, "pool_max_size", 0)
+            if pool_total > 0:
+                ceiling = max(1, pool_total - self._SERVING_RESERVE)
+                if self._max_concurrency > ceiling:
+                    logger.warning(
+                        "BackgroundRunner: configured concurrency %d exceeds pool "
+                        "capacity %d minus serving reserve %d; clamping effective "
+                        "concurrency to %d to prevent pool exhaustion.",
+                        self._max_concurrency,
+                        pool_total,
+                        self._SERVING_RESERVE,
+                        ceiling,
+                    )
+                    self._max_concurrency = ceiling
+                    self._semaphore = LoopLocalSemaphore(self._max_concurrency)
 
         cancel_listener_task = asyncio.create_task(
             self._cancel_listener(), name="background_runner:cancel_listener"
@@ -348,6 +396,16 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
     def capabilities(self) -> Any:
         from dynastore.modules.tasks.models import RunnerCapabilities
         return RunnerCapabilities(max_concurrency=self._max_concurrency)
+
+    @property
+    def active_count(self) -> int:
+        """Number of in-flight asyncio tasks currently tracked by this runner.
+
+        Read-only snapshot — safe to call from any coroutine without locking.
+        Used by the dispatcher-local load probe to decide whether to offload
+        an offloadable system task to an external executor.
+        """
+        return len(self._running_tasks)
 
     # ------------------------------------------------------------------
     # StopSignalProtocol — confirmed dismiss for in-process tasks
@@ -740,6 +798,20 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
             async with self._semaphore:
                 # Terminal routing policy for this task (fail-open to defaults).
                 _terminal = await _resolve_routing_terminal(context.task_type)
+                # Per-execution override takes priority over the routing ceiling.
+                # cpu/memory are not applicable to in-process runners and are ignored.
+                _bg_exec_ovr = context.execution_overrides
+                _bg_effective_timeout: Optional[float] = (
+                    float(_bg_exec_ovr.timeout_seconds)
+                    if _bg_exec_ovr and _bg_exec_ovr.timeout_seconds
+                    else _terminal.timeout_seconds
+                )
+                if _bg_exec_ovr and (_bg_exec_ovr.cpu or _bg_exec_ovr.memory):
+                    logger.debug(
+                        "BackgroundRunner: cpu/memory overrides not applicable "
+                        "for in-process execution of '%s' — ignored.",
+                        context.task_type,
+                    )
                 # Re-register on the heartbeat so the row keeps extending
                 # ``locked_until`` while the actual work runs.  The dispatcher
                 # will skip its own ``unregister`` when it sees
@@ -761,13 +833,18 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         f"({context.task_type}) in background."
                     )
                     hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-                    if _terminal.timeout_seconds:
-                        result = await asyncio.wait_for(
-                            task_instance.run(hydrated_payload),
-                            timeout=_terminal.timeout_seconds,
-                        )
-                    else:
-                        result = await task_instance.run(hydrated_payload)
+                    # ``context.db_schema`` is the claimed task's own
+                    # catalog_id (or the "platform"/"system" sentinel) —
+                    # passed through so in-run index-dispatch absorption
+                    # stays scoped to this task's own catalog (#2716).
+                    with task_run_scope(catalog=context.db_schema):
+                        if _bg_effective_timeout:
+                            result = await asyncio.wait_for(
+                                task_instance.run(hydrated_payload),
+                                timeout=_bg_effective_timeout,
+                            )
+                        else:
+                            result = await task_instance.run(hydrated_payload)
 
                     await _complete_task(
                         context.engine, claimed_task_id,
@@ -846,7 +923,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     await _apply_terminal("failure", _terminal.on_failure)
 
                 except asyncio.TimeoutError:
-                    timeout_s = _terminal.timeout_seconds
+                    timeout_s = _bg_effective_timeout
                     logger.error(
                         "BackgroundRunner: claimed task '%s' (%s) timed out after %ss — dead-lettering.",
                         claimed_task_id, context.task_type, timeout_s,

@@ -17,7 +17,6 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import os
 from psycopg2.extras import register_default_jsonb, register_default_json
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -114,12 +113,16 @@ class DatastoreModule(ModuleProtocol, DatabaseProtocol):
                 # per-service contention is visible from the DB side. See
                 # #699 / #655. psycopg2 honours libpq ``application_name``
                 # in connect_args.
+                #
+                # Also carries this process's stable instance id (geoid#2924)
+                # so a monitoring/reaper query can recognize a session left
+                # behind by a specific dead Cloud Run instance, not just the
+                # service as a whole — see
+                # dynastore.modules.db_config.instance.get_stamped_application_name.
                 from dynastore.modules.db_config.instance import (
-                    get_service_name,
+                    get_stamped_application_name,
                 )
-                app_name = get_service_name() or os.getenv(
-                    "SERVICE_NAME"
-                ) or "dynastore"
+                app_name = get_stamped_application_name()
 
                 app_state.sync_engine = create_engine(
                     normalize_db_url(db_config.database_url, is_async=False),
@@ -145,19 +148,9 @@ class DatastoreModule(ModuleProtocol, DatabaseProtocol):
                 )
                 logger.info("SQLAlchemy SyncEngine established successfully.")
 
-                # Run initialization scripts using the shared maintenance tool.
-                # Even though the engine is synchronous, we are in an async lifespan context,
-                # so we can await the tool. The tool will handle the sync engine correctly.
-                # _current_file_dir = os.path.dirname(os.path.abspath(__file__))
-                # init_sql_path: str = os.path.join(_current_file_dir, "db_init/init.sql")
-
-                # managed_transaction works for sync engines too (yields a standard connection)
-                # But here we are passing the engine directly to the tool via a transaction wrapper
-                # to ensure we have a connection context for the lock.
-
-                # Note: managed_transaction for a sync engine behaves synchronously,
-                # but we need to wrap it to call the async tool?
-                # Actually, managed_transaction is an @asynccontextmanager that yields a sync conn if engine is sync.
+                # Run initialization (extension bootstrap) using the shared
+                # maintenance tool; it handles sync engines from an async
+                # lifespan context.
                 await ensure_init_db(app_state.sync_engine)
 
 

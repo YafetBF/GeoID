@@ -55,7 +55,7 @@ operation-based router via the secondary-index ``WRITE`` entries
 
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.driver_config import ItemsWritePolicy
@@ -81,11 +81,14 @@ from dynastore.modules.storage.driver_config import (
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import Operation
+from dynastore.tools.cache import cached
 
 # Canonical ES write-boundary imports (#1800 Task 5).
 # Imported at module level so tests can patch them as module attributes.
 from dynastore.modules.catalog.canonical_index_read import (
     canonical_input_from_feature,
+    ensure_canonical_source_ready,
+    has_canonical_source,
     read_canonical_index_inputs,
 )
 from dynastore.modules.elasticsearch.items_projection import resolve_catalog_known_fields
@@ -104,6 +107,8 @@ except ImportError:  # shapely not installed
         max_bytes: int = 10_000_000,
         max_iterations: int = 3,
         geometry_key: str = "geometry",
+        snap_to_grid: bool = False,
+        snap_grid_size: float = 1e-5,
     ) -> "tuple[dict, float, str]":
         """No-op fallback when shapely is not available."""
         return doc, 1.0, "none"
@@ -172,6 +177,85 @@ _ALIAS_REGISTERED_CATALOGS: set = set()
 # ``_search``. Bounded to one ensure per (catalog, process) lifetime.
 _ITEMS_INDEX_ENSURED_CATALOGS: set = set()
 
+# Memoizes index-existence confirmations via the codebase's central
+# ``@cached`` decorator (#2863) rather than a bespoke module-level set —
+# same SSOT every other process-local cache in this codebase goes through.
+# Keyed only on ``index_name`` (``es``/``mapping``/``settings_fn`` are
+# ignored: the ES client is a per-process singleton and the mapping/settings
+# resolver are constant per driver), so the ``indices.exists`` HEAD this
+# delegates to :meth:`_ElasticsearchBase._ensure_index` only ever fires once
+# per index per process instead of once per write — a HEAD before every
+# single-doc PUT was the amplification pattern that starved the shared
+# AsyncOpenSearch client pool under harvest load: millions of sequential
+# HEAD+PUT round trips exhausted the connection pool and tolerated
+# per-write failures (#2828) silently dropped the data.
+#
+# ``distributed=False`` / ``ttl=None``: this is an in-process fact (matches
+# the issue's "cache existence in-process" ask), not something to share via
+# the L2/Valkey tier — the cached value never expires on its own because
+# index creation is a once-per-catalog event; only an actual "index is
+# gone" write failure should force a re-check (see
+# :func:`_invalidate_ensured_index`). ``@cached`` only memoizes a result on
+# success, so a failed create is never cached and the next call retries for
+# real.
+@cached(
+    maxsize=4096,
+    ttl=None,
+    namespace="es_index_ensured",
+    ignore=["es", "mapping", "settings_fn"],
+    distributed=False,
+)
+async def _ensure_index_once(
+    es: Any, index_name: str, mapping: Dict[str, Any], settings_fn: Any,
+) -> bool:
+    await _ElasticsearchBase._ensure_index(es, index_name, mapping, settings_fn)
+    return True
+
+
+def _invalidate_ensured_index(index_name: str) -> None:
+    """Force the next :meth:`_ElasticsearchBase._ensure_index_cached` call
+    for *index_name* to re-check (and re-create if needed) instead of
+    trusting a stale cache entry (#2863). Call this after a write fails
+    with ``index_not_found_exception`` — the only failure mode that means
+    the cached "exists" assumption is wrong (an index dropped or rotated
+    out from under a running worker). ``es``/``mapping``/``settings_fn`` are
+    ignored by the cache key (see :func:`_ensure_index_once`), so any
+    placeholder value works for them here.
+    """
+    _ensure_index_once.cache_invalidate(None, index_name, None, None)
+
+
+def _bulk_response_missing_index(resp: Any) -> bool:
+    """True if any item in an ES ``_bulk`` response failed with
+    ``index_not_found_exception``.
+
+    Used to decide whether to call :func:`_invalidate_ensured_index` after a
+    bulk write — a plain per-doc rejection (mapping mismatch, version
+    conflict, …) does not mean the index itself is gone, so only this
+    specific error type triggers a cache invalidation.
+    """
+    if not isinstance(resp, dict):
+        return False
+    for item in resp.get("items", []) or []:
+        entry = next(iter(item.values())) if isinstance(item, dict) and item else {}
+        err = entry.get("error") if isinstance(entry, dict) else None
+        if isinstance(err, dict) and err.get("type") == "index_not_found_exception":
+            return True
+    return False
+
+
+def _is_index_not_found(exc: BaseException) -> bool:
+    """True when *exc* is an ES/OpenSearch ``index_not_found_exception``
+    raised by a single-document call (``index``/``get``/``delete``), the
+    non-bulk counterpart of :func:`_bulk_response_missing_index`.
+    """
+    info = getattr(exc, "info", None)
+    if isinstance(info, dict):
+        err = info.get("error")
+        if isinstance(err, dict) and err.get("type") == "index_not_found_exception":
+            return True
+    return "index_not_found_exception" in str(exc)
+
 
 async def _ensure_in_public_alias_once(catalog_id: str, index_name: str) -> None:
     """Add ``index_name`` to the platform public alias, at most once per
@@ -228,6 +312,14 @@ _stamp_simplification = _apply_geometry_simplification
 class _ElasticsearchBase:
     """Shared helpers for ES storage drivers."""
 
+    # Concrete subclasses declare the PluginConfig subclass they store their
+    # per-driver config under.  ``get_driver_config`` dispatches through this
+    # so each driver retrieves its own config row without hardcoding the
+    # items config type. ``None`` here is a sentinel meaning "not declared";
+    # ``get_driver_config`` falls back to ``ItemsElasticsearchDriverConfig``
+    # in that case (preserving the pre-#2049 behaviour).
+    _driver_config_class: ClassVar[Any] = None
+
     def is_available(self) -> bool:
         """Available whenever the shared ES client is wired up.
 
@@ -257,21 +349,36 @@ class _ElasticsearchBase:
         *,
         db_resource: Optional[Any] = None,
     ) -> Any:
+        """Resolve the driver config for this subclass.
+
+        Dispatches through :attr:`_driver_config_class` so each driver
+        retrieves its own config row (``ItemsElasticsearchDriverConfig``,
+        ``AssetElasticsearchDriverConfig``, etc.) instead of always
+        parsing config through ``ItemsElasticsearchDriverConfig``.
+        Subclasses MUST declare ``_driver_config_class``; if one is
+        missing it falls back to ``ItemsElasticsearchDriverConfig`` so
+        callers keep getting a usable object at the cost of potentially
+        reading the wrong config row (the pre-#2049 behaviour).
+        """
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.tools.discovery import get_protocol
-        from dynastore.modules.storage.driver_config import ItemsElasticsearchDriverConfig
+
+        config_cls = self.__class__._driver_config_class
+        if config_cls is None:
+            from dynastore.modules.storage.driver_config import ItemsElasticsearchDriverConfig
+            config_cls = ItemsElasticsearchDriverConfig
 
         configs = get_protocol(ConfigsProtocol)
         if configs is None:
-            return ItemsElasticsearchDriverConfig()
+            return config_cls()
         config = await configs.get_config(
-            ItemsElasticsearchDriverConfig,
+            config_cls,
             catalog_id=catalog_id,
             collection_id=collection_id,
             ctx=DriverContext(db_resource=db_resource),
         )
         if config is None:
-            return ItemsElasticsearchDriverConfig()
+            return config_cls()
         return config
 
     @staticmethod
@@ -306,6 +413,129 @@ class _ElasticsearchBase:
         if isinstance(entity, dict):
             return entity.get("id")
         return None
+
+    # ------------------------------------------------------------------
+    # Shared index bootstrap and bulk tally helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _ensure_index(
+        es: Any,
+        index_name: str,
+        mapping: Dict[str, Any],
+        settings_fn: Any,
+    ) -> None:
+        """Idempotently create ``index_name`` if absent (race-tolerant).
+
+        Used by every ES driver's write/index/ensure_storage paths — a
+        single code path for the create-if-absent + swallow
+        ``resource_already_exists`` pattern.
+
+        ``settings_fn`` must be an async callable with no required arguments
+        that returns the index settings dict (e.g.
+        ``get_private_items_index_settings``).
+
+        The public items driver's ``ensure_storage`` is NOT routed here
+        because it carries additional alias-enrolment logic
+        (``_ensure_in_public_alias_once``) that is public-only behaviour.
+
+        Unconditional — issues the ``indices.exists`` HEAD every call. Use
+        :meth:`_ensure_index_cached` on a hot write path where that HEAD
+        would otherwise fire on every single document (#2863).
+        """
+        if not await es.indices.exists(index=index_name):
+            try:
+                await es.indices.create(
+                    index=index_name,
+                    body={
+                        "settings": await settings_fn(),
+                        "mappings": mapping,
+                    },
+                )
+            except Exception as exc:
+                if "resource_already_exists" not in str(exc):
+                    raise
+
+    @staticmethod
+    async def _ensure_index_cached(
+        es: Any,
+        index_name: str,
+        mapping: Dict[str, Any],
+        settings_fn: Any,
+    ) -> None:
+        """Same contract as :meth:`_ensure_index`, memoized per index name
+        via the shared ``@cached`` machinery (#2863) — see
+        :func:`_ensure_index_once`.
+
+        Once an index is confirmed to exist (created here or found already
+        present), the ``indices.exists`` HEAD is skipped on every later call
+        for that same index in this process — issuing it before every single
+        write was pure amplification, since index creation is a
+        once-per-catalog event. This is opt-in (a distinct method from
+        :meth:`_ensure_index`) so existing callers keep their current
+        per-call HEAD behaviour unless they explicitly adopt the cache; call
+        :func:`_invalidate_ensured_index` after a write fails with
+        ``index_not_found_exception`` to force a re-check.
+        """
+        await _ensure_index_once(es, index_name, mapping, settings_fn)
+
+    @staticmethod
+    def _tally_bulk_response(
+        resp: Any,
+        ops_count: int,
+        *,
+        driver_name: str = "",
+        catalog: str = "",
+        collection: str = "",
+        index_name: str = "",
+    ) -> "tuple[int, List[Dict[str, Any]]]":
+        """Parse an ES ``_bulk`` response into ``(succeeded, failures)``.
+
+        Shared by every ES driver's ``index_bulk`` path (#914 zero/zero
+        warning included) so they all log diagnostic context when ES
+        returns a response shape that yields no per-item results.
+
+        Returns
+        -------
+        succeeded : int
+        failures  : list of ``{"id": ..., "reason": ...}`` dicts
+        """
+        items = (resp or {}).get("items", []) if isinstance(resp, dict) else []
+        succeeded = 0
+        failures: List[Dict[str, Any]] = []
+        for it in items:
+            entry = next(iter(it.values())) if isinstance(it, dict) and it else {}
+            err = entry.get("error") if isinstance(entry, dict) else None
+            if err:
+                failures.append({
+                    "id": entry.get("_id"),
+                    "reason": str(
+                        err.get("reason", err) if isinstance(err, dict) else err
+                    ),
+                })
+            else:
+                succeeded += 1
+        # #914 — when the parsed result is a silent no-op (succeeded=0 with
+        # no per-item failures), log the raw response shape so operators
+        # can tell ``items=[]`` (request never hit ES) from a shape we
+        # don't parse.
+        if succeeded == 0 and not failures and ops_count > 0:
+            logger.warning(
+                "%s.index_bulk: ES bulk returned a shape that yielded "
+                "0 succeeded / 0 failed for %d ops "
+                "(catalog=%s collection=%s index=%s). resp_type=%s "
+                "resp_keys=%s items_len=%d errors=%s",
+                driver_name or "ElasticsearchBase",
+                ops_count,
+                catalog,
+                collection,
+                index_name,
+                type(resp).__name__,
+                list(resp.keys()) if isinstance(resp, dict) else None,
+                len(items),
+                resp.get("errors") if isinstance(resp, dict) else None,
+            )
+        return succeeded, failures
 
 
 # ---------------------------------------------------------------------------
@@ -361,13 +591,14 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     # ``items_query.EnvelopeFields``).
     _envelope_fields: ClassVar[EnvelopeFields] = PUBLIC_ENVELOPE_FIELDS
 
-    # Driver-specific config class resolved by :meth:`_resolve_simplify_geometry`.
-    # Each concrete driver overrides this to its own
-    # ``ItemsElasticsearch*DriverConfig`` subclass so the shared base can
-    # look up the per-driver config row without knowing the subclass name.
-    # The public driver uses ``ItemsElasticsearchDriverConfig`` (the default
-    # set here); private and envelope drivers override with their own types.
-    _driver_config_class: ClassVar[Any] = None  # set per-driver below
+    # Driver-specific config class resolved by :meth:`get_driver_config` and
+    # :meth:`_resolve_simplify_geometry` / :meth:`_resolve_simplify_max_bytes`.
+    # Each concrete driver sets this to its own
+    # ``ItemsElasticsearch*DriverConfig`` subclass so the shared helpers
+    # look up the per-driver config row without hardcoding a type.
+    # All three concrete items drivers declare the correct value; this
+    # ``None`` sentinel is inherited only by intermediate bases.
+    _driver_config_class: ClassVar[Any] = None
 
     # ------------------------------------------------------------------
     # Override seams
@@ -382,6 +613,24 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         """
         raise NotImplementedError
 
+    @staticmethod
+    def _reject_unsupported_group_by(request: Optional[QueryRequest]) -> None:
+        """Raise loudly when ``request`` carries a ``group_by`` (#2829).
+
+        None of the three ES items drivers (public STAC, private, envelope)
+        implement GROUP BY / DISTINCT — they read a plain page scan. Dispatch
+        now derives ``Hint.GROUP_BY`` from such requests so they route to a
+        capable driver (PostgreSQL) before reaching here, but a caller
+        invoking ``read_entities`` directly must not silently get back a
+        plausible-looking but wrong (ungrouped) result set.
+        """
+        if request is not None and request.group_by:
+            raise ValueError(
+                "Elasticsearch items driver does not support "
+                "QueryRequest.group_by; route this query to a "
+                "GROUP_BY-capable driver (e.g. PostgreSQL)."
+            )
+
     def _collection_routing(self, collection_id: Optional[str]) -> Optional[str]:
         """Resolve the ES ``_routing`` key for collection-scoped data ops.
 
@@ -390,6 +639,41 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         routed by collection (override returns ``None``).
         """
         return collection_id
+
+    async def _resolve_internal_ids(
+        self, catalog_id: str, collection_id: Optional[str] = None
+    ) -> Tuple[str, Optional[str]]:
+        """Resolve external ``catalog_id``/``collection_id`` to their immutable
+        internal ids.
+
+        The write path stores INTERNAL ids in ``_source`` and the per-tenant
+        index name is ``{prefix}-items-{catalog_id}`` (:meth:`_items_index_name`)
+        — so a caller-supplied EXTERNAL id (the common case: STAC/OGC path
+        params) must be resolved before it is used to compute the index name
+        or a ``collection`` term filter, or the query silently targets the
+        wrong (non-existent) index / matches zero docs.
+        ``ItemsElasticsearchDriver.read_entities`` has always done this
+        resolution inline; ``count_entities`` / ``compute_extents`` /
+        ``aggregate`` share this helper so all four ops resolve identically.
+        Passthrough (unchanged input) when ``CatalogsProtocol`` is
+        unavailable or the id is already internal (``allow_missing=True``).
+        """
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols import CatalogsProtocol
+
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            return catalog_id, collection_id
+        internal_cat = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+        if internal_cat is not None:
+            catalog_id = internal_cat
+        if collection_id is not None:
+            internal_col = await catalogs.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if internal_col is not None:
+                collection_id = internal_col
+        return catalog_id, collection_id
 
     async def index_available(self, catalog_id: str) -> bool:
         """Whether this driver's backing items index exists for ``catalog_id``.
@@ -410,109 +694,21 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         if es is None:
             return False
         try:
+            # Resolve external catalog_id to internal before computing the
+            # index name — mirrors count_entities/read_entities. Without this,
+            # this pre-check probed a different (non-existent) index than the
+            # one the read actually hits, so a real index was reported
+            # unavailable (or vice versa) and the PG fallback never engaged.
+            catalog_id, _ = await self._resolve_internal_ids(catalog_id)
             return bool(
                 await es.indices.exists(index=self._items_index_name(catalog_id))
             )
         except Exception:  # noqa: BLE001 — degrade to the next configured driver
             return False
 
-    # ------------------------------------------------------------------
-    # Shared index bootstrap and bulk tally helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    async def _ensure_index(
-        es: Any,
-        index_name: str,
-        mapping: Dict[str, Any],
-        settings_fn: Any,
-    ) -> None:
-        """Idempotently create ``index_name`` if absent (race-tolerant).
-
-        Used by the private and envelope drivers' write/index/ensure_storage
-        paths — a single code path for the create-if-absent + swallow
-        ``resource_already_exists`` pattern.
-
-        ``settings_fn`` must be an async callable with no required arguments
-        that returns the index settings dict (e.g.
-        ``get_private_items_index_settings``).
-
-        The public driver's ``ensure_storage`` is NOT routed here because it
-        carries additional alias-enrolment logic (``_ensure_in_public_alias_once``)
-        that is public-only behaviour.
-        """
-        if await es.indices.exists(index=index_name):
-            return
-        try:
-            await es.indices.create(
-                index=index_name,
-                body={
-                    "settings": await settings_fn(),
-                    "mappings": mapping,
-                },
-            )
-        except Exception as exc:
-            if "resource_already_exists" not in str(exc):
-                raise
-
-    @staticmethod
-    def _tally_bulk_response(
-        resp: Any,
-        ops_count: int,
-        *,
-        driver_name: str = "",
-        catalog: str = "",
-        collection: str = "",
-        index_name: str = "",
-    ) -> "tuple[int, List[Dict[str, Any]]]":
-        """Parse an ES ``_bulk`` response into ``(succeeded, failures)``.
-
-        Shared by the private and envelope ``index_bulk`` paths.  The public
-        driver reuses this too (contributing the #914 zero/zero warning so
-        that all three drivers log diagnostic context when ES returns a
-        response shape that yields no per-item results).
-
-        Returns
-        -------
-        succeeded : int
-        failures  : list of ``{"id": ..., "reason": ...}`` dicts
-        """
-        items = (resp or {}).get("items", []) if isinstance(resp, dict) else []
-        succeeded = 0
-        failures: List[Dict[str, Any]] = []
-        for it in items:
-            entry = next(iter(it.values())) if isinstance(it, dict) and it else {}
-            err = entry.get("error") if isinstance(entry, dict) else None
-            if err:
-                failures.append({
-                    "id": entry.get("_id"),
-                    "reason": str(
-                        err.get("reason", err) if isinstance(err, dict) else err
-                    ),
-                })
-            else:
-                succeeded += 1
-        # #914 — when the parsed result is a silent no-op (succeeded=0 with
-        # no per-item failures), log the raw response shape so operators
-        # can tell ``items=[]`` (request never hit ES) from a shape we
-        # don't parse.
-        if succeeded == 0 and not failures and ops_count > 0:
-            logger.warning(
-                "%s.index_bulk: ES bulk returned a shape that yielded "
-                "0 succeeded / 0 failed for %d ops "
-                "(catalog=%s collection=%s index=%s). resp_type=%s "
-                "resp_keys=%s items_len=%d errors=%s",
-                driver_name or "ItemsElasticsearchBase",
-                ops_count,
-                catalog,
-                collection,
-                index_name,
-                type(resp).__name__,
-                list(resp.keys()) if isinstance(resp, dict) else None,
-                len(items),
-                resp.get("errors") if isinstance(resp, dict) else None,
-            )
-        return succeeded, failures
+    # ``_ensure_index`` / ``_tally_bulk_response`` moved to ``_ElasticsearchBase``
+    # (#2863) so the asset driver can reuse them too — they were never
+    # items-specific to begin with.
 
     # ------------------------------------------------------------------
     # Shared simplification helpers
@@ -527,41 +723,21 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     ) -> bool:
         """Return the ``simplify_geometry`` flag from this driver's config.
 
-        Resolves the per-driver ``ItemsElasticsearch*DriverConfig`` via the
-        ConfigsProtocol waterfall, using :attr:`_driver_config_class` to
-        address the right config row.  Each concrete driver sets
-        ``_driver_config_class`` to its own config type; the public driver
-        falls back to ``get_driver_config`` (which already resolves
-        ``ItemsElasticsearchDriverConfig``).
+        Delegates to :meth:`get_driver_config` which dispatches through
+        :attr:`_driver_config_class` to retrieve the per-driver config row.
+        All concrete drivers declare ``_driver_config_class``; the method
+        falls back gracefully when the protocol is unavailable.
 
         Degrade-safe: returns ``True`` (fail open to simplify) when the configs
         protocol is unavailable or the config row is missing.  Only an explicit
         ``simplify_geometry = False`` in the resolved config disables
         simplification.
         """
-        config_cls = self.__class__._driver_config_class
         try:
-            if config_cls is None:
-                # Public driver path: delegate to the generic get_driver_config.
-                driver_config = await self.get_driver_config(
-                    catalog_id, collection_id, db_resource=db_resource,
-                )
-                return bool(getattr(driver_config, "simplify_geometry", True))
-
-            from dynastore.models.protocols.configs import ConfigsProtocol
-            from dynastore.models.driver_context import DriverContext
-            from dynastore.tools.discovery import get_protocol
-
-            configs = get_protocol(ConfigsProtocol)
-            if configs is None:
-                return True
-            config = await configs.get_config(
-                config_cls,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-                ctx=DriverContext(db_resource=db_resource),
+            driver_config = await self.get_driver_config(
+                catalog_id, collection_id, db_resource=db_resource,
             )
-            return bool(getattr(config, "simplify_geometry", True))
+            return bool(getattr(driver_config, "simplify_geometry", True))
         except Exception:
             return True
 
@@ -574,35 +750,45 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
     ) -> int:
         """Effective ES geometry byte budget for simplification.
 
-        Reads ``simplify_target_bytes`` from this driver's config and clamps it
-        to ``(1, DEFAULT_MAX_BYTES)``.  Returns ``DEFAULT_MAX_BYTES`` (the 10 MB
-        ES ceiling) when unset or when the config is unavailable.
+        Delegates to :meth:`get_driver_config` which dispatches through
+        :attr:`_driver_config_class` to retrieve the per-driver config row.
+        Returns ``DEFAULT_MAX_BYTES`` (the 10 MB ES ceiling) when the config
+        is unavailable or ``simplify_target_bytes`` is unset.
         """
         from dynastore.tools.geometry_simplify import DEFAULT_MAX_BYTES
 
-        config_cls = self.__class__._driver_config_class
         try:
-            if config_cls is None:
-                cfg = await self.get_driver_config(
-                    catalog_id, collection_id, db_resource=db_resource,
-                )
-            else:
-                from dynastore.models.protocols.configs import ConfigsProtocol
-                from dynastore.models.driver_context import DriverContext
-                from dynastore.tools.discovery import get_protocol
-
-                configs = get_protocol(ConfigsProtocol)
-                if configs is None:
-                    return DEFAULT_MAX_BYTES
-                cfg = await configs.get_config(
-                    config_cls,
-                    catalog_id=catalog_id,
-                    collection_id=collection_id,
-                    ctx=DriverContext(db_resource=db_resource),
-                )
+            cfg = await self.get_driver_config(
+                catalog_id, collection_id, db_resource=db_resource,
+            )
         except Exception:
             return DEFAULT_MAX_BYTES
         return _clamp_geometry_budget(getattr(cfg, "simplify_target_bytes", None))
+
+    async def _resolve_snap_to_grid_config(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> Tuple[bool, float]:
+        """Return ``(snap_to_grid, snap_grid_size)`` from this driver's config.
+
+        Both values default to off / 1e-5 when the config is unavailable.
+        The snap-to-grid mode is off by default and must be enabled explicitly
+        via the driver config.
+        """
+        from dynastore.tools.geometry_simplify import DEFAULT_SNAP_GRID_SIZE
+
+        try:
+            cfg = await self.get_driver_config(
+                catalog_id, collection_id, db_resource=db_resource,
+            )
+        except Exception:
+            return False, DEFAULT_SNAP_GRID_SIZE
+        snap = bool(getattr(cfg, "snap_to_grid", False))
+        grid_size = float(getattr(cfg, "snap_grid_size", DEFAULT_SNAP_GRID_SIZE))
+        return snap, grid_size
 
     # ------------------------------------------------------------------
     # Shared concrete methods — identical across private and envelope drivers
@@ -771,6 +957,14 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return 0
+        # Resolve external ids to internal before computing the index name /
+        # collection scope — mirrors read_entities, whose omission here left
+        # count_entities querying a differently-named (non-existent) index
+        # for an external catalog_id, silently returning 0 via
+        # ignore_unavailable while read_entities served real hits.
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         # ``_query_request_to_es`` returns an enveloped ``{"query": ...}``;
         # ``es_count_items`` adds its own collection scope, so it wants the
         # inner query only (a double envelope is a malformed count body).
@@ -803,6 +997,9 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return None
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         return await es_extents(
             es,
             self._items_index_name(catalog_id),
@@ -826,6 +1023,9 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return None
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         query = (
             self._query_request_to_es(request, self._envelope_fields)
             if request is not None
@@ -1099,6 +1299,34 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         return body, params
 
 
+class _WrittenWithPresubmitSkips(List[Feature]):
+    """``List[Feature]`` subclass carrying pre-submit skip accounting (#2826).
+
+    ``write_entities`` can drop an input item before it is ever submitted to
+    ES's ``_bulk`` call — a ``REFUSE`` on-conflict policy skip, or a row with
+    no resolvable id — and previously returned a plain, silently-shorter
+    list with no signal beyond a debug/error log line. ``reindex_collection_
+    into_index`` needs that gap to fold it into ``rejected_docs`` so
+    ``total_written + rejected`` still equals the number of documents read
+    (the same invariant #2799/#2825 established for the ``_bulk`` exception
+    path).
+
+    ``skipped`` holds ``(doc_id, reason)`` pairs, ``doc_id`` is ``None`` when
+    the skip reason IS the absence of a resolvable id. Behaves exactly like
+    a plain list for every existing caller (``len()``, iteration, ``==``,
+    ``extend()``) — only a caller that explicitly reads ``.skipped`` sees a
+    difference.
+    """
+
+    def __init__(
+        self,
+        items: List[Feature],
+        skipped: List[Tuple[Optional[str], str]],
+    ) -> None:
+        super().__init__(items)
+        self.skipped: List[Tuple[Optional[str], str]] = skipped
+
+
 # ---------------------------------------------------------------------------
 # ItemsElasticsearchDriver — public STAC items index
 # ---------------------------------------------------------------------------
@@ -1128,6 +1356,10 @@ class ItemsElasticsearchDriver(
     """
 
     is_item_indexer: ClassVar[bool] = True
+
+    # Config class for the public items index — wires get_driver_config and
+    # the shared _resolve_simplify_* helpers to the correct config row.
+    _driver_config_class: ClassVar[Any] = ItemsElasticsearchDriverConfig
 
     # ES (public) is the canonical async secondary index + primary SEARCH
     # backend for items routing.  It auto-defaults into WRITE (as a secondary
@@ -1224,16 +1456,46 @@ class ItemsElasticsearchDriver(
         Batch-level via ``on_batch_conflict``:
         - REFUSE (``refuse_batch``): raise ``ConflictError`` if any external_id
           already exists.
+
+        Returns the subset of the input Features that ES actually
+        acknowledged (#2799) — not every item this driver attempted to
+        submit. ES's ``_bulk`` endpoint is per-item, so a rejection
+        elsewhere in the same request does not imply every other document
+        was indexed; a full rejection (unrecovered by the geo_shape ladder)
+        raises ``EsBulkWriteError`` instead, whose ``.acknowledged``
+        attribute carries the same accounting for that call.
+
+        When one or more input items are skipped BEFORE submission to
+        ``_bulk`` (``REFUSE`` on-conflict, or a row with no resolvable id),
+        the returned list is a :class:`_WrittenWithPresubmitSkips` — a
+        transparent ``list`` subclass whose ``.skipped`` attribute carries
+        ``(doc_id, reason)`` pairs for each pre-submit skip (#2826), so
+        callers doing accounting reconciliation (e.g.
+        ``reindex_collection_into_index``) can fold them into their own
+        rejected/skipped totals instead of the gap being silently absorbed
+        into a shorter list.
         """
         from datetime import datetime, timezone
 
         from dynastore.modules.elasticsearch.canonical_doc import build_canonical_index_doc
-        from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+        from dynastore.modules.catalog.canonical_index_read import (
+            CanonicalIndexInput,
+            canonical_input_from_feature,
+        )
 
         items = self._normalize_entities(entities)
         if not items:
             return []
         es = _es_client_required()
+        # Resolve external ids to internal before computing the index name /
+        # routing key — mirrors count_entities/compute_extents/aggregate
+        # (#2999). Without this, a caller supplying the external catalog_id
+        # writes to a different index / routing partition than the one every
+        # read path resolves to, silently stranding documents on a shard the
+        # reads never query.
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         index_name = self._items_index_name(catalog_id)
         # ES-primary (ES-only) write: ensure the tenant items index exists with
         # the correct mapping (``collection`` as keyword) and alias enrolment
@@ -1247,11 +1509,14 @@ class ItemsElasticsearchDriver(
 
         # Issue #1248: auto-simplify by default. Simplification can be disabled
         # by setting ``simplify_geometry = false`` in the driver config; the
-        # byte budget is clamped to the ES 10 MB ceiling.
+        # byte budget targets 1 MB by default (clamped to 10 MB ES ceiling).
         simplify_geometry = await self._resolve_simplify_geometry(
             catalog_id, collection_id, db_resource=db_resource,
         )
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
             catalog_id, collection_id, db_resource=db_resource,
         )
 
@@ -1301,16 +1566,43 @@ class ItemsElasticsearchDriver(
             )
             item_geoids.append(geoid_for_item)
 
-        # Batch-fetch canonical inputs for all non-None geoids.
+        # Batch-fetch canonical inputs for all non-None geoids — but only when
+        # this collection's WRITE routing actually resolves a PG-capable
+        # driver (#2864). Pure ES-only routing (``_items_routing_es()`` — the
+        # ``items_es_public`` preset used by ``stac_harvest``) has no PG WRITE
+        # entry, so every batched read would deterministically raise
+        # ``canonical_index_read._fetch_raw_rows``'s "cannot resolve physical
+        # table" RuntimeError (#2731 made that failure loud on purpose — it
+        # must not be swallowed for PG-backed collections). Checking routing
+        # capability up front, rather than catching that RuntimeError, keeps
+        # genuine PG failures on PG-backed collections visible while letting
+        # ES-only collections skip straight to the per-item feature-derived
+        # fallback below (``ci is None`` branch), which is a database-free
+        # equivalent of the canonical shape.
         batch_geoids = [g for g in item_geoids if g is not None]
         canonical_inputs: Dict[str, Any] = {}
-        if batch_geoids:
+        if batch_geoids and await has_canonical_source(catalog_id, collection_id):
+            # #3046: a canonical source being *routed* doesn't mean it has
+            # been activated (its storage provisioned) yet — a collection
+            # created via a bulk harvester never goes through
+            # ItemService.upsert's own lazy-activation gate, so without this
+            # the batched read below would deterministically hit an
+            # unresolved physical table on the collection's first ES write.
+            await ensure_canonical_source_ready(
+                catalog_id, collection_id, db_resource=db_resource,
+            )
             canonical_inputs = await read_canonical_index_inputs(
                 catalog_id, collection_id, batch_geoids, db_resource=db_resource,
             )
 
         written: List = []
         prepped_bulk: list = []
+        # Pre-submit skips (#2826) — items dropped before ever reaching the
+        # ``_bulk`` call (REFUSE on-conflict, no resolvable id). Folded onto
+        # the returned list's ``.skipped`` attribute so callers doing
+        # write/rejected reconciliation (reindex) see the gap instead of it
+        # being absorbed into a silently-shorter ``written``.
+        skipped: List[Tuple[Optional[str], str]] = []
 
         for item, stac_doc, geoid_for_id in zip(items, item_stac_docs, item_geoids):
             # Resolve external_id from the configured ComputedField path.
@@ -1345,6 +1637,7 @@ class ItemsElasticsearchDriver(
                         "ES write_entities(REFUSE): external_id '%s' exists — skipped",
                         external_id,
                     )
+                    skipped.append((base_id, "refused_on_conflict"))
                     continue
 
             # NEW_VERSION: each version gets a unique doc_id. Store validity window.
@@ -1391,43 +1684,33 @@ class ItemsElasticsearchDriver(
                 # (assets, stac_extensions) lives only in the inbound feature doc
                 # and must be threaded through to the ES _source so
                 # unproject_item_from_es can surface them on read.
-                raw_props = stac_doc.get("properties") or {}
-                from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS as _SFK
-                _sys_keys = frozenset(_SFK)
-                user_props = {k: v for k, v in raw_props.items() if k not in _sys_keys}
-                geom = stac_doc.get("geometry")
-                bbox_val = stac_doc.get("bbox")
-                fallback_row: Dict[str, Any] = {"geoid": geoid_for_id or base_id}
-                if external_id is not None:
-                    fallback_row["external_id"] = str(external_id)
-                if asset_id is not None:
-                    fallback_row["asset_id"] = str(asset_id)
-
-                # Collect per-item STAC reserved members present in the
-                # serialized feature.  ``assets`` and ``stac_extensions`` are
-                # already in ``_RESERVED_MEMBER_KEYS`` so unproject_item_from_es
-                # passes them through verbatim — they just need to be stored.
-                _stac_reserved: Dict[str, Any] = {}
-                _raw_assets = stac_doc.get("assets")
-                if _raw_assets is not None:
-                    _stac_reserved["assets"] = _raw_assets
-                _raw_exts = stac_doc.get("stac_extensions")
-                if _raw_exts is not None:
-                    _stac_reserved["stac_extensions"] = _raw_exts
-
+                #
+                # Built via canonical_input_from_feature — the same
+                # database-free canonical-input producer used by
+                # ItemsElasticsearchDriver.index()/index_bulk() (the Indexer
+                # protocol surface) — instead of a third hand-rolled
+                # reimplementation of the same feature-to-canonical-input
+                # shape (#2732 step 2).
+                fallback_geoid = geoid_for_id or base_id
+                ci = canonical_input_from_feature(
+                    stac_doc, catalog_id, collection_id,
+                    geoid=fallback_geoid,
+                    external_id=external_id,
+                    asset_id=asset_id,
+                )
                 es_doc = build_canonical_index_doc(
-                    fallback_row,
-                    resolved_sidecars=[],
+                    ci.row,
+                    resolved_sidecars=ci.resolved_sidecars,
                     known_fields=known_fields,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
-                    geometry=geom if isinstance(geom, dict) else None,
-                    bbox=list(bbox_val) if bbox_val is not None else None,
-                    user_properties=user_props or None,
-                    access=None,
-                    stac_reserved_members=_stac_reserved or None,
+                    geometry=ci.geometry,
+                    bbox=ci.bbox,
+                    user_properties=ci.user_properties,
+                    access=ci.access,
+                    stac_reserved_members=ci.stac_reserved_members,
                 )
-                doc_id = geoid_for_id or base_id
+                doc_id = fallback_geoid
                 logger.debug(
                     "write_entities: no raw PG row for geoid=%s in %s/%s — "
                     "using feature-derived fallback doc",
@@ -1440,6 +1723,7 @@ class ItemsElasticsearchDriver(
                     "— this item will NOT be indexed in Elasticsearch.",
                     catalog_id, collection_id,
                 )
+                skipped.append((base_id, "missing_id"))
                 continue
 
             # NEW_VERSION: append timestamp suffix to the doc_id (not to the
@@ -1462,6 +1746,7 @@ class ItemsElasticsearchDriver(
             # recorded in system.geometry_simplification (nested, typed).
             es_doc, factor, mode = maybe_simplify_for_es(
                 es_doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _apply_geometry_simplification(es_doc, factor, mode)
 
@@ -1478,13 +1763,16 @@ class ItemsElasticsearchDriver(
         if prepped_bulk:
             body: list = []
             submitted_ids: list = []
+            doc_by_id: Dict[str, Dict[str, Any]] = {}
             for entry in prepped_bulk:
                 body.append(entry["action"])
                 body.append(entry["doc"])
-                submitted_ids.append(entry["action"]["index"]["_id"])
+                doc_id_str = entry["action"]["index"]["_id"]
+                submitted_ids.append(doc_id_str)
+                doc_by_id[doc_id_str] = entry["doc"]
             from dynastore.modules.elasticsearch._mapping_errors import (
                 maybe_raise_bulk_mapping_mismatch,
-                raise_on_bulk_errors,
+                raise_on_bulk_errors_with_ladder,
             )
             # ``write_entities`` is the synchronous ES-*primary* write path
             # (ES-only / ES-primary collections): there is no PG row and no
@@ -1498,8 +1786,30 @@ class ItemsElasticsearchDriver(
             # eventual by design and drained from the outbox.
             resp = await es.bulk(body=body, params={"refresh": "wait_for"})
             maybe_raise_bulk_mapping_mismatch(resp, index_name)
-            raise_on_bulk_errors(resp, index_name, submitted_ids)
+            # Ladder-aware rejection handling (#2769): a poison-classified
+            # per-doc rejection is retried through progressively coarser
+            # geometry before it is reported as a failure — this is also the
+            # bulk reindex path's rejection point (reindex_collection_into_index
+            # calls write_entities), so the retry benefits both callers.
+            #
+            # ES's ``_bulk`` endpoint is per-item — a rejection elsewhere in
+            # the same request does not mean every other id in ``submitted_ids``
+            # was actually indexed. Only report the ids ES (or the ladder)
+            # actually acknowledged (#2799); ``written`` above is a pre-submit
+            # list built before the bulk call and must not be returned as-is.
+            acknowledged_ids = set(
+                await raise_on_bulk_errors_with_ladder(
+                    es, resp, index_name, submitted_ids, doc_by_id,
+                    routing=collection_id,
+                )
+            )
+            written = [
+                item for item, doc_id in zip(written, submitted_ids)
+                if doc_id in acknowledged_ids
+            ]
 
+        if skipped:
+            return _WrittenWithPresubmitSkips(written, skipped)
         return written
 
     async def _enforce_field_constraints(
@@ -1642,13 +1952,17 @@ class ItemsElasticsearchDriver(
         props = clean.get("properties")
         if read_policy is not None and isinstance(props, dict):
             ft = read_policy.feature_type
+            source_props = source.get("properties") if isinstance(source, dict) else None
+            source_authored_created = (
+                isinstance(source_props, dict) and "created" in source_props
+            )
             if getattr(ft, "external_id_as_feature_id", False) and isinstance(source, dict):
                 ext = source.get("external_id")
                 if ext is not None:
                     clean["id"] = str(ext)
             if not getattr(ft, "expose_geoid", False):
                 props.pop("geoid", None)
-            if not getattr(ft, "expose_created", False):
+            if not getattr(ft, "expose_created", False) and not source_authored_created:
                 props.pop("created", None)
         return Feature.model_validate(clean)
 
@@ -1727,6 +2041,8 @@ class ItemsElasticsearchDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        self._reject_unsupported_group_by(request)
+
         from dynastore.modules.storage.routing_config import (
             get_output_transformers_for_search,
         )
@@ -1737,6 +2053,82 @@ class ItemsElasticsearchDriver(
             restore_transform_chain,
         )
         from dynastore.tools.typed_store.base import _to_snake
+
+        # ── Resolve external ids to internal for the ES query ─────────────────
+        # The write path stores INTERNAL catalog_id / collection_id in _source;
+        # the read path receives EXTERNAL ids from the URL.  Resolve once so the
+        # term filter and _routing value match what is indexed, and so the
+        # external id is available for the response projection (internal→external).
+        from dynastore.tools.discovery import get_protocol as _get_proto_r
+        from dynastore.models.protocols import CatalogsProtocol as _CatProto_r
+
+        external_collection_id = collection_id  # preserve for response projection
+        _catalogs_r = _get_proto_r(_CatProto_r)
+        if _catalogs_r is not None:
+            _internal_cat_r = await _catalogs_r.resolve_catalog_id(
+                catalog_id, allow_missing=True
+            )
+            if _internal_cat_r is not None:
+                catalog_id = _internal_cat_r
+            _internal_col_r = await _catalogs_r.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if _internal_col_r is not None:
+                collection_id = _internal_col_r
+
+        # Build a lazily-populated cache: internal_collection_id → external_id.
+        # Many items in a page share the same collection; resolve once, reuse N-1.
+        _internal_to_external_cache: Dict[str, str] = {}
+        if collection_id != external_collection_id:
+            _internal_to_external_cache[collection_id] = external_collection_id
+
+        async def _project_collection_field(feature: Feature) -> Feature:
+            """Project the stored internal ``collection`` field to the external label.
+
+            Resolves the mapping once per distinct internal collection_id per
+            query, then reuses the cached value for every subsequent hit in the
+            same page.
+            """
+            raw_coll = None
+            # ``Feature`` uses extra="allow"; ``collection`` is a top-level member.
+            if hasattr(feature, "collection"):
+                raw_coll = feature.collection  # type: ignore[attr-defined]
+            elif (
+                feature.__pydantic_extra__ is not None
+                and "collection" in feature.__pydantic_extra__
+            ):
+                raw_coll = feature.__pydantic_extra__["collection"]
+
+            if not raw_coll or not isinstance(raw_coll, str):
+                return feature
+
+            if raw_coll in _internal_to_external_cache:
+                external_coll = _internal_to_external_cache[raw_coll]
+            else:
+                external_coll = raw_coll  # default: pass through unchanged
+                if _catalogs_r is not None:
+                    try:
+                        resolved = await _catalogs_r.collections.resolve_collection_external_id(
+                            catalog_id, raw_coll, allow_missing=True
+                        )
+                        if resolved is not None:
+                            external_coll = resolved
+                    except Exception:
+                        pass  # fail open: leave collection as-is
+                _internal_to_external_cache[raw_coll] = external_coll
+
+            if external_coll == raw_coll:
+                return feature  # nothing to project
+
+            # Patch the feature's ``collection`` field with the external label.
+            if feature.__pydantic_extra__ is not None and "collection" in feature.__pydantic_extra__:
+                feature.__pydantic_extra__["collection"] = external_coll
+            else:
+                try:
+                    object.__setattr__(feature, "collection", external_coll)
+                except (AttributeError, TypeError):
+                    pass
+            return feature
 
         es = _es_client_required()
         index_name = self._items_index_name(catalog_id)
@@ -1764,6 +2156,7 @@ class ItemsElasticsearchDriver(
                     src = resp.get("_source")
                     if src is not None:
                         feature = self._es_source_to_feature(src, read_policy)
+                        feature = await _project_collection_field(feature)
                         if restore_chain:
                             feature = await restore_transform_chain(
                                 feature,
@@ -1798,6 +2191,7 @@ class ItemsElasticsearchDriver(
                         feature = self._es_source_to_feature(
                             hit["_source"], read_policy,
                         )
+                        feature = await _project_collection_field(feature)
                         if restore_chain:
                             feature = await restore_transform_chain(
                                 feature,
@@ -2026,10 +2420,23 @@ class ItemsElasticsearchDriver(
         # directly from the raw row + resolved sidecars — no read-policy
         # filtering, no external_id_as_feature_id id-flip (#1800).
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
-        inputs = await read_canonical_index_inputs(
-            ctx.catalog, ctx.collection, [op.entity_id],
-            db_resource=ctx.pg_conn,
-        )
+        # Only attempt the canonical read when this collection's WRITE
+        # routing actually resolves a canonical-capable driver — same guard
+        # write_entities() uses (#2864/#2884/#3046), including the same
+        # lazy-activation step (a collection reindexed via the outbox before
+        # its first item write went through ItemService.upsert's own
+        # activation gate would otherwise hit an unresolved physical table).
+        # No canonical-capable driver routed: skip straight to the
+        # feature-derived fallback below instead.
+        inputs = {}
+        if await has_canonical_source(ctx.catalog, ctx.collection):
+            await ensure_canonical_source_ready(
+                ctx.catalog, ctx.collection, db_resource=ctx.pg_conn,
+            )
+            inputs = await read_canonical_index_inputs(
+                ctx.catalog, ctx.collection, [op.entity_id],
+                db_resource=ctx.pg_conn,
+            )
         ci = inputs.get(op.entity_id)
         if ci is None:
             # No raw PG row.  For a PG-primary collection this means the row
@@ -2065,8 +2472,12 @@ class ItemsElasticsearchDriver(
         )
         simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
         simplify_max_bytes = await self._resolve_simplify_max_bytes(ctx.catalog, ctx.collection)
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
         doc, factor, mode = maybe_simplify_for_es(
             doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+            snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
         )
         _apply_geometry_simplification(doc, factor, mode)
         await es.index(
@@ -2105,8 +2516,16 @@ class ItemsElasticsearchDriver(
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
         simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
         simplify_max_bytes = await self._resolve_simplify_max_bytes(ctx.catalog, ctx.collection)
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
 
-        # Batch-fetch canonical inputs for all upsert ops in one PG round-trip.
+        # Batch-fetch canonical inputs for all upsert ops in one PG round-trip
+        # — but only when this collection's WRITE routing actually resolves a
+        # canonical-capable driver, same guard write_entities() uses
+        # (#2864/#2884/#3046), including the same lazy-activation step. No
+        # canonical-capable driver routed: skip straight to the per-op
+        # feature-derived fallback below instead.
         upsert_geoids = [
             op.entity_id
             for op in ops
@@ -2116,10 +2535,15 @@ class ItemsElasticsearchDriver(
         # connection from the caller's transaction when available (covers the
         # Cloud Run JOB/worker context where the dispatcher's IndexContext
         # carries the wrapping TX opened by _dispatch_index_upsert Phase 2f).
-        canonical_inputs = await read_canonical_index_inputs(
-            ctx.catalog, ctx.collection, upsert_geoids,
-            db_resource=ctx.pg_conn,
-        ) if upsert_geoids else {}
+        canonical_inputs = {}
+        if upsert_geoids and await has_canonical_source(ctx.catalog, ctx.collection):
+            await ensure_canonical_source_ready(
+                ctx.catalog, ctx.collection, db_resource=ctx.pg_conn,
+            )
+            canonical_inputs = await read_canonical_index_inputs(
+                ctx.catalog, ctx.collection, upsert_geoids,
+                db_resource=ctx.pg_conn,
+            )
 
         body: List[dict] = []
         for op in ops:
@@ -2180,6 +2604,7 @@ class ItemsElasticsearchDriver(
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _apply_geometry_simplification(doc, factor, mode)
             body.append({"index": {
@@ -2192,6 +2617,20 @@ class ItemsElasticsearchDriver(
             return BulkResult(total=len(ops))
 
         resp = await es.bulk(body=body, params={"refresh": "false"})
+        # #2494 instrumentation — submitted vs response doc counts so a
+        # divergence (ES silently dropping/coalescing actions) is visible
+        # without cross-referencing the raw response body. DEBUG (review
+        # finding): fires on every ES bulk call regardless of the #2494
+        # storage-plane flag, so INFO would add unconditional log volume
+        # to every deployment running the ES driver.
+        _resp_items = resp.get("items") if isinstance(resp, dict) else None
+        logger.debug(
+            "es_bulk_response submitted_ops=%d bulk_actions=%d "
+            "response_items=%d errors=%s catalog=%s collection=%s",
+            len(ops), len(body) // 2, len(_resp_items or []),
+            resp.get("errors") if isinstance(resp, dict) else None,
+            ctx.catalog, ctx.collection,
+        )
         succeeded, failures = self._tally_bulk_response(
             resp, len(ops),
             driver_name="ItemsElasticsearchDriver",
@@ -2301,6 +2740,11 @@ class AssetElasticsearchDriver(
 
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
+    # Config class for the asset index — wires get_driver_config to the
+    # correct per-driver config row instead of falling through to
+    # ItemsElasticsearchDriverConfig (the _ElasticsearchBase fallback).
+    _driver_config_class: ClassVar[Any] = AssetElasticsearchDriverConfig
+
     # Asset ES is the canonical async secondary index + primary SEARCH
     # backend for asset metadata routing.  It auto-defaults into WRITE (as a
     # secondary index, identified by ``is_asset_indexer``) and SEARCH.
@@ -2337,7 +2781,14 @@ class AssetElasticsearchDriver(
         *,
         db_resource: Optional[Any] = None,
     ) -> None:
-        """Index a single asset document."""
+        """Index a single asset document.
+
+        Called once per asset by ``AssetService.create_asset``/``update_asset``
+        for the ES-primary write path — the site the observed harvest
+        starvation traced back to (#2863): an ``indices.exists`` HEAD before
+        every single PUT. :meth:`_ensure_index_cached` now caches that check
+        per index name so the HEAD only fires once per (index, process).
+        """
         from dynastore.modules.elasticsearch.mappings import (
             get_assets_index_name, ASSET_MAPPING,
         )
@@ -2348,22 +2799,15 @@ class AssetElasticsearchDriver(
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
-
-        if not await es.indices.exists(index=index_name):
-            try:
-                await es.indices.create(
-                    index=index_name,
-                    body={
-                        "settings": await get_assets_index_settings(),
-                        "mappings": ASSET_MAPPING,
-                    },
-                )
-            except Exception as exc:
-                if "resource_already_exists" not in str(exc):
-                    raise
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
 
         asset_id = asset_doc.get("asset_id", asset_doc.get("id"))
-        await es.index(index=index_name, id=asset_id, body=asset_doc)
+        try:
+            await es.index(index=index_name, id=asset_id, body=asset_doc)
+        except Exception as exc:
+            if _is_index_not_found(exc):
+                _invalidate_ensured_index(index_name)
+            raise
 
     async def delete_asset(
         self, catalog_id: str, asset_id: str,
@@ -2417,25 +2861,69 @@ class AssetElasticsearchDriver(
         await self.index_asset(ctx.catalog, doc)
 
     async def index_bulk(self, ctx, ops):
-        """Bulk-apply a batch of asset ops.
+        """Bulk-apply a batch of asset ops via a single ES ``_bulk`` call.
 
-        Delegates per-op to :meth:`index` for now — asset writes are
-        rare enough vs item writes that a single ES round-trip per op
-        isn't a hot-path concern.  A native ``_bulk`` implementation
-        can land later if profiling motivates it.
+        Previously delegated per-op to :meth:`index` — an ``indices.exists``
+        HEAD plus a single-doc PUT/DELETE for every op in the batch, the same
+        per-doc amplification pattern that starved the shared client pool
+        under harvest load (#2863). This batch already has every op in hand,
+        so it now goes through one ``_bulk`` request instead, reusing the
+        same ``_ensure_index`` / ``_tally_bulk_response`` machinery the
+        items/private/envelope drivers' ``index_bulk`` paths already use
+        rather than a parallel bulk implementation. Per-op failures are
+        reported in ``BulkResult.failures`` — one bad doc does not fail the
+        whole batch.
         """
         from dynastore.models.protocols.indexer import BulkResult
+        from dynastore.modules.elasticsearch.mappings import (
+            get_assets_index_name, ASSET_MAPPING,
+        )
+        from dynastore.modules.elasticsearch.index_config import (
+            get_assets_index_settings,
+        )
+        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            maybe_raise_bulk_mapping_mismatch,
+        )
 
-        succeeded = 0
-        failures: List[Dict[str, Any]] = []
-        for op in ops:
-            if op.entity_type != "asset":
+        asset_ops = [op for op in ops if op.entity_type == "asset"]
+        if not asset_ops:
+            # ``total`` reflects the full input batch (matching every other
+            # ES driver's ``index_bulk`` convention, e.g.
+            # ``ItemsElasticsearchDriver.index_bulk``) — a non-asset op is
+            # silently skipped (a different tier's Indexer fields it), not
+            # counted as succeeded or failed.
+            return BulkResult(total=len(ops))
+
+        index_name = get_assets_index_name(_get_index_prefix(), ctx.catalog)
+        es = self._get_client()
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
+
+        body: List[dict] = []
+        for op in asset_ops:
+            if op.op_type == "delete":
+                body.append({"delete": {"_index": index_name, "_id": op.entity_id}})
                 continue
-            try:
-                await self.index(ctx, op)
-                succeeded += 1
-            except Exception as exc:  # noqa: BLE001 — surface per-op failures
-                failures.append({"id": op.entity_id, "reason": str(exc)})
+            # upsert
+            doc = dict(op.payload or {})
+            doc.setdefault("asset_id", op.entity_id)
+            doc.setdefault("catalog_id", ctx.catalog)
+            if ctx.collection is not None:
+                doc.setdefault("collection_id", ctx.collection)
+            body.append({"index": {"_index": index_name, "_id": op.entity_id}})
+            body.append(doc)
+
+        resp = await es.bulk(body=body)
+        maybe_raise_bulk_mapping_mismatch(resp, index_name)
+        if _bulk_response_missing_index(resp):
+            _invalidate_ensured_index(index_name)
+        succeeded, failures = self._tally_bulk_response(
+            resp, len(asset_ops),
+            driver_name="AssetElasticsearchDriver",
+            catalog=ctx.catalog,
+            collection=ctx.collection or "",
+            index_name=index_name,
+        )
         return BulkResult(
             total=len(ops),
             succeeded=succeeded,
@@ -2467,19 +2955,7 @@ class AssetElasticsearchDriver(
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         items = self._normalize_entities(entities)
         es = self._get_client()
-
-        if not await es.indices.exists(index=index_name):
-            try:
-                await es.indices.create(
-                    index=index_name,
-                    body={
-                        "settings": await get_assets_index_settings(),
-                        "mappings": ASSET_MAPPING,
-                    },
-                )
-            except Exception as exc:
-                if "resource_already_exists" not in str(exc):
-                    raise
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
 
         bulk_body: list = []
         asset_ids: list = []
@@ -2502,6 +2978,8 @@ class AssetElasticsearchDriver(
             )
             resp = await es.bulk(body=bulk_body)
             maybe_raise_bulk_mapping_mismatch(resp, index_name)
+            if _bulk_response_missing_index(resp):
+                _invalidate_ensured_index(index_name)
             raise_on_bulk_errors(resp, index_name, asset_ids)
 
         return items if isinstance(items, list) else list(items)
@@ -2598,18 +3076,7 @@ class AssetElasticsearchDriver(
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
-        if not await es.indices.exists(index=index_name):
-            try:
-                await es.indices.create(
-                    index=index_name,
-                    body={
-                        "settings": await get_assets_index_settings(),
-                        "mappings": ASSET_MAPPING,
-                    },
-                )
-            except Exception as exc:
-                if "resource_already_exists" not in str(exc):
-                    raise
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
 
     async def drop_storage(
         self,
@@ -2653,6 +3120,10 @@ class AssetElasticsearchDriver(
             await es.indices.delete(
                 index=index_name, params={"ignore_unavailable": "true"},
             )
+            # The index is gone — drop it from the existence cache (#2863) so
+            # the next write re-checks/re-creates instead of trusting a now-
+            # stale "exists" entry and PUTting straight into a 404.
+            _invalidate_ensured_index(index_name)
 
     async def export_entities(
         self,
@@ -2838,5 +3309,4 @@ class AssetElasticsearchDriver(
             identifiers={"index": index_name, "prefix": prefix, "catalog_id": catalog_id},
             display_label=index_name,
         )
-
 

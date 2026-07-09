@@ -105,13 +105,17 @@ class _FakeCatalogs:
         )
 
 
-def _wire(monkeypatch, svc, catalogs):
+def _wire(monkeypatch, svc, catalogs, config_calls=None):
     async def _get_catalogs():
         return catalogs
 
     async def _get_configs():
         class _Cfg:
-            async def get_config(self, cls, catalog_id=None, ctx=None):
+            async def get_config(self, cls, catalog_id=None, collection_id=None, ctx=None):
+                if config_calls is not None:
+                    config_calls.append(
+                        {"catalog_id": catalog_id, "collection_id": collection_id}
+                    )
                 # cache_on_demand defaults False → no storage cache path
                 return FeaturesPluginConfig()
 
@@ -248,6 +252,50 @@ async def test_get_items_threads_cql_filter_into_query_request(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_items_over_max_limit_clamps_instead_of_erroring(monkeypatch):
+    """OGC API - Features Part 1 Core /req/core/fc-limit-response-1: a
+    ``limit`` above the configured maximum (1000 by default) is clamped, not
+    rejected. The handler itself never sees a value above 1000 (FastAPI's
+    ``le=`` gate — removed — used to 422 here instead)."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    _wire(monkeypatch, svc, catalogs)
+
+    resp = await _call_get_items(svc, limit=5000, offset=0)
+    assert resp.status_code == 200
+
+    req = catalogs.stream_kwargs["request"]
+    assert req.limit == 1000
+
+
+@pytest.mark.asyncio
+async def test_get_items_omitted_limit_uses_configured_default(monkeypatch):
+    """``limit=None`` (query param omitted) falls back to the configured
+    default (10), not an unbounded scan."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    _wire(monkeypatch, svc, catalogs)
+
+    await _call_get_items(svc, limit=None, offset=0)
+
+    req = catalogs.stream_kwargs["request"]
+    assert req.limit == 10
+
+
+@pytest.mark.asyncio
+async def test_get_items_in_range_limit_is_unchanged(monkeypatch):
+    """Existing in-range behaviour is preserved."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    _wire(monkeypatch, svc, catalogs)
+
+    await _call_get_items(svc, limit=250, offset=0)
+
+    req = catalogs.stream_kwargs["request"]
+    assert req.limit == 250
+
+
+@pytest.mark.asyncio
 async def test_get_items_serves_non_4326_crs_via_items_protocol(monkeypatch):
     """A non-4326 output CRS reprojection is a PG-capable path; the listing
     still streams through the items protocol (the router/driver handles the
@@ -268,3 +316,19 @@ async def test_get_items_serves_non_4326_crs_via_items_protocol(monkeypatch):
 
     assert [f["id"] for f in body["features"]] == ["pg-1"]
     assert catalogs.stream_called is True
+
+
+@pytest.mark.asyncio
+async def test_get_items_threads_collection_id_into_plugin_config_lookup(monkeypatch):
+    """#2717: a collection-scoped ``FeaturesPluginConfig`` override (e.g. a
+    tighter ``default_limit``/``max_limit``) must actually be consulted — the
+    lookup has to carry ``collection_id``, not just ``catalog_id``, mirroring
+    the STAC ``_get_stac_config`` reference pattern."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    config_calls: list = []
+    _wire(monkeypatch, svc, catalogs, config_calls=config_calls)
+
+    await _call_get_items(svc, catalog_id="cat", collection_id="col")
+
+    assert config_calls == [{"catalog_id": "cat", "collection_id": "col"}]

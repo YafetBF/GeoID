@@ -53,6 +53,40 @@ def _logger() -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+def _make_pool_reset_hook(pool_label: str) -> Any:
+    """Build an ``asyncpg.create_pool(reset=...)`` callback for ``pool_label``.
+
+    A raw asyncpg connection whose protocol state was left corrupted by a
+    cancelled operation (asyncio task cancellation, CPU-throttling storm)
+    fails its release-time reset query with the same shape SQLAlchemy sees
+    on its pooled connections (``InternalClientError: cannot switch to
+    state N``). ``PoolConnectionHolder.release()`` already terminates the
+    connection instead of returning it whenever the reset call raises — see
+    asyncpg's ``pool.py`` — but does so silently. Supplying a custom
+    ``reset`` callback replaces asyncpg's default reset entirely, so this
+    still issues the same reset query asyncpg would run by default
+    (``Connection.get_reset_query()``); the only addition is the structured
+    WARN logged before the exception propagates and the connection is
+    discarded.
+    """
+
+    async def _reset(conn: Any) -> None:
+        reset_query = conn.get_reset_query()
+        try:
+            if reset_query:
+                await conn.execute(reset_query)
+        except Exception as exc:
+            _logger().warning(
+                "raw_pool_connection_discarded pool=%s reason=%s: %s",
+                pool_label,
+                type(exc).__name__,
+                str(exc)[:120],
+            )
+            raise
+
+    return _reset
+
+
 class EngineLifecycleConfig(BaseModel):
     """Lifecycle policy attached to a platform engine.
 
@@ -186,6 +220,18 @@ class EngineConfig(PluginConfig):
         ),
     )
 
+    def connection_budget_units(self) -> int:
+        """Connections this engine's runtime instance holds against
+        ``EngineInstanceCache``'s fleet-wide connection budget (#2963).
+
+        Base default is 0 — an engine kind that opens no real database
+        connections (e.g. an Elasticsearch client) never competes for the
+        budget. Override in engine kinds whose ``engine_init()`` actually
+        opens connections against the shared, connection-limited database
+        this budget protects (currently only PostgreSQL).
+        """
+        return 0
+
 
 class PostgresqlEngineConfig(EngineConfig):
     """PostgreSQL connection pool — backs every PG-driver class.
@@ -228,6 +274,13 @@ class PostgresqlEngineConfig(EngineConfig):
         ),
     )
 
+    def connection_budget_units(self) -> int:
+        """This engine's ``pool_size`` — the real connections
+        ``engine_init()`` opens against the shared database, and so the
+        cost this engine charges against ``EngineInstanceCache``'s
+        fleet-wide budget (#2963)."""
+        return self.pool_size
+
     async def engine_init(self) -> Any:
         """Build a dedicated ``asyncpg.Pool`` for this engine.
 
@@ -236,21 +289,66 @@ class PostgresqlEngineConfig(EngineConfig):
         accepts libpq-flavoured DSNs only, so the SQLAlchemy
         ``postgresql+asyncpg://`` prefix is normalised to ``postgresql://``
         — matches the strip already done in the outbox-pool helper.
+
+        Every connection carries the same lock-safety + clamped
+        statement_timeout ``server_settings`` as the shared serving engine
+        (``modules/db/db_service.py``, #2906) — without them a per-catalog
+        engine has zero server-side timeouts, so a stuck query or a leaked
+        transaction can hold a connection (and its locks) indefinitely
+        (#2898).
         """
         import asyncpg  # local import: keeps F.1 import light
 
         from dynastore.modules.db_config.db_config import DBConfig
+        from dynastore.modules.db_config.db_timeout_config import (
+            build_connection_server_settings,
+            clamp_serving_statement_timeout,
+            resolve_timeout_settings,
+        )
+        from dynastore.modules.db_config.instance import get_stamped_application_name
 
         if self.connection_url is not None:
             dsn = self.connection_url.reveal()
         else:
             dsn = DBConfig.database_url
         dsn = dsn.replace("postgresql+asyncpg://", "postgresql://")
+
+        lock_timeout, statement_timeout, idle_in_transaction_session_timeout = (
+            resolve_timeout_settings(DBConfig)
+        )
+        statement_timeout = clamp_serving_statement_timeout(
+            statement_timeout, DBConfig.serving_statement_timeout_ceiling_seconds
+        )
+        # geoid#2924: stamp service + per-process instance id so a
+        # monitoring/reaper query can recognize this pool's connections and
+        # tell dead-instance sessions from live ones. Mode-aware (#3081):
+        # behind a transaction pooler this returns application_name only, so
+        # the per-catalog pool CONNECTS instead of being rejected on the
+        # lock-safety/keepalive startup params. NOTE: this raw asyncpg pool has
+        # no SQLAlchemy begin-listener, so in pooler mode it does not yet
+        # re-apply the lock-safety timeouts per transaction the way the serving
+        # and task engines do — per-catalog per-transaction re-enforcement is a
+        # scoped #3081 follow-up; until then a pooled per-catalog connection
+        # relies on the pooler/server-side limits for those bounds.
+        server_settings = build_connection_server_settings(
+            DBConfig,
+            application_name=get_stamped_application_name(),
+            lock_timeout=lock_timeout,
+            idle_in_transaction_session_timeout=idle_in_transaction_session_timeout,
+            statement_timeout=statement_timeout,
+        )
         return await asyncpg.create_pool(
             dsn=dsn,
             min_size=1,
             max_size=self.pool_size,
             timeout=self.pool_timeout_sec,
+            statement_cache_size=0,
+            server_settings=server_settings,
+            # Discard (rather than recycle) a connection whose protocol
+            # state was corrupted by a cancelled operation — this pool has
+            # no SQLAlchemy layer, so it needs its own release-time guard
+            # (#2900).
+            reset=_make_pool_reset_hook(self.__class__.class_key()),
         )
 
     async def engine_release(self, instance: Any) -> None:
@@ -368,18 +466,61 @@ class DuckdbEngineConfig(EngineConfig):
     default lifecycle suggests ``ttl_lru`` for idle eviction in
     long-running deployments.  Operators tune ``pool_size`` to the
     available cores; ``max_memory_gb`` caps the per-process heap.
+
+    ``pool_size`` is the SSOT for ``ItemsDuckdbDriver``'s bounded
+    connection pool (a ``queue.Queue`` of pre-warmed ``duckdb.connect()``
+    in-process wires, see ``drivers/duckdb.py``).  The driver reads it from
+    the central cached config getter at its ``lifespan()`` startup, and
+    from then on re-checks it live on a throttled cadence (at most once
+    every 30s, see ``_maybe_resize_pool`` in ``drivers/duckdb.py``) at the
+    driver's async choke point every read/write/delete/ensure_storage path
+    already passes through. A raise grows the pool immediately; a lower
+    value shrinks it lazily — surplus connections are only retired as they
+    are returned, never yanked out from under a caller — so a config change
+    takes effect within roughly one throttle window, not on the next pod
+    restart. It used to be the env var ``DUCKDB_POOL_SIZE`` (fixed at
+    process boot); moved here so operators change it via the configs API.
+
+    An optional scaling actuator (``ScalingPolicyConfig.duckdb_pool_autosize``,
+    default off — see ``modules/scaling/config.py``) may also bump this
+    value itself: when the reconciler sees the pool saturated but the fleet
+    compute-idle (the same condition that otherwise just holds
+    ``min_instances``), it writes a bounded, cooled-down step up to this
+    field at platform scope instead.
+
+    Each pooled connection is a genuine in-memory DuckDB process with its
+    own thread/memory budget (``threads``, ``max_memory_gb``) — but it
+    never opens a PostgreSQL connection, so this pool is independent of,
+    and does NOT consume, the shared Postgres connection budget modeled by
+    ``ScalingPolicyConfig`` (``modules/scaling/config.py``). Its ceiling is
+    CPU (threads × pool_size vs. available vCPU) and memory
+    (max_memory_gb × pool_size vs. available RAM) on the instance, not DB
+    connections. Default raised 4 -> 8 (2026-07) to give DuckDB-routed
+    analytical reads more concurrency headroom; this is a secondary,
+    optional lever for that read path only — verify the instance's CPU/
+    memory allocation can absorb 8 × threads / 8 × max_memory_gb before
+    raising further.
     """
 
     engine_class: ClassVar[str] = "duckdb_engine"
     _address: ClassVar[Tuple[str, ...]] = ("platform", "protocols", "storage")
 
     pool_size: Mutable[int] = Field(
-        default=4,
+        default=8,
         ge=1,
         le=64,
         description=(
-            "Number of DuckDB processes in the pool.  Tune to available "
-            "cores × workload concurrency."
+            "Number of DuckDB connections in the pool.  Tune to available "
+            "cores × workload concurrency.  Read at driver startup and "
+            "re-checked live thereafter on a throttled cadence (at most "
+            "every 30s) — grows immediately, shrinks lazily as borrowed "
+            "connections are returned, so a change takes effect within "
+            "roughly one throttle window, not on the next pod restart.  "
+            "May also be bumped by the optional scaling actuator "
+            "(``ScalingPolicyConfig.duckdb_pool_autosize``, default off).  "
+            "CPU/memory-bound only — does not consume PostgreSQL "
+            "connections, so it is NOT part of ``ScalingPolicyConfig``'s "
+            "connection budget."
         ),
     )
 
@@ -716,6 +857,49 @@ class ValkeyEngineConfig(EngineConfig):
         ),
     )
 
+    health_check_interval_seconds: Mutable[int] = Field(
+        default=30,
+        ge=0,
+        le=300,
+        description=(
+            "Seconds between proactive PINGs of an otherwise-idle Valkey "
+            "connection. Catches a socket dead-on-arrival (stale pooled "
+            "connection) before the next real command hits it, rather than "
+            "that command failing outright and feeding the cache's "
+            "consecutive-failure circuit breaker. ``0`` disables the check "
+            "(valkey-py default)."
+        ),
+    )
+
+    retry_attempts: Mutable[int] = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description=(
+            "Bounded retry count (exponential backoff) for connection-class "
+            "errors only — a stale pooled socket surfaces as an immediate "
+            "``ConnectionError``/``TimeoutError``, and without a retry a "
+            "single bad connection trips the circuit breaker instead of "
+            "self-healing on the next attempt. Application-level errors "
+            "(bad command, cluster ``MOVED``, etc.) are never retried. "
+            "``0`` disables retries (valkey-py default)."
+        ),
+    )
+
+    max_connections: Mutable[int] = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description=(
+            "Cap on concurrent Valkey connections for this engine's client — "
+            "applied to both the standalone ``ConnectionPool`` and the "
+            "cluster client's per-node pools. valkey-py otherwise defaults "
+            "``max_connections`` to ``2**31`` (effectively unbounded), so a "
+            "request burst can open one connection per in-flight command "
+            "per instance."
+        ),
+    )
+
     async def engine_init(self) -> Any:
         """Build a Valkey async client from the current config snapshot.
 
@@ -755,6 +939,9 @@ class ValkeyEngineConfig(EngineConfig):
             tcp_keepalive_idle=self.tcp_keepalive_idle_seconds,
             tcp_keepalive_interval=self.tcp_keepalive_interval_seconds,
             tcp_keepalive_count=self.tcp_keepalive_count,
+            health_check_interval=self.health_check_interval_seconds,
+            retry_attempts=self.retry_attempts,
+            max_connections=self.max_connections,
         )
         # Stash the pool on the client so engine_release can close both.
         # ValkeyCluster owns its pools internally so _pool is None there.

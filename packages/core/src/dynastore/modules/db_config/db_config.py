@@ -51,6 +51,18 @@ _FILE_VALUES: Mapping[str, Any] = load_db_config()
 # for no concurrency benefit. So we trust the operator's small ``pool_min_size``
 # and floor it only at 1 — a pool needs at least one connection; everything
 # above that is a deployment choice. Burst safety is the total floor's job.
+#
+# This is also the idle-cost lever (#2333): keep ``pool_min_size`` near this
+# floor (1-2) and size ``pool_max_size`` for burst instead. SQLAlchemy's
+# QueuePool already grows and shrinks around that small base on its own —
+# overflow connections (anything above ``pool_size``) are opened on demand
+# under load and CLOSED on check-in once the base is full again, rather than
+# kept warm. So a small base + generous ``max_overflow`` is not just cheaper
+# at idle, it is the mechanism that returns the pool to its cheap baseline
+# automatically once load clears — no separate "shrink" actuator needed. The
+# instance-count floor (``modules/scaling``) is the other half of that
+# picture and must ratchet down just as promptly — see
+# ``ScalingPolicyConfig.scale_in_cooldown_seconds`` / ``scale_in_step``.
 SAFE_POOL_MIN_FLOOR: int = 1
 
 # Smallest total pool capacity (``pool_size + max_overflow``) we consider safe
@@ -260,6 +272,11 @@ class DBConfig:
     #     never runs ROLLBACK — the exact failure mode that pinned
     #     catalog.catalogs behind an idle-in-transaction reader while an
     #     ALTER waited on it. A DDL therefore can never leave a lock open.
+    #
+    #     Under burst load, connections can accumulate in idle_in_txn state
+    #     if transactions span external calls (GCS/ES/Cloud Run API). A 10s
+    #     default surfaces issues quickly in dev/staging while allowing
+    #     production to tune higher via the configs API or env var.
     #   * statement_timeout — bounds total EXECUTION time of any single
     #     statement (distinct from lock_timeout, which only bounds the WAIT to
     #     acquire a lock). Disabled by default ("0") to preserve historical
@@ -275,10 +292,24 @@ class DBConfig:
     #     DDL, maintenance jobs) already scope their own budget via SET LOCAL
     #     statement_timeout, which overrides this session default within their
     #     transaction, so a session-wide value is safe to enable.
+    #
+    # These are genuine infra dimensioning values. Configure them via env var
+    # (or db_config.json) before startup; they are resolved once at import time.
     lock_timeout: str = _cfg_str("DB_LOCK_TIMEOUT", "5s")
     statement_timeout: str = _cfg_str("DB_STATEMENT_TIMEOUT", "0")
     idle_in_transaction_session_timeout: str = _cfg_str(
-        "DB_IDLE_IN_TRANSACTION_TIMEOUT", "30s"
+        "DB_IDLE_IN_TRANSACTION_TIMEOUT", "10s"
+    )
+    # Task-side counterpart of idle_in_transaction_session_timeout above,
+    # applied only to the ad-hoc engines task/job code builds for itself
+    # (see task_engine_connect_args in db_timeout_config.py). Those engines
+    # routinely interleave a PG transaction with slow secondary-store I/O
+    # (ES bulk writes during reindex/drain); the 10s serving-tier budget
+    # kills them mid-write (#2837 regression). Still bounded — well short of
+    # unbounded — so a genuinely frozen task can't hold locks forever, which
+    # was the #2832 goal.
+    task_idle_in_transaction_session_timeout: str = _cfg_str(
+        "DB_TASK_IDLE_IN_TRANSACTION_TIMEOUT", "300s"
     )
     # How long SQLAlchemy's QueuePool will wait for a free connection before
     # raising ``sqlalchemy.exc.TimeoutError`` (fail-fast, not wedge).
@@ -297,6 +328,41 @@ class DBConfig:
     #   DB_POOL_ACQUIRE_TIMEOUT=10  # review / staging — fail very fast
     #   DB_POOL_ACQUIRE_TIMEOUT=30  # production default
     pool_acquire_timeout: int = _cfg_int("DB_POOL_ACQUIRE_TIMEOUT", 30)
+    # Ceiling (seconds) the shared SERVING engine's effective statement_timeout
+    # is clamped to, regardless of what DB_STATEMENT_TIMEOUT resolves to
+    # (see clamp_serving_statement_timeout in db_timeout_config.py). Exists
+    # because DB_STATEMENT_TIMEOUT is disabled ("0") in dev and set to "90s"
+    # in production -- both above the 60s load-balancer/Cloud Run deadline, so
+    # a stuck interactive query holds its connection to that ceiling instead
+    # of being cancelled and reclaimed server-side (#2898). 55s sits below the
+    # 60s LB timeout and at/under pool_command_timeout. Task-side engines are
+    # unaffected -- they never apply statement_timeout at all.
+    serving_statement_timeout_ceiling_seconds: int = _cfg_int(
+        "DB_SERVING_STATEMENT_TIMEOUT_CEILING", 55
+    )
+    # Connection pooling mode (#3081). Governs how the lock-safety GUCs and TCP
+    # keepalives above reach PostgreSQL.
+    #   * "direct" (default) — a direct PostgreSQL/AlloyDB backend (e.g. :5432,
+    #     on-prem or a raw AlloyDB instance). Every lock-safety GUC and TCP
+    #     keepalive is sent as an asyncpg startup ``server_settings`` parameter,
+    #     exactly as before. Nothing changes for existing/on-prem deployments.
+    #   * "transaction_pooler" — a transaction-mode connection pooler (AlloyDB
+    #     Managed Connection Pooling / PgBouncer, e.g. :6432). Such poolers only
+    #     forward an allowlist of startup parameters and abort the connection on
+    #     the first unrecognized one, so ONLY ``application_name`` is sent at
+    #     startup; the lock/statement/idle timeouts are re-applied per
+    #     transaction via ``SET LOCAL`` and the backend TCP keepalives are
+    #     dropped (the pooler owns the backend socket — the client→pooler socket
+    #     keepalives are still armed client-side). Set this on the deployed
+    #     dev/review/prod services whose DATABASE_URL points at the pooler port.
+    db_pooling_mode: str = _cfg_str("DB_POOLING_MODE", "direct")
+    # Optional direct PostgreSQL/AlloyDB DSN used only by the long-lived
+    # LISTEN/NOTIFY bridge. Transaction-mode poolers do not preserve LISTEN
+    # session state across transactions, so deployments whose DATABASE_URL
+    # points at a transaction pooler should set this to a direct backend URL if
+    # sub-second cross-pod wakeups are required. When unset, the bridge falls
+    # back to its health-beat polling path instead of using the pooler.
+    listen_database_url: str = _cfg_str("DB_LISTEN_DATABASE_URL", "")
 
     def validate_pool_sizing(self) -> None:
         """Make a dangerously-small pool LOUD and SAFE at startup.

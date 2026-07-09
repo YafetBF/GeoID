@@ -21,11 +21,14 @@ Catalog-related protocol definitions.
 """
 
 from typing import (
+    FrozenSet,
     Protocol,
     Optional,
     Any,
+    Iterable,
     List,
     Dict,
+    Tuple,
     Union,
     Set,
     runtime_checkable,
@@ -104,6 +107,34 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         """
         ...
 
+    async def resolve_catalog_id(
+        self,
+        external_id: str,
+        allow_missing: bool = False,
+    ) -> Optional[str]:
+        """
+        Resolves a public ``external_id`` to the immutable internal catalog id.
+
+        Returns ``None`` when no live catalog carries that ``external_id``;
+        with ``allow_missing=False`` callers treat that as not-found.
+        """
+        ...
+
+    async def resolve_catalog_external_id(
+        self,
+        internal_id: str,
+        allow_missing: bool = True,
+    ) -> Optional[str]:
+        """
+        Resolves a catalog's immutable internal ``id`` to its public ``external_id``.
+
+        Used by read paths that stored/echoed an internal id to project it
+        back to the client-visible label.  Returns ``None`` (default) or
+        raises ``ValueError`` when the catalog is not found, depending on
+        ``allow_missing``.
+        """
+        ...
+
     async def ensure_catalog_exists(
         self, catalog_id: str, lang: str = "en", ctx: Optional["DriverContext"] = None,
     ) ->None:
@@ -143,16 +174,25 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
     # façade to coerce dict rows into Feature models at the boundary.
 
     async def get_catalog(
-        self, catalog_id: str, lang: str = "en", ctx: Optional["DriverContext"] = None,
-    ) ->"Catalog":
+        self,
+        catalog_id: str,
+        lang: str = "en",
+        ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
+    ) -> "Catalog":
         """
         Retrieves the catalog metadata model for a specific language.
         """
         ...
 
     async def get_catalog_model(
-        self, catalog_id: str, ctx: Optional["DriverContext"] = None,
-    ) ->Optional["Catalog"]:
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+        *,
+        hints: FrozenSet[Any] = frozenset(),
+    ) -> Optional["Catalog"]:
         """
         Retrieves the raw catalog model (often cached).
         """
@@ -163,9 +203,15 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         catalog_data: Union[Dict[str, Any], "Catalog"],
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        hints: FrozenSet[Any] = frozenset(),
     ) -> "Catalog":
         """
         Creates a new catalog.
+
+        ``hints`` carries the request's ``?hints=`` set; ``Hint.DEFER``
+        defers the storage-backend (GCP) provisioners past creation so the
+        catalog is created core-only and provisioned later via an explicit
+        ``catalog_provision`` task.
         """
         ...
 
@@ -186,6 +232,20 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
     ) ->bool:
         """
         Deletes a catalog and its associated resources.
+        """
+        ...
+
+    async def get_hard_delete_task(
+        self, catalog_id: str,
+    ) -> Optional[Any]:
+        """
+        Look up the in-flight ``catalog_provision`` deprovision task a prior
+        ``delete_catalog(force=True)`` call enqueued for ``catalog_id``.
+
+        Resolves both live and just-tombstoned rows so a caller polling right
+        after the DELETE request still gets a hit. Returns ``None`` when
+        nothing is in flight (no hard delete was ever enqueued, or it has
+        already reached a terminal state).
         """
         ...
 
@@ -234,6 +294,44 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         """
         ...
 
+    async def get_provisioning_checklist(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Dict[str, str]:
+        """Return the raw provisioning checklist for a catalog from PG.
+
+        Reads ``catalog.catalogs.provisioning_checklist`` directly (no model
+        cache, no FOR UPDATE lock — this is a pure read).  Returns an empty
+        dict when the row is missing or the column is NULL.  The JSONB value
+        may arrive as a ``str`` or a ``dict`` depending on the asyncpg
+        type-codec configuration; both forms are handled.
+        """
+        ...
+
+    async def reset_checklist_for_reprovision(
+        self,
+        catalog_id: str,
+        *,
+        force: bool = False,
+        ensure_keys: Optional[Iterable[str]] = None,
+        include_deferred: bool = False,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Dict[str, str]:
+        """Reset the checklist for a reprovision and set status='provisioning' (#2395).
+
+        With ``force=False`` every step that is not already ``complete`` /
+        ``skipped`` is reset to ``pending`` (re-run only what failed); with
+        ``force=True`` every step is reset (full replay). ``deferred`` steps
+        (un-fao/GeoID#2678) are always left alone unless ``include_deferred=
+        True`` explicitly opts them back into ``pending`` — ``force`` alone
+        never resurrects a held-back provisioner. ``ensure_keys`` adds any
+        provisioner key not already in the checklist as ``pending`` (folds in
+        previously-deferred steps on an explicit provision run). Returns
+        the new checklist, or ``{}`` when there is no checklist to reprovision.
+        """
+        ...
+
     async def get_catalog_config(
         self, catalog_id: str, ctx: Optional["DriverContext"] = None,
     ) ->Any:
@@ -268,6 +366,7 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
         ids: Optional[Set[str]] = None,
+        include_unready: bool = False,
     ) -> List["Catalog"]:
         """
         Lists all catalogs.
@@ -275,5 +374,48 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         ``ids`` — restrict results to these catalog ids; applied before
         pagination so that LIMIT/OFFSET are consistent with the filtered
         result set.  ``None`` means no restriction (all catalogs).
+
+        ``include_unready`` — when ``False`` (default) catalogs that have
+        never reached ``ready`` are excluded (#2676). Reserved for internal/
+        administrative callers; every public listing/search path leaves this
+        at the default.
         """
         ...
+
+    # === Rename / Alias Operations ===
+
+    async def rename_catalog(
+        self,
+        internal_id: str,
+        new_external_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Tuple[str, str]:
+        """Rename a catalog's public label (external_id) without touching storage.
+
+        Returns ``(prev_external_id, new_external_id)``.
+
+        Raises:
+            CatalogRenameConflictError: if another live catalog already holds
+                ``external_id = new_external_id``.
+            ValueError: if no live catalog row exists for ``internal_id``.
+        """
+        ...
+
+    async def rename_collection(
+        self,
+        catalog_internal_id: str,
+        collection_internal_id: str,
+        new_external_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> Tuple[str, str]:
+        """Rename a collection's public label (external_id) within a catalog.
+
+        Returns ``(prev_external_id, new_external_id)``.
+
+        Raises:
+            CollectionRenameConflictError: if another live collection in the
+                same catalog already holds ``external_id = new_external_id``.
+            ValueError: if no live collection row exists for the given internal ids.
+        """
+        ...
+

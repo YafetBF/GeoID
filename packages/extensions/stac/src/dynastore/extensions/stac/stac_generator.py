@@ -20,9 +20,8 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Optional, Union, cast
-from dynastore.models.shared_models import Feature
-from dynastore.models.ogc import Feature as OGCFeature
+from typing import Any, Dict, FrozenSet, List, Optional, cast
+from dynastore.models.ogc import Feature
 
 import pystac
 from fastapi import HTTPException, Request, status
@@ -41,24 +40,94 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import Geom
 from dynastore.modules.stac.stac_config import (
     StacPluginConfig,
     HierarchyStrategy,
+    DatacubeDimension,
+    OGC_DIMENSIONS_PAGINATION_URI,
 )
 from dynastore.tools.language_utils import resolve_localized_field
 from dynastore.extensions.tools.conformance import get_active_conformance
 from dynastore.models.localization import (
     get_language_object,
 )
+from . import stac_db, asset_factory
 from .stac_models import stac_localize
 from dynastore.tools.discovery import get_protocol
 from .metadata_helpers import merge_stac_metadata
 
 logger = logging.getLogger(__name__)
 
-from . import stac_db, asset_factory
-
 SUPPORTED_STAC_EXTENSIONS = [
     "https://stac-extensions.github.io/datacube/v2.3.0/schema.json",
     "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
 ]
+
+
+def _cube_dimensions_extension_uris(
+    cube_dimensions: Dict[str, DatacubeDimension],
+) -> List[str]:
+    """STAC extension URIs to declare for a set of ``cube:dimensions`` (#2985).
+
+    Always the ratified datacube v2.3.0 URI. If any dimension carries
+    DynaStore's pagination fields (``size``/``href``/``generator`` — not part
+    of the ratified v2.3.0 schema), also declare the OGC Dimensions
+    pagination URI so those extras aren't presented as if they were part of
+    the standard datacube conformance claim.
+    """
+    uris = [SUPPORTED_STAC_EXTENSIONS[0]]
+    if any(
+        dim.size is not None or dim.href is not None or dim.generator is not None
+        for dim in cube_dimensions.values()
+    ):
+        uris.append(OGC_DIMENSIONS_PAGINATION_URI)
+    return uris
+
+
+def _public_id(model: Any) -> str:
+    """Return the public (external) identifier for a Catalog or Collection model.
+
+    Prefers ``external_id`` (the renamable public label) over ``id`` (the
+    immutable internal token) so every URL built by this generator uses the
+    value clients send in requests, not an opaque storage key.
+    """
+    return getattr(model, "external_id", None) or model.id
+
+
+async def _resolve_public_catalog_id(catalog_id: str) -> str:
+    """Project ``catalog_id`` to its public external id when it is shaped like
+    an internal storage id (``c_{13 base32}``); otherwise return it unchanged.
+
+    A path param is already external in the common case (no lookup needed).
+    A stored/legacy internal id is projected internal → external via
+    ``resolve_catalog_external_id``. Fails open to the input value when
+    ``CatalogsProtocol`` is unavailable or the id cannot be resolved, so a
+    read never 500s over an id-space mismatch (#2354 read-path leak).
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    if not is_internal_physical_name(catalog_id, "c"):
+        return catalog_id
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc is None:
+        return catalog_id
+    resolved = await catalogs_svc.resolve_catalog_external_id(catalog_id, allow_missing=True)
+    return resolved or catalog_id
+
+
+async def _resolve_public_collection_id(catalog_id: str, collection_id: str) -> str:
+    """Project ``collection_id`` to its public external id when it is shaped
+    like an internal storage id (``col_{13 base32}``); otherwise return it
+    unchanged.  Mirrors ``_resolve_public_catalog_id``; see its docstring.
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    if not is_internal_physical_name(collection_id, "col"):
+        return collection_id
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc is None:
+        return collection_id
+    resolved = await catalogs_svc.collections.resolve_collection_external_id(
+        catalog_id, collection_id, allow_missing=True
+    )
+    return resolved or collection_id
 
 
 def _apply_extra_metadata_fallbacks(
@@ -101,6 +170,35 @@ def _apply_extra_metadata_fallbacks(
                 collection.summaries = pystac.Summaries(merged_summaries)
     else:
         collection.extra_fields.pop("summaries", None)
+
+    extra_assets = collection.extra_fields.pop("assets", None)
+    if not collection.assets and extra_assets and isinstance(extra_assets, dict):
+        collection.assets = {
+            asset_id: (
+                pystac.Asset(
+                    href=asset_data.get("href", ""),
+                    title=asset_data.get("title"),
+                    description=asset_data.get("description"),
+                    media_type=asset_data.get("type"),
+                    roles=asset_data.get("roles"),
+                    extra_fields={
+                        k: v for k, v in asset_data.items()
+                        if k not in {"href", "title", "description", "type", "roles"}
+                    },
+                )
+                if isinstance(asset_data, dict)
+                else asset_data
+            )
+            for asset_id, asset_data in extra_assets.items()
+        }
+
+    extra_item_assets = collection.extra_fields.pop("item_assets", None)
+    if extra_item_assets and isinstance(extra_item_assets, dict):
+        if "item_assets" not in collection.extra_fields:
+            collection.extra_fields["item_assets"] = extra_item_assets
+        item_assets_uri = "https://stac-extensions.github.io/item-assets/v1.0.0/schema.json"
+        if item_assets_uri not in collection.stac_extensions:
+            collection.stac_extensions.append(item_assets_uri)
 
 
 def _parse_dt(value: Optional[Any]) -> Optional[datetime]:
@@ -300,7 +398,7 @@ async def create_root_catalog(request: Request, lang: str = "en") -> Dict[str, A
     all_catalogs = await cast(CatalogsProtocol, catalogs_svc).list_catalogs(lang=lang, limit=1000)
     for cat in all_catalogs:
         # Localize catalog summary for the link title
-        catalog_id = cat.id
+        catalog_id = _public_id(cat)
         child_href = f"{base_url}/catalogs/{catalog_id}"
         root_catalog.add_link(
             pystac.Link(
@@ -323,11 +421,13 @@ def create_catalog_summary(
     # Localize metadata
     meta_dict, available_langs = stac_localize(catalog_model, lang)
 
+    _cat_public_id = _public_id(catalog_model)
+
     catalog = pystac.Catalog(
-        id=catalog_model.id,
+        id=_cat_public_id,
         description=meta_dict.get("description")
-        or f"STAC Catalog for the '{catalog_model.id}' database schema.",
-        title=meta_dict.get("title") or f"Catalog: {catalog_model.id}",
+        or f"STAC Catalog for the '{_cat_public_id}' database schema.",
+        title=meta_dict.get("title") or f"Catalog: {_cat_public_id}",
     )
 
     # The StacContributor registry declares the language extension (URI +
@@ -337,7 +437,7 @@ def create_catalog_summary(
     asset_factory.apply_stac_contributions(
         catalog,
         ResourceRef(
-            catalog_id=catalog_model.id,
+            catalog_id=_cat_public_id,
             collection_id="",
             lang=lang,
             extras={"available_languages": set(available_langs or [])},
@@ -358,7 +458,7 @@ def create_catalog_summary(
 
     # Set Links
     # Self link needs to point to the specific catalog endpoint
-    self_href = f"{get_root_url(request)}/stac/catalogs/{catalog_model.id}"
+    self_href = f"{get_root_url(request)}/stac/catalogs/{_cat_public_id}"
     catalog.add_link(
         pystac.Link(rel="self", target=self_href, media_type="application/json")
     )
@@ -384,14 +484,19 @@ def create_catalog_summary(
 
 
 async def create_catalog(
-    request: Request, catalog_id: str, lang: str = "en"
+    request: Request,
+    catalog_id: str,
+    lang: str = "en",
+    hints: FrozenSet = frozenset(),
 ) -> Dict[str, Any]:
     """Generates a STAC Catalog for a specific catalog ID."""
     base_url = get_url(request)
     catalogs_svc = get_protocol(CatalogsProtocol)
     if not catalogs_svc:
         raise RuntimeError("CatalogsProtocol not available")
-    catalog_metadata_model = await cast(CatalogsProtocol, catalogs_svc).get_catalog_model(catalog_id)
+    catalog_metadata_model = await cast(CatalogsProtocol, catalogs_svc).get_catalog_model(
+        catalog_id, hints=hints,
+    )
     if not catalog_metadata_model:
         return {}
 
@@ -425,6 +530,17 @@ async def create_catalog(
         for k, v in extra.items():
             if k not in ["language", "languages"]:
                 catalog.extra_fields[k] = v
+
+    # Surface the deleted_at marker for soft-deleted catalogs. The field lives
+    # on the Catalog model (not in extra_metadata) so it must be copied
+    # explicitly to the pystac extra_fields. Active catalogs have deleted_at=None
+    # (excluded by exclude_none=True in localize()) so this branch is a no-op
+    # for the common case.
+    _deleted_at = meta_dict.get("deleted_at")
+    if _deleted_at is not None:
+        catalog.extra_fields["deleted_at"] = (
+            _deleted_at.isoformat() if hasattr(_deleted_at, "isoformat") else str(_deleted_at)
+        )
 
     # Use dynamic exclusion based on the model's protocol + STAC top level
     stac_top_level = {"stac_version", "stac_extensions", "links", "conformsTo", "id", "title", "description"}
@@ -465,61 +581,35 @@ async def create_catalog(
                 )
             )
 
-    catalogs_svc = get_protocol(CatalogsProtocol)
-    if not catalogs_svc:
-        raise RuntimeError("CatalogsProtocol not available")
-    collections = await cast(CatalogsProtocol, catalogs_svc).list_collections(catalog_id, lang=lang, limit=1000)
-    for coll in collections:
-        # Localize collection summary for the link title
-        collection_id = coll.id
-        collection_href = f"{base_url}/collections/{collection_id}"
-        catalog.add_link(
-            pystac.Link(
-                rel="child",
-                target=collection_href,
-                title=coll.title.resolve(lang) if coll.title else collection_id,
-                media_type="application/json",
-            )
+    # Collection discovery is via the "data" link to the paginated
+    # /collections endpoint (STAC API core / Collection Search), not one
+    # "child" link per collection. Minting a child link per collection used
+    # to require hydrating every collection through the routed READ driver
+    # (a PG existence lookup plus a CollectionStore router fan-out each),
+    # which made this landing page's cost scale with the catalog's
+    # collection count instead of being O(1) — past a couple thousand
+    # collections the request no longer completed before the gateway
+    # timeout (#2865). STAC Browser and other STAC API clients already walk
+    # "data" to page through collections, so dropping the per-collection
+    # links loses no discoverability.
+    catalog.add_link(
+        pystac.Link(
+            rel="data",
+            target=f"{base_url}/collections",
+            media_type="application/json",
+            title="Collections",
         )
+    )
     catalog.set_root(catalog)
     return catalog.to_dict()
 
 
-async def create_collections_catalog(
-    request: Request, catalog_id: str, lang: str = "en"
-) -> Dict[str, Any]:
-    """Generates the collections list for a specific catalog."""
-    catalogs_svc = get_protocol(CatalogsProtocol)
-    if not catalogs_svc:
-        raise RuntimeError("CatalogsProtocol not available")
-    collections = await cast(CatalogsProtocol, catalogs_svc).list_collections(catalog_id, lang=lang, limit=1000)
-
-    stac_collections = []
-    for coll in collections:
-        stac_coll = await create_collection(request, catalog_id, coll.id, lang=lang)
-        if stac_coll:
-            stac_collections.append(stac_coll.to_dict())
-
-    root_url = get_root_url(request)
-    links = [
-        {
-            "rel": "self",
-            "type": "application/json",
-            "href": f"{root_url}/stac/catalogs/{catalog_id}/collections",
-        },
-        {
-            "rel": "parent",
-            "type": "application/json",
-            "href": f"{root_url}/stac/catalogs/{catalog_id}",
-        },
-        {"rel": "root", "type": "application/json", "href": f"{root_url}/stac"},
-    ]
-
-    return {"collections": stac_collections, "links": links}
-
-
 async def create_collection(
-    request: Request, catalog_id: str, collection_id: str, lang: str = "en"
+    request: Request,
+    catalog_id: str,
+    collection_id: str,
+    lang: str = "en",
+    hints: FrozenSet = frozenset(),
 ) -> Optional[pystac.Collection]:
     """Generates a full STAC Collection for a specific database table."""
     catalogs_svc = get_protocol(CatalogsProtocol)
@@ -529,11 +619,20 @@ async def create_collection(
     from dynastore.modules.storage.routing_config import Operation
     driver = await get_driver(Operation.READ, catalog_id, collection_id)
     metadata_model, layer_config = await asyncio.gather(
-        catalogs_svc.get_collection_model(catalog_id, collection_id),  # type: ignore[attr-defined]
+        catalogs_svc.get_collection_model(catalog_id, collection_id, hints=hints),  # type: ignore[attr-defined]
         driver.get_driver_config(catalog_id, collection_id),
     )
     if not metadata_model:
         return None
+
+    # Project catalog_id/collection_id to their public (external) labels once,
+    # for the wire ``id`` and every self/parent/items link built below. The
+    # collection model already carries ``external_id`` from the registry
+    # lookup (_public_id prefers it over the immutable internal ``id``); the
+    # catalog id is resolved separately since no Catalog model is fetched here.
+    # Never echo the raw path param — it may be an internal id (#2354).
+    collection_id = _public_id(metadata_model)
+    catalog_id = await _resolve_public_catalog_id(catalog_id)
 
     # Localize metadata
     meta_dict, available_langs = stac_localize(metadata_model, lang)
@@ -604,8 +703,9 @@ async def create_collection(
             stac_extensions_to_add.append(ext_uri)
     # Add extensions based on config
     if stac_config.cube_dimensions or stac_config.cube_variables:
-        if SUPPORTED_STAC_EXTENSIONS[0] not in stac_extensions_to_add:
-            stac_extensions_to_add.append(SUPPORTED_STAC_EXTENSIONS[0])
+        for cube_uri in _cube_dimensions_extension_uris(stac_config.cube_dimensions):
+            if cube_uri not in stac_extensions_to_add:
+                stac_extensions_to_add.append(cube_uri)
 
     # Cast layer_config components to expected types to handle Immutable wrappers.
     # Sidecars are PG-driver-internal — driver_sidecars() returns [] for any
@@ -795,6 +895,13 @@ async def create_collection(
     internal_cols = metadata_model.get_internal_columns() | stac_top_level
     for internal in internal_cols:
         collection.extra_fields.pop(internal, None)
+    if (
+        "summaries" in _stored_extras
+        and isinstance(_stored_extras.get("summaries"), dict)
+        and not _stored_extras["summaries"]
+        and not merged_summaries
+    ):
+        collection.extra_fields["summaries"] = {}
 
     # Set the root catalog to avoid pystac trying to resolve it via network
     root_catalog = pystac.Catalog(
@@ -1066,13 +1173,25 @@ async def create_item_from_feature(
     request: Request,
     catalog_id: str,
     collection_id: str,
-    feature: Union[Feature, OGCFeature],
+    feature: Feature,
     stac_config: Optional[StacPluginConfig] = None,
     view_mode: str = "standard",
     lang: str = "en",
     collection_url_override: Optional[str] = None,
+    external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Optional[pystac.Item]:
-    """Generates a STAC Item from a mapped Feature."""
+    """Generates a STAC Item from a mapped Feature.
+
+    ``external_catalog_id`` / ``external_collection_id``: the public labels
+    for ``catalog_id`` / ``collection_id``, pre-resolved once by the caller
+    (e.g. ``create_item_collection`` resolves once per page instead of once
+    per item). When omitted (a standalone single-item call) they are
+    resolved here. Every wire member and link below is built from these
+    public ids — ``catalog_id`` / ``collection_id`` may be internal storage
+    ids (a stored/legacy echo or an internal-shaped path param) and must
+    never reach the client (#2354).
+    """
     from dynastore.models.protocols.configs import ConfigsProtocol
 
     # 1. Resolve Configs
@@ -1086,6 +1205,15 @@ async def create_item_from_feature(
 
     if feature is None:
         return None
+
+    if external_catalog_id is None:
+        external_catalog_id = await _resolve_public_catalog_id(catalog_id)
+    if external_collection_id is None:
+        external_collection_id = await _resolve_public_collection_id(
+            catalog_id, collection_id
+        )
+    catalog_id = external_catalog_id
+    collection_id = external_collection_id
 
     # 3. Detect available languages
     available_langs = set()
@@ -1121,7 +1249,7 @@ async def create_item_from_feature(
             _extract_langs_from_dict(feature.model_extra.get("stac_extra_fields", {}))
 
     # 5. Geometry and BBox
-    geometry = feature.geometry.model_dump() if feature.geometry else None
+    geometry = feature.geometry.model_dump(exclude_none=True) if feature.geometry else None
 
     # 6. Datetimes handling
     # Strip GeoJSON/STAC structural members (id, geometry, …) that can ride into
@@ -1149,8 +1277,14 @@ async def create_item_from_feature(
         from .stac_validator import _coerce_for_stac_validation
         properties = _coerce_for_stac_validation(properties, lang=lang)
 
-    item_dt = resolve_item_datetime(properties)
-    if item_dt is None:
+    preserve_null_datetime = (
+        "datetime" in properties
+        and properties.get("datetime") is None
+        and properties.get("start_datetime")
+        and properties.get("end_datetime")
+    )
+    item_dt = None if preserve_null_datetime else resolve_item_datetime(properties)
+    if item_dt is None and not preserve_null_datetime:
         # STAC requires a datetime. A COLUMNAR collection without a validity
         # sink drops the item's datetime on write (#1253), so the echoed row
         # carries no temporal value. Rather than 500 on an invalid item, stamp
@@ -1177,6 +1311,14 @@ async def create_item_from_feature(
         stac_extensions=getattr(feature, "stac_extensions", []),
         extra_fields=getattr(feature, "extra_fields", {}),
     )
+
+    # Restore the source stac_version when one was captured at ingest.  pystac
+    # always writes its own local version in to_dict(); applying the stored value
+    # to extra_fields overrides it because pystac merges extra_fields into the
+    # serialized dict after the version constant.
+    _stored_sv = getattr(feature, "stac_version", None)
+    if _stored_sv and isinstance(_stored_sv, str):
+        item.extra_fields["stac_version"] = _stored_sv
 
     # The StacContributor registry declares the language extension (URI +
     # language/languages) for the item, reusing inject_stac_language_fields.
@@ -1306,6 +1448,19 @@ async def create_item_from_feature(
     )
     await asset_factory.add_dynamic_assets_and_links(item, asset_context)
 
+    # Re-run StacContributor pass now that dynamic assets are attached.
+    # The early call at item construction time carries no item_assets (assets
+    # are populated by add_dynamic_assets_and_links above), so any contributor
+    # that gates its extension URI on item_assets — e.g. WmtsWebMapLinksContributor
+    # — cannot fire then.  This second pass uses a ref built from the fully-
+    # populated item, which includes the just-attached assets.  apply_stac_contributions
+    # is idempotent (it deduplicates URIs and merges fields), so contributors
+    # that already fired (e.g. LanguageStacContributor) produce no duplicates.
+    asset_factory.apply_stac_contributions(
+        item,
+        asset_factory._to_resource_ref(item, asset_context),
+    )
+
     # Hierarchy and source links apply to all feature items.
     apply_hierarchy_links(
         item=item,
@@ -1371,6 +1526,12 @@ async def create_item_collection(
             hints=hints,
         )
 
+    # Resolve the page's public (external) catalog/collection ids ONCE — every
+    # item on this page belongs to the same collection, so a per-item
+    # resolution would be N wasted lookups (#2354 read-path leak fix).
+    public_catalog_id = await _resolve_public_catalog_id(catalog_id)
+    public_collection_id = await _resolve_public_collection_id(catalog_id, collection_id)
+
     stac_items_tasks = [
         create_item_from_feature(
             request,
@@ -1380,6 +1541,8 @@ async def create_item_collection(
             stac_config,
             view_mode=view_mode,
             lang=lang,
+            external_catalog_id=public_catalog_id,
+            external_collection_id=public_collection_id,
         )
         for feature in items_rows
     ]
@@ -1404,11 +1567,26 @@ async def create_item_collection(
         params = {**preserved, "limit": limit, "offset": page_offset}
         return f"{self_href}?{urlencode(params)}"
 
-    collection_dict.setdefault("links", []).append(
+    collection_dict.setdefault("links", [])
+    collection_dict["links"].append(
         {
             "rel": "self",
             "href": _page_href(offset),
             "type": "application/geo+json",
+        }
+    )
+    collection_dict["links"].append(
+        {
+            "rel": "root",
+            "href": f"{get_root_url(request)}/stac",
+            "type": "application/json",
+        }
+    )
+    collection_dict["links"].append(
+        {
+            "rel": "collection",
+            "href": f"{get_root_url(request)}/stac/catalogs/{public_catalog_id}/collections/{public_collection_id}",
+            "type": "application/json",
         }
     )
 
@@ -1475,8 +1653,9 @@ async def create_search_results_collection(
     stac_items_tasks = []
     for feature in features:
         # Cross-collection tracking injected by search.py
-        cid = feature.properties.get("_catalog_id") or ""
-        tid = feature.properties.get("_collection_id") or ""
+        properties = feature.properties or {}
+        cid = properties.get("_catalog_id") or ""
+        tid = properties.get("_collection_id") or ""
 
         stac_items_tasks.append(
             create_item_from_feature(request, cid, tid, feature=feature, stac_config=stac_config, lang=lang)
@@ -1487,22 +1666,44 @@ async def create_search_results_collection(
     item_collection = pystac.ItemCollection(items=[item for item in stac_items if item])
     collection_dict = item_collection.to_dict()
 
-    # Per STAC spec, POST search responses should not have next/prev links
-    # but should provide context for the client to form the next request.
-    # The 'context' object is deprecated in STAC API 1.0.0 for ItemCollection
-    # in favor of numberMatched/numberReturned at the top level.
-    # We will add them here.
     collection_dict["numberMatched"] = total_count
     collection_dict["numberReturned"] = len(stac_items)
 
-    # Add a 'self' link to allow clients to repeat the search
-    # (Note: GET request with parameters would be more standard here)
+    # Add 'self'/'root' links, and — mirroring the OGC Features items response
+    # — a 'next' link while more results remain past this page, so a GET
+    # search response is paginable the same way collection items are.
     self_href = get_url(request)
-    collection_dict.setdefault("links", []).append(
+    links = collection_dict.setdefault("links", [])
+    links.append(
         pystac.Link(
             rel="self", target=self_href, media_type="application/geo+json"
         ).to_dict()
     )
+    links.append(
+        {
+            "rel": "root",
+            "href": f"{get_root_url(request)}/stac",
+            "type": "application/json",
+        }
+    )
+    if (offset + limit) < total_count:
+        from urllib.parse import urlencode
+
+        base_href = get_url(request, remove_qp=True)
+        preserved = {
+            k: v
+            for k, v in request.query_params.items()
+            if k not in ("limit", "offset")
+        }
+        next_params = {**preserved, "limit": limit, "offset": offset + limit}
+        links.append(
+            {
+                "rel": "next",
+                "href": f"{base_href}?{urlencode(next_params)}",
+                "type": "application/geo+json",
+                "title": "Next page",
+            }
+        )
 
     return collection_dict
 

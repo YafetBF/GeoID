@@ -48,6 +48,7 @@ import pytest
 
 pytest.importorskip("opensearchpy")  # optional dep — skip when SCOPE excludes it
 
+from dynastore.modules.elasticsearch.bulk_reindex import ReindexResult
 from dynastore.tasks.elasticsearch_indexer.tasks import (
     BulkCatalogReindexInputs,
     BulkCatalogReindexTask,
@@ -125,6 +126,16 @@ class _FakeReader:
             yield f
 
 
+class _ListWithSkipped(list):
+    """Test double for ``_WrittenWithPresubmitSkips`` (#2826) — mirrors the
+    real ES driver's ``.skipped`` attribute so ``reindex_collection_into_index``
+    can be exercised without depending on the real ES driver internals."""
+
+    def __init__(self, items, skipped):
+        super().__init__(items)
+        self.skipped = skipped
+
+
 class _FakeWriter:
     """Fake CollectionItemsStore implementing write_entities."""
 
@@ -132,15 +143,56 @@ class _FakeWriter:
     preferred_chunk_size: int = 0
     is_item_indexer: bool = True  # marks as secondary-index / ES-like target
 
-    def __init__(self, raise_on_write: Optional[Exception] = None):
+    def __init__(
+        self,
+        raise_on_write: Optional[Exception] = None,
+        fail_calls: int = -1,
+        presubmit_skip_ids: Optional[set] = None,
+        presubmit_missing_id_count: int = 0,
+    ):
+        """``fail_calls``: -1 (default) raises ``raise_on_write`` on every call
+        (matches the pre-#2764 "always fails" contract). A positive N raises
+        only for the first N calls, then succeeds — used to simulate a single
+        rejected sub-chunk followed by recovery.
+
+        ``presubmit_skip_ids``: ids to drop before "submission" (simulating
+        a REFUSE on-conflict pre-submit skip, #2826) — reported on
+        ``.skipped`` as ``(id, "refused_on_conflict")``.
+
+        ``presubmit_missing_id_count``: drop this many leading entities from
+        each call regardless of id (simulating a row with no resolvable id)
+        — reported on ``.skipped`` as ``(None, "missing_id")``.
+        """
         self._raise = raise_on_write
+        self._fail_calls = fail_calls
+        self._call_count = 0
         self.written_batches: list = []
+        self._presubmit_skip_ids = presubmit_skip_ids or set()
+        self._presubmit_missing_id_count = presubmit_missing_id_count
 
     async def write_entities(self, catalog_id, collection_id, entities, **kwargs):
-        if self._raise:
+        self._call_count += 1
+        if self._raise is not None and (
+            self._fail_calls == -1 or self._call_count <= self._fail_calls
+        ):
             raise self._raise
-        self.written_batches.append(list(entities))
-        return list(entities)
+        entities = list(entities)
+        skipped: list = []
+        remaining = entities
+        for _ in range(min(self._presubmit_missing_id_count, len(remaining))):
+            remaining.pop(0)
+            skipped.append((None, "missing_id"))
+        kept = []
+        for e in remaining:
+            eid = e["id"] if isinstance(e, dict) else getattr(e, "id", None)
+            if eid in self._presubmit_skip_ids:
+                skipped.append((eid, "refused_on_conflict"))
+            else:
+                kept.append(e)
+        self.written_batches.append(kept)
+        if skipped:
+            return _ListWithSkipped(kept, skipped)
+        return kept
 
 
 class _FakeResolvedDriver:
@@ -251,9 +303,10 @@ async def test_reindex_reader_is_routing_resolved_not_hardcoded():
                 return_value="dynastore",
             ):
                 from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
-                total = await reindex_collection_into_index("cat1", "col1")
+                result = await reindex_collection_into_index("cat1", "col1")
 
-    assert total == 2
+    assert result.total_written == 2
+    assert result.rejected == 0
     # Reader was called, not a catalogs_proto path.
     assert reader._calls, "read_entities was never called"
     assert reader._calls[0][0] == "cat1"
@@ -333,6 +386,88 @@ async def test_reindex_raises_when_no_secondary_index_writer():
 
 
 # ---------------------------------------------------------------------------
+# Tests: read-page / write-chunk size resolution (#2750)
+# ---------------------------------------------------------------------------
+
+def test_resolve_read_page_explicit_value_wins_over_writer_preference():
+    """An operator-supplied page_size governs verbatim, even when smaller
+    than the writer's preferred_chunk_size — the read page must never be
+    silently overridden upward (the #2750 regression)."""
+    from dynastore.modules.elasticsearch.bulk_reindex import _resolve_read_page
+
+    assert _resolve_read_page(50, 500) == 50
+
+
+def test_resolve_read_page_none_falls_back_to_writer_preference():
+    """page_size=None defers to the writer's preferred_chunk_size when it
+    declares one."""
+    from dynastore.modules.elasticsearch.bulk_reindex import _resolve_read_page
+
+    assert _resolve_read_page(None, 500) == 500
+
+
+def test_resolve_read_page_none_and_no_writer_preference_uses_default():
+    """page_size=None with no writer preference (0) falls back to the
+    module default."""
+    from dynastore.modules.elasticsearch.bulk_reindex import (
+        _DEFAULT_READ_PAGE_SIZE,
+        _resolve_read_page,
+    )
+
+    assert _resolve_read_page(None, 0) == _DEFAULT_READ_PAGE_SIZE
+
+
+def test_resolve_read_page_custom_default_override():
+    """The default parameter is honoured when both page_size and the writer
+    preference are absent."""
+    from dynastore.modules.elasticsearch.bulk_reindex import _resolve_read_page
+
+    assert _resolve_read_page(None, 0, default=42) == 42
+
+
+@pytest.mark.asyncio
+async def test_reindex_explicit_page_size_survives_larger_writer_preference():
+    """End-to-end: an explicit small page_size reaches reader.read_entities
+    verbatim even when the writer declares a larger preferred_chunk_size —
+    the read page must not be widened by the writer preference."""
+    features = [_make_feature(f"f{i}") for i in range(3)]
+    reader = _FakeReader({"col1": features})
+    writer = _FakeWriter()
+    writer.preferred_chunk_size = 500  # writer prefers a much larger chunk
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1", page_size=50)
+
+    assert result.total_written == 3
+    # The read page passed to read_entities must be the explicit 50, not
+    # max(50, writer.preferred_chunk_size)=500.
+    assert reader._calls[0][2] == 50
+
+
+# ---------------------------------------------------------------------------
 # Tests: streaming and chunk delivery
 # ---------------------------------------------------------------------------
 
@@ -367,9 +502,9 @@ async def test_reindex_features_are_delivered_to_writer_in_chunks():
                 return_value="dynastore",
             ):
                 from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
-                total = await reindex_collection_into_index("cat1", "col1", page_size=3)
+                result = await reindex_collection_into_index("cat1", "col1", page_size=3)
 
-    assert total == 5
+    assert result.total_written == 5
     all_written = [f for batch in writer.written_batches for f in batch]
     written_ids = sorted(f["id"] for f in all_written)
     assert written_ids == sorted(f["id"] for f in features)
@@ -380,13 +515,23 @@ async def test_reindex_features_are_delivered_to_writer_in_chunks():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_reindex_write_failure_propagates():
-    """A write_entities failure must propagate — no silent success or count inflation."""
-    reader = _FakeReader({"col1": [_make_feature("f1"), _make_feature("f2")]})
+async def test_reindex_rejected_subchunk_does_not_abort_run():
+    """#2764: a sub-chunk rejected by ES (EsBulkWriteError) must not abort the
+    run. The loop continues with the next sub-chunk/page, the rejected doc is
+    surfaced in ``rejected_docs``, and ``total_written`` reflects only the
+    accepted documents — including the ones ES accepted in later sub-chunks."""
+    reader = _FakeReader(
+        {"col1": [_make_feature("f1"), _make_feature("f2"), _make_feature("f3")]}
+    )
 
     from dynastore.modules.storage.errors import EsBulkWriteError
-    err = EsBulkWriteError("bulk failure", failures=[("f1", "429 too_many_requests: queue full")])
-    writer = _FakeWriter(raise_on_write=err)
+    err = EsBulkWriteError(
+        "bulk failure",
+        failures=[("f1", "400 document_parsing_exception: known geo_shape divergence")],
+    )
+    # Only the first write_entities call (f1's sub-chunk) fails; f2 and f3
+    # succeed — proves the run keeps going past the rejected sub-chunk.
+    writer = _FakeWriter(raise_on_write=err, fail_calls=1)
 
     async def _get_config(model, *, catalog_id, collection_id=None):
         return _make_routing_config()
@@ -412,8 +557,274 @@ async def test_reindex_write_failure_propagates():
                 return_value="dynastore",
             ):
                 from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
-                with pytest.raises(EsBulkWriteError):
-                    await reindex_collection_into_index("cat1", "col1")
+                # page_size=1 forces one sub-chunk per document so the test can
+                # pin the failure to exactly f1's sub-chunk.
+                result = await reindex_collection_into_index("cat1", "col1", page_size=1)
+
+    assert result.total_written == 2  # f2 + f3; f1 was rejected
+    assert result.rejected == 1
+    assert result.rejected_docs == [
+        ("f1", "400 document_parsing_exception: known geo_shape divergence")
+    ]
+    written_ids = sorted(f["id"] for batch in writer.written_batches for f in batch)
+    assert written_ids == ["f2", "f3"]
+    assert writer._call_count == 3  # all three sub-chunks were attempted
+
+
+@pytest.mark.asyncio
+async def test_reindex_credits_only_acknowledged_ids_on_silent_sibling_drop():
+    """#2799: the id-level reconcile audit found that ES's ``_bulk`` response
+    can acknowledge FEWER docs than ``len(sub_chunk) - len(failures)`` —
+    sibling documents in the same rejected sub-chunk silently failed to
+    persist while the old formula still credited them as written. Crediting
+    must come from ``exc.acknowledged`` only, and the shortfall must be
+    reported, not silently dropped."""
+    reader = _FakeReader(
+        {"col1": [_make_feature(f"f{i}") for i in range(1, 5)]}  # f1..f4
+    )
+
+    from dynastore.modules.storage.errors import EsBulkWriteError
+    # ES explicitly rejected f2; only f1 and f3 were actually acknowledged —
+    # f4 vanished from the bulk response entirely (the silent-sibling-drop
+    # case), so it is neither acknowledged nor an explicit failure.
+    err = EsBulkWriteError(
+        "bulk failure",
+        failures=[("f2", "400 document_parsing_exception: known geo_shape divergence")],
+        acknowledged=["f1", "f3"],
+    )
+    writer = _FakeWriter(raise_on_write=err, fail_calls=1)
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                # page_size=4 keeps all 4 docs in a single sub-chunk/one
+                # write_entities call so the whole silent-drop is exercised
+                # inside one EsBulkWriteError.
+                result = await reindex_collection_into_index("cat1", "col1", page_size=4)
+
+    # Only the two truly-acknowledged docs are credited — never the
+    # over-count of len(sub_chunk) - len(failures) == 3 the old formula
+    # would have produced.
+    assert result.total_written == 2
+    # f2 (explicit ES rejection) + f4 (unaccounted/silently dropped).
+    assert result.rejected == 2
+    assert ("f2", "400 document_parsing_exception: known geo_shape divergence") in result.rejected_docs
+    unaccounted = [r for r in result.rejected_docs if r[0] != "f2"]
+    assert len(unaccounted) == 1
+    assert "unacknowledged" in unaccounted[0][1]
+    # Self-report invariant: acknowledged + reported-failures == docs read.
+    assert result.total_written + result.rejected == 4
+
+
+@pytest.mark.asyncio
+async def test_reindex_ladder_recovered_docs_are_credited_as_written():
+    """#2799/#2769: a doc recovered by the geo_shape degradation ladder is
+    reported on ``EsBulkWriteError.acknowledged`` (or not raised at all when
+    every rejection recovers) — the reindex accounting must credit it as
+    written, not fold it into ``rejected_docs`` just because ES's raw
+    response initially rejected it."""
+    reader = _FakeReader(
+        {"col1": [_make_feature("f1"), _make_feature("f2"), _make_feature("f3")]}
+    )
+
+    from dynastore.modules.storage.errors import EsBulkWriteError
+    # f1 passed cleanly, f2 recovered on a degraded geometry rung (so it is
+    # acknowledged despite originating as a poison rejection), f3 exhausted
+    # every rung and is still a real failure.
+    err = EsBulkWriteError(
+        "bulk failure",
+        failures=[("f3", "400 document_parsing_exception: still invalid after ladder")],
+        acknowledged=["f1", "f2"],
+    )
+    writer = _FakeWriter(raise_on_write=err, fail_calls=1)
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1", page_size=3)
+
+    assert result.total_written == 2  # f1 + f2 (ladder-recovered)
+    assert result.rejected == 1  # only f3, the truly-exhausted rejection
+    assert result.rejected_docs == [
+        ("f3", "400 document_parsing_exception: still invalid after ladder")
+    ]
+    # No unaccounted/silent gap — acknowledged + failures == docs read.
+    assert result.total_written + result.rejected == 3
+
+
+@pytest.mark.asyncio
+async def test_reindex_folds_presubmit_refuse_skip_into_rejected_docs():
+    """#2826: a writer that skips a document BEFORE submission (REFUSE
+    on-conflict) — no ``EsBulkWriteError`` raised at all — must have that
+    skip folded into ``rejected_docs``, not silently absorbed into a
+    shorter ``total_written`` with no accounting."""
+    reader = _FakeReader(
+        {"col1": [_make_feature("f1"), _make_feature("f2")]}
+    )
+    writer = _FakeWriter(presubmit_skip_ids={"f1"})
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1")
+
+    # f1 was skipped pre-submit, f2 was written — no exception anywhere.
+    assert result.total_written == 1
+    assert result.rejected == 1
+    assert result.rejected_docs == [("f1", "refused_on_conflict")]
+    # Self-report invariant: acknowledged + reported-skips == docs read.
+    assert result.total_written + result.rejected == 2
+
+
+@pytest.mark.asyncio
+async def test_reindex_folds_presubmit_missing_id_skip_into_rejected_docs():
+    """#2826: a writer that skips a row with no resolvable id before
+    submission must fold it into ``rejected_docs`` with a synthetic id
+    (the real id is genuinely unknown) and the ``missing_id`` reason."""
+    reader = _FakeReader({"col1": [_make_feature("f1")]})
+    writer = _FakeWriter(presubmit_missing_id_count=1)
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1")
+
+    assert result.total_written == 0
+    assert result.rejected == 1
+    assert len(result.rejected_docs) == 1
+    doc_id, reason = result.rejected_docs[0]
+    assert reason == "missing_id"
+    assert doc_id is not None  # synthetic placeholder, not a bare None
+    assert "presubmit-skip" in doc_id
+    assert result.total_written + result.rejected == 1
+
+
+@pytest.mark.asyncio
+async def test_reindex_mixed_batch_presubmit_skip_and_written_both_counted():
+    """#2826: a sub-chunk with both a pre-submit skip and normally-written
+    documents must count both correctly — the write side is unaffected by
+    the skip accounting fix."""
+    reader = _FakeReader(
+        {"col1": [_make_feature(f"f{i}") for i in range(1, 4)]}  # f1..f3
+    )
+    writer = _FakeWriter(presubmit_skip_ids={"f2"})
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1")
+
+    assert result.total_written == 2  # f1 + f3
+    assert result.rejected == 1  # f2, pre-submit skip
+    assert result.rejected_docs == [("f2", "refused_on_conflict")]
+    written_ids = sorted(f["id"] for batch in writer.written_batches for f in batch)
+    assert written_ids == ["f1", "f3"]
+    assert result.total_written + result.rejected == 3
 
 
 @pytest.mark.asyncio
@@ -507,7 +918,7 @@ async def test_collection_reindex_task_passes_driver_hint():
 
     async def _fake_reindex(catalog_id, collection_id, *, driver_hint=None, page_size=500):
         captured_hints.append(driver_hint)
-        return 1
+        return ReindexResult(total_written=1)
 
     es = _FakeEs()
 
@@ -533,6 +944,41 @@ async def test_collection_reindex_task_passes_driver_hint():
 
 
 @pytest.mark.asyncio
+async def test_collection_reindex_task_surfaces_rejected_docs():
+    """#2764: BulkCollectionReindexTask's result dict must surface the
+    rejected count and per-doc reasons alongside total_indexed, not just a
+    bare success count."""
+
+    async def _fake_reindex(catalog_id, collection_id, *, driver_hint=None, page_size=500):
+        return ReindexResult(
+            total_written=5842,
+            rejected_docs=[("019f2160-5a24-75b7-85b5-d51eb3c011ed", "400 document_parsing_exception")],
+        )
+
+    es = _FakeEs()
+
+    with patch(
+        "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+    ), patch(
+        "dynastore.modules.elasticsearch.client.get_index_prefix",
+        return_value="dynastore",
+    ), patch(
+        "dynastore.tasks.elasticsearch_indexer.tasks._reindex_collection",
+        side_effect=_fake_reindex,
+    ):
+        task = BulkCollectionReindexTask()
+        result = await task.run(_make_payload(
+            BulkCollectionReindexInputs(catalog_id="cat1", collection_id="col1"),
+        ))
+
+    assert result["total_indexed"] == 5842
+    assert result["rejected"] == 1
+    assert result["rejected_docs"] == [
+        {"id": "019f2160-5a24-75b7-85b5-d51eb3c011ed", "reason": "400 document_parsing_exception"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_catalog_reindex_task_iterates_collections_and_passes_driver_hint():
     """BulkCatalogReindexTask calls _reindex_collection for each collection and
     forwards the driver hint from inputs."""
@@ -540,7 +986,7 @@ async def test_catalog_reindex_task_iterates_collections_and_passes_driver_hint(
 
     async def _fake_reindex(catalog_id, collection_id, *, driver_hint=None, page_size=500):
         captured_calls.append((collection_id, driver_hint))
-        return 2
+        return ReindexResult(total_written=2)
 
     es = _FakeEs()
     catalogs = _FakeCatalogs(["col1", "col2"])
@@ -576,13 +1022,55 @@ async def test_catalog_reindex_task_iterates_collections_and_passes_driver_hint(
 
 
 @pytest.mark.asyncio
+async def test_catalog_reindex_task_aggregates_rejected_docs_across_collections():
+    """#2764: BulkCatalogReindexTask sums rejected counts across collections
+    and tags each rejected doc with its collection_id."""
+
+    async def _fake_reindex(catalog_id, collection_id, *, driver_hint=None, page_size=500):
+        if collection_id == "col1":
+            return ReindexResult(total_written=10, rejected_docs=[("bad1", "400 reason")])
+        return ReindexResult(total_written=20)
+
+    es = _FakeEs()
+    catalogs = _FakeCatalogs(["col1", "col2"])
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "CatalogsProtocol" in name:
+            return catalogs
+        return None
+
+    with patch(
+        "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+    ), patch(
+        "dynastore.modules.elasticsearch.client.get_index_prefix",
+        return_value="dynastore",
+    ), patch(
+        "dynastore.tools.discovery.get_protocol", side_effect=_get_protocol,
+    ), patch(
+        "dynastore.tasks.elasticsearch_indexer.tasks._reindex_collection",
+        side_effect=_fake_reindex,
+    ):
+        task = BulkCatalogReindexTask()
+        result = await task.run(_make_payload(
+            BulkCatalogReindexInputs(catalog_id="cat1"),
+        ))
+
+    assert result["total_indexed"] == 30
+    assert result["rejected"] == 1
+    assert result["rejected_docs"] == [
+        {"collection_id": "col1", "id": "bad1", "reason": "400 reason"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_collection_task_pre_reindex_wipe_collection_scoped():
     """Pre-reindex delete_by_query for BulkCollectionReindexTask uses a
     collection-scoped term query and carries routing."""
     es = _FakeEs()
 
     async def _fake_reindex(*args, **kwargs):
-        return 0
+        return ReindexResult(total_written=0)
 
     with patch(
         "dynastore.modules.elasticsearch.client.get_client", return_value=es,
@@ -603,6 +1091,86 @@ async def test_collection_task_pre_reindex_wipe_collection_scoped():
     assert dbq["index"] == "dynastore-cat1-items"
     assert dbq["body"] == {"query": {"term": {"collection": "col1"}}}
     assert dbq["params"]["routing"] == "col1"
+
+
+class _FakeCollectionsSvc:
+    """Stub for ``CatalogsProtocol.collections`` — external → internal only,
+    mirroring the real ``resolve_collection_id`` contract used by
+    ``ItemsElasticsearchDriver._resolve_internal_ids``."""
+
+    def __init__(self, collection_map):
+        self._map = collection_map
+
+    async def resolve_collection_id(self, catalog_id, collection_id, allow_missing=False):
+        return self._map.get(collection_id)
+
+
+class _FakeCatalogsProtocol:
+    """Stub ``CatalogsProtocol`` resolving a fixed external → internal id
+    map, mirroring the real ``resolve_catalog_id`` / ``collections.
+    resolve_collection_id`` contract (``None`` on miss, passthrough left to
+    the caller)."""
+
+    def __init__(self, catalog_map, collection_map):
+        self._catalog_map = catalog_map
+        self.collections = _FakeCollectionsSvc(collection_map)
+
+    async def resolve_catalog_id(self, catalog_id, allow_missing=False):
+        return self._catalog_map.get(catalog_id)
+
+
+@pytest.mark.asyncio
+async def test_collection_task_pre_reindex_wipe_resolves_external_ids():
+    """#2999: the pre-reindex delete_by_query must resolve an EXTERNAL
+    catalog_id/collection_id to internal before computing the index name /
+    term filter / routing key — mirroring ``ItemsElasticsearchDriver``'s
+    read-path resolution (count_entities/compute_extents/aggregate/
+    read_entities) so the wipe targets the same index/routing partition the
+    write path (``write_entities``, fixed alongside this) actually indexes
+    into. Mirrors the dev divergence cited in #2999: catalog
+    external_id="gaulb" vs internal id="c_akbbm7cinmqfe".
+    """
+    es = _FakeEs()
+    fake_catalogs = _FakeCatalogsProtocol(
+        catalog_map={"gaulb": "c_akbbm7cinmqfe"},
+        collection_map={"gaul_level_1": "col_internal456"},
+    )
+
+    async def _fake_reindex(*args, **kwargs):
+        return ReindexResult(total_written=0)
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "CatalogsProtocol" in name:
+            return fake_catalogs
+        return None
+
+    with patch(
+        "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+    ), patch(
+        "dynastore.modules.elasticsearch.client.get_index_prefix",
+        return_value="dynastore",
+    ), patch(
+        "dynastore.tools.discovery.get_protocol", side_effect=_get_protocol,
+    ), patch(
+        "dynastore.tasks.elasticsearch_indexer.tasks._reindex_collection",
+        side_effect=_fake_reindex,
+    ):
+        task = BulkCollectionReindexTask()
+        await task.run(_make_payload(
+            BulkCollectionReindexInputs(
+                catalog_id="gaulb", collection_id="gaul_level_1",
+            ),
+        ))
+
+    assert es.delete_by_query_calls
+    dbq = es.delete_by_query_calls[0]
+    # Index name and routing must be built from the INTERNAL ids — matching
+    # what read_entities/write_entities target — not the raw external ids.
+    assert dbq["index"] == "dynastore-c_akbbm7cinmqfe-items"
+    assert "gaulb" not in dbq["index"]
+    assert dbq["body"] == {"query": {"term": {"collection": "col_internal456"}}}
+    assert dbq["params"]["routing"] == "col_internal456"
 
 
 @pytest.mark.asyncio
@@ -876,11 +1444,11 @@ async def test_reindex_reader_ref_override_resolves_from_registry():
         return_value="dynastore",
     ):
         from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
-        total = await reindex_collection_into_index(
+        result = await reindex_collection_into_index(
             "cat1", "col1", reader_ref="items_duckdb_driver",
         )
 
-    assert total == 2
+    assert result.total_written == 2
     assert reader._calls, "file-driver read_entities was never called"
     assert not search_driver_calls, "hint resolution should be bypassed by reader_ref"
 

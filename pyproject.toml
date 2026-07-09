@@ -36,12 +36,26 @@ members = ["packages/core", "packages/extensions/*", "packages/modules/*"]
 [tool.uv.sources]
 dynastore-core = { workspace = true }
 dynastore-module-datastore = { workspace = true }
+dynastore-module-elasticsearch = { workspace = true }
+dynastore-module-gcp = { workspace = true }
+dynastore-module-cache = { workspace = true }
+dynastore-module-storage-iceberg = { workspace = true }
+dynastore-module-storage-duckdb = { workspace = true }
+dynastore-module-gdal = { workspace = true }
+dynastore-module-tiles = { workspace = true }
+dynastore-module-crs = { workspace = true }
+dynastore-module-web = { workspace = true }
+dynastore-module-iam = { workspace = true }
+dynastore-module-styles = { workspace = true }
+dynastore-module-local = { workspace = true }
+dynastore-module-notebooks = { workspace = true }
 dynastore-ext-tasks = { workspace = true }
 dynastore-ext-stats = { workspace = true }
 dynastore-ext-edr = { workspace = true }
 dynastore-ext-moving-features = { workspace = true }
 dynastore-ext-connected-systems = { workspace = true }
 dynastore-ext-dimensions = { workspace = true }
+dynastore-ext-region-mapping = { workspace = true }
 dynastore-ext-notebooks = { workspace = true }
 dynastore-ext-proxy = { workspace = true }
 dynastore-ext-processes = { workspace = true }
@@ -73,6 +87,7 @@ dynastore-ext-configs = { workspace = true }
 dynastore-ext-assets = { workspace = true }
 dynastore-ext-catalog-status = { workspace = true }
 
+
 [project.optional-dependencies]
 # ==========================================================================
 # GRANULAR MODULES — building blocks, one per domain
@@ -81,8 +96,8 @@ dynastore-ext-catalog-status = { workspace = true }
 # ==========================================================================
 module_storage = []
 module_storage_postgresql = []
-module_storage_duckdb = ["duckdb>=1.0.0"]
-module_storage_iceberg = ["pyiceberg[sql-postgres]>=0.11.1", "pyarrow>=22"]
+module_storage_duckdb = ["duckdb>=1.0.0", "dynastore-module-storage-duckdb"]
+module_storage_iceberg = ["pyiceberg[sql-postgres]>=0.11.1", "pyarrow>=22", "dynastore-module-storage-iceberg"]
 module_storage_elasticsearch = ["dynastore[module_elasticsearch]"]
 module_storage_elasticsearch_private = ["dynastore[module_elasticsearch]"]
 module_storage_elasticsearch_assets = ["dynastore[module_elasticsearch]"]
@@ -90,39 +105,41 @@ module_collection_elasticsearch = ["dynastore[module_elasticsearch]"]
 module_catalog_elasticsearch = ["dynastore[module_elasticsearch]"]
 module_stac = []
 module_catalog = ["dynastore[geospatial_core]", "sqlalchemy>=2.0.0"]
-module_gcp = ["gcloud-aio-storage==9.6.0", "google-cloud-bigquery==3.24.0", "google-cloud-run", "google-cloud-storage>=3.1.0", "google-cloud-pubsub", "gcsfs>=2024.5.0", "charset-normalizer>=3", "urllib3>=2.7.0,<3", "requests>=2.32", "httpx", "pmtiles>=3.2.0"]
+module_gcp = ["gcloud-aio-storage==9.6.0", "google-cloud-bigquery==3.24.0", "google-cloud-run", "google-cloud-storage>=3.1.0", "google-cloud-pubsub", "google-cloud-logging", "gcsfs>=2024.5.0", "charset-normalizer>=3", "urllib3>=2.7.0,<3", "requests>=2.32", "httpx", "pmtiles>=3.2.0", "dynastore-module-gcp"]
 module_datastore = ["dynastore[db_sync]", "psycopg2-binary>=2.9.7", "dynastore-module-datastore"]
 module_db_config = ["sqlalchemy", "geoalchemy2", "h3>=4.4.2", "s2sphere>=0.2.5", "python-dateutil"]
-module_iam = ["pydantic[email]", "PyJWT>=2.0.0", "tenacity>=8.0"]
-module_local = ["python-multipart>=0.0.27"]
+module_web = ["dynastore-module-web"]
+module_iam = ["pydantic[email]", "PyJWT>=2.13.0", "tenacity>=8.0", "dynastore-module-iam"]
+module_local = ["python-multipart>=0.0.31", "dynastore-module-local"]
 module_db = ["dynastore[db_async]", "sqlalchemy[asyncio]", "asyncpg"]
-module_crs = ["dynastore[geospatial_core]", "pyproj>=3.0.0"]
+module_crs = ["dynastore[geospatial_core]", "pyproj>=3.0.0", "dynastore-module-crs"]
 module_events = ["psycopg[binary,pool]"]
-module_elasticsearch = ["opensearch-py[async]", "httpx"]
-module_gdal = ["dynastore[geospatial_core]", "GDAL==3.13.0"]
-module_tiles = ["dynastore[geospatial_core]", "pmtiles>=3.2.0", "morecantile>=7.0.3,<8"]
-module_cache = ["valkey>=6.0", "msgpack>=1.0"]
+module_elasticsearch = ["opensearch-py[async]", "httpx", "dynastore-module-elasticsearch"]
+module_gdal = ["dynastore[geospatial_core]", "GDAL==3.13.1", "dynastore-module-gdal"]
+module_tiles = ["dynastore[geospatial_core]", "pmtiles>=3.2.0", "morecantile>=7.0.3,<8", "dynastore-module-tiles"]
+module_cache = ["valkey>=6.0", "msgpack>=1.2.1", "dynastore-module-cache"]
 module_tasks = []
 module_proxy = []
-module_styles = ["lxml>=4.9"]
+module_styles = ["lxml>=4.9", "dynastore-module-styles"]
 module_moving_features = []
 module_connected_systems = []
 module_stats = []
-module_notebooks = ["httpx", "python-dotenv"]
+module_notebooks = ["httpx", "python-dotenv", "dynastore-module-notebooks"]
 
 # ==========================================================================
 # GRANULAR EXTENSIONS — FastAPI routers, one per domain
 # ==========================================================================
-extension_base = ["fastapi>=0.100"]
+extension_base = ["fastapi>=0.100", "starlette>=1.3.1"]
 extension_web = ["dynastore[extension_base]", "markdown>=3.3.7", "dynastore-ext-web"]
 extension_httpx = ["dynastore[extension_base]", "httpx", "dynastore-ext-httpx"]
 extension_catalog = ["dynastore[extension_base,module_catalog]"]
 extension_stac = ["dynastore[extension_base,geospatial_io]", "pystac[validation]>=1.13.0", "stac-pydantic[validation]>=3.1.0", "dynastore-ext-stac"]
-extension_auth = ["dynastore[extension_base,extension_web]", "python-multipart>=0.0.27", "itsdangerous>=2.0", "dynastore-ext-auth"]
-extension_template = ["dynastore[extension_base]", "attrs>=25.3.0", "aiohttp>=3.12.15", "jinja2>=3.1.6", "xmltodict>=0.13.0", "httpx>=0.24.1", "dynastore-ext-template"]
+extension_auth = ["dynastore[extension_base,extension_web]", "python-multipart>=0.0.31", "itsdangerous>=2.0", "dynastore-ext-auth"]
+extension_template = ["dynastore[extension_base]", "attrs>=25.3.0", "aiohttp>=3.14.1", "jinja2>=3.1.6", "xmltodict>=0.13.0", "httpx>=0.24.1", "dynastore-ext-template"]
 extension_processes = ["dynastore[extension_base]", "jsonschema", "dynastore-ext-processes"]
 extension_features = ["dynastore[extension_base,geospatial_core,geospatial_io]", "pygeofilter[backend-sqlalchemy]", "dynastore-ext-features"]
 extension_tiles = ["dynastore[extension_base,module_tiles]", "dynastore-ext-tiles"]
+extension_tiles_raster = ["dynastore[extension_tiles,module_styles]", "rio-tiler>=9.0", "rasterio>=1.4.3", "lxml>=4.9", "dynastore-ext-tiles"]
 extension_volumes = ["dynastore[extension_base,geospatial_core]", "shapely>=2.0", "pyproj>=3.0.0", "cjio>=0.10.1", "dynastore-ext-volumes"]
 extension_tasks = ["dynastore[extension_base,module_tasks]", "dynastore-ext-tasks"]
 extension_proxy = ["dynastore[extension_base,module_proxy]", "dynastore-ext-proxy"]
@@ -130,7 +147,7 @@ extension_gdal = ["dynastore[extension_base,module_gdal]", "dynastore-ext-gdal"]
 extension_styles = ["dynastore[extension_base,module_styles]", "dynastore-ext-styles"]
 extension_moving_features = ["dynastore[extension_base,module_moving_features]", "dynastore-ext-moving-features"]
 extension_connected_systems = ["dynastore[extension_base,module_connected_systems]", "dynastore-ext-connected-systems"]
-extension_iam = ["dynastore[extension_base,module_iam,extension_web]", "httpx>=0.24.1", "PyJWT>=2.8.0", "dynastore-ext-iam"]
+extension_iam = ["dynastore[extension_base,module_iam,extension_web]", "httpx>=0.24.1", "PyJWT>=2.13.0", "dynastore-ext-iam"]
 extension_logs = ["dynastore[extension_base,extension_web]", "httpx", "dynastore-ext-logs"]
 extension_configs = ["dynastore[extension_base]", "dynastore-ext-configs"]
 extension_stats = ["dynastore[extension_base,module_stats]", "dynastore-ext-stats"]
@@ -144,7 +161,7 @@ extension_notebooks = ["dynastore[extension_base,module_notebooks]", "dynastore-
 extension_records = ["dynastore[extension_base]", "pygeofilter[backend-sqlalchemy]", "dynastore-ext-records"]
 extension_gcp_bucket = ["dynastore[extension_base,module_gcp]", "dynastore-ext-gcp-bucket"]
 extension_geoid = ["dynastore[extension_base,extension_web]", "user-agents>=2.2.0", "dynastore-ext-geoid"]
-extension_maps = ["dynastore[extension_base,geospatial_core,mvt]", "GDAL==3.13.0", "dynastore-ext-maps"]
+extension_maps = ["dynastore[extension_base,geospatial_core,mvt]", "GDAL==3.13.1", "dynastore-ext-maps"]
 extension_coverages = ["dynastore[extension_base,geospatial_core]", "rasterio>=1.4.3", "dynastore-ext-coverages"]
 extension_edr = ["dynastore[extension_base,geospatial_core]", "dynastore-ext-edr"]
 extension_dggs = ["dynastore[extension_base,geospatial_core]", "h3>=4.1.0", "s2sphere>=0.2.5", "dynastore-ext-dggs"]
@@ -152,6 +169,7 @@ module_coverages_netcdf = ["netCDF4>=1.6.0", "xarray>=2024.0.0"]
 module_coverages_zarr = ["zarr>=2.18.0", "xarray>=2024.0.0"]
 extension_dwh = ["dynastore[extension_base,dwh,geospatial_io]", "pyproj>=3.0.0", "dynastore-ext-dwh"]
 extension_dimensions = ["dynastore[extension_base]", "ogc-dimensions @ git+https://github.com/ccancellieri/ogc-dimensions.git@main#subdirectory=reference-implementation", "dynastore-ext-dimensions"]
+extension_region_mapping = ["dynastore[extension_base]", "dynastore-ext-region-mapping"]
 
 # ==========================================================================
 # GRANULAR TASKS
@@ -204,8 +222,8 @@ gdal = ["dynastore[module_gdal,extension_gdal,task_gdal_deps]"]
 maps = ["dynastore[extension_maps]"]
 stac = ["dynastore[module_stac, extension_stac]"]
 stats = ["dynastore[module_stats,extension_stats]"]
-web = ["dynastore[extension_web]"]
-geoid = ["dynastore[web_core,extension_geoid]"]
+web = ["dynastore[module_web, extension_web]"]
+geoid = ["dynastore[module_web,extension_geoid]"]
 processes = ["dynastore[extension_processes]"]
 features = ["dynastore[extension_features]"]
 styles = ["dynastore[module_styles,extension_styles]"]
@@ -221,7 +239,8 @@ storage = ["dynastore[module_storage]"]
 auth = ["dynastore[extension_auth]"]
 template = ["dynastore[extension_template]"]
 dimensions = ["dynastore[extension_dimensions]"]
-notebooks = ["dynastore[extension_notebooks]"]
+region_mapping = ["dynastore[extension_region_mapping]"]
+notebooks = ["dynastore[module_notebooks, extension_notebooks]"]
 edr = ["dynastore[extension_edr]"]
 
 # ==========================================================================
@@ -269,7 +288,7 @@ core = ["dynastore[db_async,web,configs,storage,cache]"]
 catalog_data_grp = ["dynastore[geospatial_core,catalog,features]"]
 catalog_routes_grp = ["dynastore[stac,assets,extension_records,extension_catalog_status]"]
 catalog_grp = ["dynastore[catalog_data_grp,catalog_routes_grp,module_local,events]"]
-maps_grp = ["dynastore[styles,maps,extension_wfs,tiles,crs,gdal,extension_coverages]"]
+maps_grp = ["dynastore[styles,maps,extension_wfs,tiles,crs,gdal,extension_coverages,extension_tiles_raster]"]
 # google_grp split: dwh is rendering input (BQ joins also live here),
 # gcp is the bucket-admin router (not on maps).
 dwh_grp = ["dynastore[extension_dwh,module_gcp]"]
@@ -278,7 +297,7 @@ google_grp = ["dynastore[gcp_routes_grp,dwh_grp]"]
 auth_grp = ["dynastore[iam,auth,extension_admin]"]
 # tools_grp split: core proxy/template vs route-heavy dimensions/notebooks.
 tools_core_grp = ["dynastore[extension_httpx,template]"]
-tools_grp = ["dynastore[tools_core_grp,dimensions,notebooks]"]
+tools_grp = ["dynastore[tools_core_grp,dimensions,region_mapping,notebooks]"]
 monitor_grp = ["dynastore[stats,logs]"]
 index_grp = ["dynastore[elasticsearch,task_elasticsearch_indexer_deps]"]
 # drivers_grp — all storage/asset/metadata drivers (both collection and asset domains)
@@ -306,7 +325,7 @@ outbox_drain = ["dynastore[task_base]"]
 # Worker DB convention split (see #909 and #1420):
 #   task_base        — CPU-bound workers (sync psycopg2 only, no asyncpg in image).
 #                      Preserves #909: ingestion, gdal, tiles_preseed,
-#                      dimensions_materialize, elasticsearch_indexer.
+#                      elasticsearch_indexer.
 #   task_base_async  — I/O-bound streaming workers (asyncpg + psycopg3 via
 #                      module_events; psycopg2-binary absent: db_sync/module_datastore
 #                      not included, module_storage_postgresql is an empty marker,
@@ -369,6 +388,13 @@ outbox_drain = ["dynastore[task_base]"]
 # module_gcp for the same reason. Confirmed on dynastore-dwh-join-export-job-5k56c,
 # review, 2026-05-29.
 worker_task_dwh_join = ["dynastore[task_base_async,module_catalog,module_crs,extension_dwh,module_gcp,module_storage_postgresql]"]
+# Heavy, non-paginated OGC API - Joins export. Reuses dwh_join's proven scope:
+# its runtime needs are a strict subset (it drives the join via the CORE
+# ``dynastore.modules.joins`` executor rather than the dwh extension, but pulls
+# the same BigQuery + geospatial_io + GCS upload + CRS + PG-read deps). The
+# ``joins`` extra (transitively in extension_dwh) carries google-cloud-bigquery,
+# db-dtypes and pandas for the BigQuery secondary path.
+worker_task_joins_export = ["dynastore[task_base_async,module_catalog,module_crs,extension_dwh,module_gcp,module_storage_postgresql]"]
 worker_task_ingestion = ["dynastore[ingestion,catalog_grp,google_grp,gdal,drivers_grp]"]
 # export_features: writes feature output to GCS (`gs://...` destination_uri)
 # via dynastore.modules.gcp clients. Without module_gcp the worker raises
@@ -381,8 +407,30 @@ worker_task_ingestion = ["dynastore[ingestion,catalog_grp,google_grp,gdal,driver
 worker_task_export_features = ["dynastore[task_base_async,module_gcp,stac,geospatial_core,geospatial_io,module_storage_postgresql]"]
 worker_task_tiles_preseed = ["dynastore[task_base,module_catalog,tiles,crs,module_storage_postgresql]", "morecantile>=7.0.3,<8"]
 worker_task_gdal = ["dynastore[task_base,module_catalog,gdal,module_storage_postgresql]"]
-worker_task_dimensions_materialize = ["dynastore[task_base,module_catalog,extension_dimensions,module_storage_postgresql]"]
-worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
+# module_db (asyncpg) is required: CatalogService methods called by this task
+# (ensure_catalog_exists, upsert, update_task) use managed_transaction which
+# awaits async DB calls — the sync psycopg2 engine alone raises
+# TypeError: CursorResult object can't be awaited. Same fix as #2472
+# applied to worker_task_catalog_provision.
+worker_task_dimensions_materialize = ["dynastore[task_base,module_db,module_catalog,extension_dimensions,module_storage_postgresql]"]
+# worker_task_async_writer (#2622): the generic secondary-write drain job.
+# Hosts the write-from-source crash-recovery backstop (elasticsearch_indexer /
+# envelope_attrs_backfill, the former sole reason for this SCOPE) alongside
+# the driver-agnostic outbox drainers (storage_drain / event_drain, entry
+# points always registered by task_base — this SCOPE just gives them a
+# capable-for-ES container to run in when offloaded off the serving tier).
+# `outbox_drain` (=task_base) is kept as its own extras key name for anyone
+# still referencing it directly. Add new secondary write-driver modules here
+# as they are built so this job stays the ONE place that drains every driver
+# family, not just Elasticsearch.
+# module_db (asyncpg) is required: storage_drain builds a SQLAlchemy async
+# engine (workclass_drain/storage_drain_task.py — create_async_engine +
+# NullPool) for its claim/terminal-write loop; task_base alone ships only the
+# sync psycopg2 engine, so every run dies at startup with
+# ModuleNotFoundError: No module named 'asyncpg' and the storage-plane outbox
+# never drains (#2718). Same dual-engine pairing as
+# worker_task_dimensions_materialize (#2472).
+worker_task_async_writer = ["dynastore[task_base,module_db,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
 # stac_harvest: I/O-bound streaming harvest of a remote STAC catalog into a
 # target dynastore catalog. task_base (sync psycopg2 engine) like ingestion and
 # every other driver-heavy worker — the task reads its engine via get_engine()
@@ -403,6 +451,49 @@ worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elastic
 # Remote fetch is stdlib-only (urllib via asyncio.to_thread), so no httpx dep.
 # module_storage_postgresql kept explicit per the SCOPE × routing invariant.
 worker_task_stac_harvest = ["dynastore[task_base,catalog_grp,drivers_grp,index_grp,configs,storage,geospatial_core,module_storage_postgresql]"]
+# Catalog provisioning executor (#2329): runs the registered provisioners for a
+# catalog or collection in priority order.  Needs:
+#   - task_base          — dispatcher + capability publisher (sync psycopg2 engine)
+#   - module_db          — async asyncpg engine. The provisioners and their
+#                          deprovision hooks (catalog-core schema create/drop,
+#                          CascadeOrchestrator.snapshot_and_enqueue,
+#                          safe_drop_relation) are async and write through
+#                          `managed_transaction(get_engine())` + `await
+#                          conn.execute(...)`; the storage drivers in drivers_grp
+#                          do the same via their async `_get_engine()`. Without
+#                          an async engine `get_engine()` falls back to the sync
+#                          psycopg2 engine and every `await conn.execute(...)`
+#                          fails with "'CursorResult' object can't be awaited"
+#                          (seen on catalog DELETE / deprovision_hard). task_base
+#                          is kept so the boot-time db_config engine_resolver
+#                          still has the sync engine it snapshots for per-driver
+#                          refs — the same dual-engine topology the catalog API
+#                          service already runs.
+#   - catalog_grp        — CatalogsProtocol + provisioning-registry callers
+#   - module_gcp         — GCP provisioner hooks (bucket, pubsub)
+#   - drivers_grp        — storage drivers for any provisioner that writes items
+#   - index_grp          — Elasticsearch client (provisioners may set up ES index)
+#   - configs            — ConfigsProtocol for hot-reloadable threshold/concurrency
+#   - module_storage_postgresql — explicit per SCOPE × routing invariant
+#   - iam                — IAM tenant provisioning (#2610). Enables IAM as a
+#                          whole: the `iam` aggregate installs BOTH the module
+#                          (`dynastore-module-iam`, which owns the
+#                          `initialize_iam_tenant` critical sync catalog
+#                          initializer that creates every per-tenant IAM table —
+#                          roles, role_hierarchy, grants, policies — in the new
+#                          schema atomically with the catalog) AND the extension
+#                          (`dynastore-ext-iam`). IamModule self-gates on the
+#                          presence of the extension distribution (#1003 SCOPE
+#                          gate): with only `module_iam` installed, discovery
+#                          skips IamModule and the initializer never registers,
+#                          so fresh catalogs come up with no IAM tables and fail
+#                          closed on the first per-catalog IAM read. An extension
+#                          is never enabled without its base module, so IAM ships
+#                          as module+extension together. Catalog creation runs
+#                          here (in the provision Job), not on the serving catalog
+#                          service, which stays IAM-less (api_open / scope_catalog
+#                          do not include IAM).
+worker_task_catalog_provision = ["dynastore[task_base,module_db,catalog_grp,module_gcp,drivers_grp,index_grp,configs,module_storage_postgresql,iam]"]
 # Write-reactive tile-cache invalidation (#1292) needs no dedicated SCOPE / Job
 # (#1298): it reuses the existing tiles_preseed task (operation=invalidate),
 # which already deploys as the geospatial-tiles-preseed-job
@@ -495,7 +586,7 @@ api_full = ["dynastore[api_catalog,maps_grp,geospatial_io]"]
 # geoid_service: api_catalog + geoid extension — the ONLY service with auth
 geoid_service = ["dynastore[api_catalog,extension_geoid]"]
 # worker_service: background task processor (sync-db tasks + async-db catalog reads), no auth
-worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_joins_export,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # catalog_local: local dev catalog — api_open without google_grp/gcp_cloud_runner (no tools_grp: use the dedicated tools service)
 catalog_local = ["dynastore[core,catalog_grp,monitor_grp,index_grp,processes]"]
 # worker_local: local HTTP simulation of Cloud Run Jobs — all tasks + processes/stats UI
@@ -505,8 +596,10 @@ worker_local = ["dynastore[worker_service,monitor_grp]"]
 # DOCKER SERVICE SCOPES (used by docker-compose SCOPE build arg)
 # Prefixed with scope_ to avoid collision with module-level extras above.
 # ==========================================================================
-# scope_catalog: catalog API without auth — open for local testing
-scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,dimensions,drivers_grp,extension_volumes]"]
+# scope_catalog: catalog API without auth — open for local testing.
+# Includes `template` so the catalog pod can render/interpolate Jinja JSON
+# templates in-process (the dedicated tools service still serves it too).
+scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,template,dimensions,region_mapping,drivers_grp,extension_volumes,extension_dggs,extension_edr,extension_moving_features,extension_connected_systems]"]
 # scope_catalog_review: scope_catalog + gdal running in-process as a background
 # async runner on the catalog pod.  For review / local images ONLY — not
 # referenced by scope_catalog, scope_geoid, or any production scope.
@@ -514,9 +607,9 @@ scope_catalog_review = ["dynastore[scope_catalog,module_gdal,worker_task_gdal]"]
 # scope_geoid: catalog + geoid UI + auth/iam — maps to geospatial-auth in cloud
 scope_geoid = ["dynastore[scope_catalog,extension_geoid,auth_grp]"]
 # scope_worker: background task processor — headless Cloud Run job runner
-scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_joins_export,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # scope_tools: proxy + template tools service — no auth
-scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
+scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,region_mapping,proxy]"]
 # scope_maps: vector producer + raster renderer (local docker), no auth.
 # Mirrors api_maps_open + module_cache + drivers_grp so local data reads work.
 # worker_task_gdal pulls task_base (module_tasks dispatcher + capability
@@ -533,6 +626,7 @@ scope_maps = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,m
 # image — the cloud split (scope_catalog / scope_geoid / scope_worker / …)
 # is unchanged.
 scope_onprem = ["dynastore[scope_geoid,scope_worker]"]
+scope_onprem_catalog = ["dynastore[scope_catalog,scope_worker]"]
 
 # ==========================================================================
 # DEVELOPMENT & TESTING
@@ -548,7 +642,7 @@ all = ["dynastore[api_full,geoid_service,worker_service]"]
 # `everything` = `all` + every `extension_*` extra, so all 35 ext wheels resolve.
 # Build the CI test image with SCOPE=everything. Keep service images on the
 # narrow `scope_*` extras to stay slim.
-everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,extension_catalog_status,extension_configs,extension_connected_systems,extension_coverages,extension_crs,extension_dggs,extension_dimensions,extension_dwh,extension_edr,extension_events,extension_features,extension_gcp_bucket,extension_gdal,extension_geoid,extension_httpx,extension_iam,extension_logs,extension_maps,extension_moving_features,extension_notebooks,extension_processes,extension_proxy,extension_records,extension_stac,extension_stats,extension_styles,extension_tasks,extension_template,extension_tiles,extension_volumes,extension_web,extension_wfs]"]
+everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,extension_catalog_status,extension_configs,extension_connected_systems,extension_coverages,extension_crs,extension_dggs,extension_dimensions,extension_dwh,extension_edr,extension_events,extension_features,extension_gcp_bucket,extension_gdal,extension_geoid,extension_httpx,extension_iam,extension_logs,extension_maps,extension_moving_features,extension_notebooks,extension_processes,extension_proxy,extension_records,extension_region_mapping,extension_stac,extension_stats,extension_styles,extension_tasks,extension_template,extension_tiles,extension_tiles_raster,extension_volumes,extension_web,extension_wfs]"]
 # Superset of `everything` that pulls in every optional driver / task-only
 # dependency referenced anywhere in src/. Pyright/mypy need these resolvable to
 # clear `reportMissingImports` on optional code paths (duckdb, pyiceberg,
@@ -556,7 +650,7 @@ everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,ext
 # images on `scope_*` to stay slim.
 typecheck = ["dynastore[everything,drivers_grp,task_tiles_preseed_deps]"]
 test = ["pytest>=8.0.0", "pytest-asyncio>=0.23.5", "pytest-cov>=4.1.0", "pytest-xdist>=3.5.0", "pytest-timeout>=2.3.0", "requests>=2.31.0", "orjson>=3.9.15"]
-notebooks_test = ["dynastore[test]", "nbval>=0.11", "ipykernel>=6.29", "jupyter-client>=8.6", "httpx>=0.27", "python-dotenv>=1.0"]
+notebooks_test = ["dynastore[test]", "nbval>=0.11", "ipykernel>=6.29", "jupyter-client>=8.6", "tornado>=6.5.7", "httpx>=0.27", "python-dotenv>=1.0"]
 lite_build = ["jupyterlite-core>=0.4", "jupyterlite-pyodide-kernel>=0.4"]
 dev = ["ruff", "black", "mypy", "pyright>=1.1.390", "debugpy", "dynastore[test]"]
 

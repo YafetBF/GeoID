@@ -43,6 +43,7 @@ from pydantic import ValidationError
 from typing import (
     Any,
     Dict,
+    List,
     Optional,
     Set,
     Tuple,
@@ -52,7 +53,8 @@ from typing import (
 
 from dataclasses import dataclass, field as dc_field
 
-from dynastore.tools.cache import cached
+from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
+from dynastore.tools.async_utils import PLATFORM_CONFIG_CHANGED
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -64,6 +66,8 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.db_config.typed_store.ddl import (
     PLATFORM_SCHEMAS_DDL,
     TASK_CAPABILITY_REGISTRY_DDL,
+    LEADER_LEASE_DDL,
+    INSTANCE_LIVENESS_DDL,
 )
 from dynastore.modules.db_config.typed_store import config_queries as _cq
 from dynastore.tools.plugin import ProtocolPlugin
@@ -75,7 +79,12 @@ from dynastore.models.driver_context import DriverContext
 # imported to avoid circular imports
 from dynastore.modules.db_config.exceptions import (
     ConfigValidationError,
+    ConfigVersionConflictError,
     ImmutableConfigError,
+)
+from dynastore.modules.db_config.config_version import (
+    decode_config_version,
+    encode_config_version,
 )
 from dynastore.tools.json import CustomJSONEncoder
 
@@ -86,8 +95,16 @@ from dynastore.models.plugin_config import (
     require_config_class,
     resolve_config_class,
 )
+# Re-exported for backward compatibility — callers historically imported
+# ``_validate_stored_config`` from this module. The implementation now lives
+# in ``stored_config_read`` so the catalog/collection tier (config_service.py)
+# can share it instead of duplicating it.
+from dynastore.modules.db_config.stored_config_read import (  # noqa: F401
+    _validate_stored_config,
+)
 
 logger = logging.getLogger(__name__)
+
 
 # Exceptions that legitimately mean "physical layer absent / not yet
 # reachable" — for these the gate correctly fails open to ``False`` so
@@ -532,23 +549,35 @@ async def _platform_table_exists(conn: DbResource) -> bool:
 get_platform_config_query = _cq.get_platform_config
 upsert_platform_config_query = _cq.upsert_platform_config
 list_platform_configs_query = _cq.list_platform_configs
+list_platform_configs_versioned_query = _cq.list_platform_configs_versioned
 delete_platform_config_query = _cq.delete_platform_config
 get_platform_config_by_ref_query = _cq.get_platform_config_by_ref
 list_platform_refs_query = _cq.list_platform_refs
 
 
-async def _register_schema(conn: DbResource, config: "PluginConfig") -> None:
-    """Upsert the config's current JSON schema into ``configs.schemas``."""
-    cls = type(config)
-    await _cq.register_schema.execute(
-        conn,
-        schema_id=cls.schema_id(),
-        class_key=cls.class_key(),
-        schema_json=json.dumps(cls.model_json_schema(), sort_keys=True),
-    )
-
-
 # --- Manager ---
+
+get_platform_config_versioned_query = _cq.get_platform_config_versioned
+cas_update_platform_config_query = _cq.cas_update_platform_config
+
+
+def _serialize_config_for_db(config: "PluginConfig") -> str:
+    """Serialize a config to the JSON string persisted in platform_configs.
+
+    ``secret_mode="db"`` → every Secret field serializes to its encrypted
+    envelope before jsonb persistence.  ``exclude_unset=True`` → store only
+    the fields the caller explicitly sent; class defaults are resolved at read
+    time by the waterfall, not baked in here.
+
+    Single SSOT for the write-side serialization contract shared by
+    ``set_config`` and ``set_config_by_ref`` (platform tier).
+    """
+    config_data = (
+        config.model_dump(mode="json", context={"secret_mode": "db"}, exclude_unset=True)
+        if hasattr(config, "model_dump")
+        else config
+    )
+    return json.dumps(config_data, cls=CustomJSONEncoder)
 
 
 def _post_commit_router_bust(cls: Type["PluginConfig"]) -> None:
@@ -576,6 +605,16 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
 
     def __init__(self, engine: Optional[DbResource] = None):
         self._engine = engine
+        # #2946: memoize the *validated* config model keyed by class_key.
+        # Re-running _validate_stored_config on every get_config hit re-fires the
+        # routing-config @model_validator (driver self-registration), which is the
+        # several-hundred-MB cold-wake allocation spike behind the chronic OOM
+        # kills. We key each entry on the identity of the source raw dict so a
+        # cache refresh (new dict object) transparently forces a single
+        # re-validation -- no staleness risk, since the raw-dict cache
+        # (get_platform_config_internal_cached) remains the sole TTL/version SSOT.
+        # Value: (source_dict_ref, validated_model).
+        self._validated_config_cache: Dict[str, tuple[Any, PluginConfig]] = {}
         self._setup_cache()
 
     @property
@@ -591,8 +630,21 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
 
     def _setup_cache(self):
         self.get_platform_config_internal_cached = cached(
-            maxsize=64, ttl=300, namespace="platform_config", l1_ttl=2,
+            maxsize=64,
+            ttl=DEFAULT_CONFIG_CACHE_TTL,
+            namespace="platform_config",
+            l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
         )(self._get_platform_config_internal_db)
+
+    def _invalidate_config_cache(self, class_key: str) -> None:
+        """Bust the raw-dict cache and the #2946 validated-model memo in lockstep.
+
+        Every write path must call this (not the raw ``cache_invalidate``
+        directly) so a stale validated model can never outlive the raw dict it
+        was derived from.
+        """
+        self.get_platform_config_internal_cached.cache_invalidate(class_key)
+        self._validated_config_cache.pop(class_key, None)
 
     @asynccontextmanager
     async def lifespan(self, app_state: Any) -> typing.AsyncGenerator[None, None]:
@@ -601,12 +653,10 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         if self.engine is not None:
             await self.initialize_storage(self.engine)
         else:
-            logger.error(
-                "PlatformConfigService: no DB engine available at lifespan — "
-                "configs schema and configs.task_capability_registry NOT initialized; "
-                "task backstop / proactive-sweep loops will fail with "
-                "'relation does not exist' if a DB-backed tier starts without a preceding "
-                "DBService lifespan. Check module priority ordering or engine configuration."
+            logger.warning(
+                "PlatformConfigService: no DB engine available at lifespan — expected at "
+                "priority-0 startup; configs schema will be initialized by TasksModule.lifespan "
+                "once the DB engine is registered downstream."
             )
         logger.info("PlatformConfigService: Started.")
         yield
@@ -625,6 +675,8 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             await ensure_schema_exists(conn, "configs")
             await DDLQuery(PLATFORM_SCHEMAS_DDL).execute(conn)
             await DDLQuery(TASK_CAPABILITY_REGISTRY_DDL).execute(conn)
+            await DDLQuery(LEADER_LEASE_DDL).execute(conn)
+            await DDLQuery(INSTANCE_LIVENESS_DDL).execute(conn)
             logger.info("Platform Config Storage initialized successfully.")
         except Exception as e:
             logger.error(
@@ -643,6 +695,16 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         config = await self._get_platform_config_internal(cls, db_resource=db_resource)
         if config:
             return config
+        return await self._default_or_raise(cls)
+
+    async def _default_or_raise(self, cls: Type[PluginConfig]) -> PluginConfig:
+        """Construct the code-level default, or raise ``ConfigResolutionError``.
+
+        Shared by :meth:`get_config` and :meth:`get_config_versioned` — no
+        persisted row means "fall through to the class default", and a
+        class that cannot be constructed with zero args is a genuine
+        ops misconfiguration in either path.
+        """
         try:
             return cls()
         except Exception as exc:
@@ -655,6 +717,40 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 required_fields=required,
                 scope_tried=["platform", "code_default"],
             ) from exc
+
+    async def get_config_versioned(
+        self,
+        config_cls: Union[str, Type[PluginConfig]],
+        ctx: Optional[DriverContext] = None,
+    ) -> Tuple[PluginConfig, Optional[str]]:
+        """Versioned read for CAS writes (#2707).
+
+        Returns ``(config, version)`` where ``config`` is what
+        :meth:`get_config` would return (platform row overlaid on the code
+        default) and ``version`` is the opaque CAS token for the platform
+        row, or ``None`` when no row is persisted yet — nothing to CAS
+        against, so a subsequent write should go through unconditionally
+        (``expected_version=None``, the default).
+
+        Always reads storage directly, bypassing
+        ``get_platform_config_internal_cached`` — the token must reflect
+        the true current row, never a stale cached one, or a real
+        conflict could be masked (or a phantom one raised).
+        """
+        cls = require_config_class(config_cls)
+        db_resource = ctx.db_resource if ctx else None
+        async with managed_transaction(db_resource or self.engine) as conn:
+            if not await _platform_table_exists(conn):
+                row = None
+            else:
+                row = await get_platform_config_versioned_query.execute(
+                    conn, ref_key=cls.class_key()
+                )
+        if not row:
+            return await self._default_or_raise(cls), None
+        data = row["config_data"]
+        config = data if isinstance(data, cls) else _validate_stored_config(cls, data)
+        return config, encode_config_version(row["updated_at"])
 
     async def _get_platform_config_internal_db(
         self, class_key: str
@@ -671,18 +767,39 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
     ) -> Optional[PluginConfig]:
         class_key = cls.class_key()
         if db_resource:
+            # Explicit-connection read: bypass both caches for read-your-writes
+            # consistency. Never memoize — the caller wants the live row.
             if not await _platform_table_exists(db_resource):
                 return None
             data = await get_platform_config_query.execute(
                 db_resource, ref_key=class_key
             )
-        else:
-            data = await self.get_platform_config_internal_cached(class_key)
+            if not data:
+                return None
+            if isinstance(data, cls):
+                return data
+            return _validate_stored_config(cls, data)
+
+        data = await self.get_platform_config_internal_cached(class_key)
         if not data:
             return None
         if isinstance(data, cls):
             return data
-        return cls.model_validate(data)
+
+        # #2946: validated-model memo. Reuse the previously-validated model only
+        # when the source raw dict is the *same object* the cache returned last
+        # time (identity, not equality). A cache refresh yields a new dict object
+        # => cache miss here => exactly one re-validation. This keeps the raw-dict
+        # cache as the sole TTL/version authority while eliminating the repeated
+        # routing-config @model_validator driver re-registration that spiked
+        # several hundred MB on every cold-wake detached rebuild.
+        cached_entry = self._validated_config_cache.get(class_key)
+        if cached_entry is not None and cached_entry[0] is data:
+            return cached_entry[1]
+
+        validated = _validate_stored_config(cls, data)
+        self._validated_config_cache[class_key] = (data, validated)
+        return validated
 
     async def set_config(
         self,
@@ -690,19 +807,46 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         config: PluginConfig,
         check_immutability: bool = True,
         ctx: Optional[DriverContext] = None,
+        expected_version: Optional[str] = None,
     ) -> None:
+        """Persist a platform-scope config.
+
+        ``expected_version`` (#2707): when ``None`` (default), writes
+        unconditionally — today's behavior, fully backward compatible.
+        When set to a token obtained from :meth:`get_config_versioned`,
+        the write becomes an atomic compare-and-set: it only lands if the
+        stored row's ``updated_at`` still equals that token. On a lost
+        race (no row, or a concurrent writer already moved it) this
+        raises ``ConfigVersionConflictError`` instead of silently
+        overwriting the concurrent change — the caller should re-read via
+        ``get_config_versioned`` and retry.
+        """
         cls = require_config_class(config_cls)
         class_key = cls.class_key()
         db_resource = ctx.db_resource if ctx else None
+
+        # #2524: a config with no explicitly-set fields serialises to {} under
+        # exclude_unset=True.  {} is falsy at read time — the waterfall skips it —
+        # so the row provides no value.  Return early to avoid an unnecessary write
+        # transaction and spurious config-cache / router-cache invalidation.
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write at platform scope; "
+                "waterfall defaults apply without a stored row",
+                class_key,
+            )
+            return
+
         async with managed_transaction(db_resource or self.engine) as conn:
             old_config: Optional[PluginConfig] = None
             current_data = await get_platform_config_query.execute(
                 conn, ref_key=class_key
             )
             if current_data:
-                old_config = cls.model_validate(current_data) if not isinstance(
-                    current_data, cls
-                ) else current_data
+                old_config = _validate_stored_config(
+                    cls, current_data
+                ) if not isinstance(current_data, cls) else current_data
             if check_immutability:
                 # Discard caller values for machine-assigned (Computed) fields
                 # BEFORE enforcement/persist (#1135). Internal provisioning uses
@@ -718,30 +862,53 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             # ``managed_transaction`` rolls back the (not-yet-issued) upsert.
             await run_validate_handlers(cls, config, None, None, conn)
 
-            await _register_schema(conn, config)
-
             # exclude_unset=True → platform row stores only fields the caller
             # explicitly sent. Class defaults are resolved at read time, so
             # bumping a class default propagates without rewriting this row.
-            await upsert_platform_config_query.execute(
-                conn,
-                ref_key=class_key,
-                class_key=class_key,
-                schema_id=type(config).schema_id(),
-                config_data=json.dumps(
-                    config.model_dump(
-                        mode="json",
-                        context={"secret_mode": "db"},
-                        exclude_unset=True,
-                    ),
-                    cls=CustomJSONEncoder,
-                ),
-            )
+            if expected_version is not None:
+                rowcount = await cas_update_platform_config_query.execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                    expected_version=decode_config_version(expected_version),
+                )
+                if rowcount == 0:
+                    raise ConfigVersionConflictError(
+                        f"set_config({class_key!r}): expected_version "
+                        f"{expected_version!r} no longer matches the stored "
+                        f"platform row (or the row is absent) — a concurrent "
+                        f"writer changed it. Re-read via get_config_versioned "
+                        f"and retry."
+                    )
+            else:
+                await upsert_platform_config_query.execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                )
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, None, None, conn)
 
-        self.get_platform_config_internal_cached.cache_invalidate(class_key)
+            # Co-transactional NOTIFY (Layer A hot-reload watcher): committed
+            # atomically with the row above so every long-lived instance's
+            # ConfigReloadService — woken via the existing task-queue LISTEN
+            # bridge, no dedicated connection of its own — reconciles this
+            # change without a redeploy. Best-effort: a lost NOTIFY only
+            # delays convergence on other pods to the bridge's own health-beat.
+            try:
+                await DQLQuery(
+                    f"SELECT pg_notify('{PLATFORM_CONFIG_CHANGED}', :payload)",
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, payload=class_key)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("set_config: platform_config_changed NOTIFY failed: %s", exc)
+
+        self._invalidate_config_cache(class_key)
         # Post-commit router bust closes the race where an apply_handler
         # invalidates inside the open transaction and a concurrent reader
         # re-caches the pre-commit row. Mirrors catalog/collection tiers.
@@ -762,8 +929,26 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                     class_key,
                 )
                 continue
-            configs[cls] = cls.model_validate(row["config_data"])
+            configs[cls] = _validate_stored_config(cls, row["config_data"])
         return configs
+
+    async def list_configs_versioned(self) -> List[Tuple[str, str, Any, Any]]:
+        """Return ``(ref_key, class_key, config_data, updated_at)`` for every
+        persisted platform config row — the token feed ``ConfigReloadService``
+        diffs against its ``{class_key: last_seen_updated_at}`` map.
+
+        Strictly against ``configs.platform_configs`` (the single platform
+        table); never enumerates tenant schemas. Unlike :meth:`list_configs`,
+        does NOT resolve/validate against the registered ``PluginConfig``
+        class here — an unknown or malformed row is the reconcile loop's
+        problem to skip, not this listing's to fail on.
+        """
+        async with managed_transaction(self.engine) as conn:
+            rows = await list_platform_configs_versioned_query.execute(conn)
+        return [
+            (row["ref_key"], row["class_key"], row["config_data"], row["updated_at"])
+            for row in rows
+        ]
 
     async def list_refs(self) -> Dict[str, str]:
         """F.4c.2 — return ``{ref_key: class_key}`` for every platform-stored row.
@@ -807,7 +992,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             )
             return None
         data = row["config_data"]
-        return cls.model_validate(data)
+        return _validate_stored_config(cls, data)
 
     async def delete_config(
         self,
@@ -822,7 +1007,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 conn, ref_key=class_key
             )
             if rows_affected > 0:
-                self.get_platform_config_internal_cached.cache_invalidate(class_key)
+                self._invalidate_config_cache(class_key)
                 _post_commit_router_bust(cls)
                 return True
         return False
@@ -850,6 +1035,17 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         cls = type(config)
         class_key = cls.class_key()
         db_resource = ctx.db_resource if ctx else None
+
+        # #2524: skip write when no fields were explicitly set (see set_config).
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write (by-ref=%r) at platform scope; "
+                "waterfall defaults apply without a stored row",
+                class_key, ref_key,
+            )
+            return
+
         async with managed_transaction(db_resource or self.engine) as conn:
             existing_row = await get_platform_config_by_ref_query.execute(
                 conn, ref_key=ref_key
@@ -864,7 +1060,9 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                         f"the ref first or pick a different name."
                     )
                 if check_immutability:
-                    old_config = cls.model_validate(existing_row["config_data"])
+                    old_config = _validate_stored_config(
+                        cls, existing_row["config_data"]
+                    )
                     await enforce_config_immutability(
                         old_config, config,
                         catalog_id=None, collection_id=None, conn=conn,
@@ -873,30 +1071,31 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, None, None, conn)
 
-            await _register_schema(conn, config)
-
             await upsert_platform_config_query.execute(
                 conn,
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=json.dumps(
-                    config.model_dump(
-                        mode="json",
-                        context={"secret_mode": "db"},
-                        exclude_unset=True,
-                    ),
-                    cls=CustomJSONEncoder,
-                ),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, None, None, conn)
 
+            # Co-transactional NOTIFY (Layer A hot-reload watcher) — see the
+            # matching block in set_config for the rationale.
+            try:
+                await DQLQuery(
+                    f"SELECT pg_notify('{PLATFORM_CONFIG_CHANGED}', :payload)",
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, payload=class_key)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("set_config_by_ref: platform_config_changed NOTIFY failed: %s", exc)
+
         # Invalidate the class-keyed cache for the dispatch class so any
         # waterfall reads pick up the change.  Multi-instance rows still
         # share their class with the single-instance default.
-        self.get_platform_config_internal_cached.cache_invalidate(class_key)
+        self._invalidate_config_cache(class_key)
         _post_commit_router_bust(cls)
 
     async def delete_config_by_ref(
@@ -923,7 +1122,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         # Best-effort cache + router invalidation.  resolve_config_class
         # returns None when the class has been unregistered (warning
         # logged); skip the router bust in that case.
-        self.get_platform_config_internal_cached.cache_invalidate(stored_class_key)
+        self._invalidate_config_cache(stored_class_key)
         cls = resolve_config_class(stored_class_key)
         if cls is not None:
             _post_commit_router_bust(cls)

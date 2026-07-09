@@ -18,9 +18,8 @@
 
 """DQL query factories for the typed-config store tables.
 
-All SQL that touches the four config tables is defined here:
+All SQL that touches the config tables is defined here:
 
-* ``configs.schemas``          — schema registry (platform-level)
 * ``configs.platform_configs`` — platform-level config store
 * ``<tenant>.catalog_configs`` — per-tenant catalog config store
 * ``<tenant>.collection_configs`` — per-tenant collection config store
@@ -53,8 +52,11 @@ Usage example::
 
 from __future__ import annotations
 
-from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
-from dynastore.tools.db import validate_sql_identifier
+from typing import Any, Dict, List, Tuple
+
+from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.modules.db_config.shared_queries import list_page_with_count
+from dynastore.tools.db import build_upsert, validate_sql_identifier
 from dynastore.modules.db_config.typed_store.ddl import (
     CONFIGS_SCHEMA,
     CATALOG_CONFIGS_TABLE,
@@ -84,16 +86,38 @@ list_platform_refs = DQLQuery(
     result_handler=ResultHandler.ALL_DICTS,
 )
 
-upsert_platform_config = DQLQuery(
+# --- CAS (compare-and-set) reads/writes (#2707) -----------------------------
+# ``updated_at`` is already a NOT NULL column on every config table — it
+# doubles as an opaque optimistic-concurrency token (see
+# ``dynastore.modules.db_config.config_version``) without any schema change.
+
+get_platform_config_versioned = DQLQuery(
+    f"SELECT config_data, updated_at FROM {CONFIGS_SCHEMA}.platform_configs WHERE ref_key = :ref_key;",
+    result_handler=ResultHandler.ONE_DICT,
+)
+
+cas_update_platform_config = DQLQuery(
     f"""
-    INSERT INTO {CONFIGS_SCHEMA}.platform_configs (ref_key, class_key, schema_id, config_data, updated_at)
-    VALUES (:ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-    ON CONFLICT (ref_key) DO UPDATE SET
-        class_key   = EXCLUDED.class_key,
-        schema_id   = EXCLUDED.schema_id,
-        config_data = EXCLUDED.config_data,
-        updated_at  = NOW();
+    UPDATE {CONFIGS_SCHEMA}.platform_configs SET
+        class_key   = :class_key,
+        schema_id   = :schema_id,
+        config_data = CAST(:config_data AS jsonb),
+        updated_at  = NOW()
+    WHERE ref_key = :ref_key AND updated_at = :expected_version;
     """,
+    result_handler=ResultHandler.ROWCOUNT,
+)
+
+upsert_platform_config = DQLQuery(
+    build_upsert(
+        table=f"{CONFIGS_SCHEMA}.platform_configs",
+        columns=("ref_key", "class_key", "schema_id", "config_data", "updated_at"),
+        conflict_cols=("ref_key",),
+        literal_values={
+            "config_data": "CAST(:config_data AS jsonb)",
+            "updated_at": "NOW()",
+        },
+    ),
     result_handler=ResultHandler.ROWCOUNT,
 )
 
@@ -102,32 +126,27 @@ list_platform_configs = DQLQuery(
     result_handler=ResultHandler.ALL_DICTS,
 )
 
+# Layer A config hot-reload watcher (ConfigReloadService): the token feed for
+# its startup seed + reconcile diff. ``updated_at`` doubles as the same
+# opaque optimistic-concurrency token used by the CAS queries above; here it
+# is read (never compared-and-set) purely to detect which platform config
+# rows changed since the service last saw them.
+list_platform_configs_versioned = DQLQuery(
+    f"SELECT ref_key, class_key, config_data, updated_at FROM {CONFIGS_SCHEMA}.platform_configs;",
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
 delete_platform_config = DQLQuery(
     f"DELETE FROM {CONFIGS_SCHEMA}.platform_configs WHERE ref_key = :ref_key;",
     result_handler=ResultHandler.ROWCOUNT,
 )
 
-register_schema = DQLQuery(
-    f"""
-    INSERT INTO {CONFIGS_SCHEMA}.schemas (schema_id, class_key, schema_json)
-    VALUES (:schema_id, :class_key, CAST(:schema_json AS jsonb))
-    ON CONFLICT (schema_id) DO NOTHING;
-    """,
-    result_handler=ResultHandler.ROWCOUNT,
-)
-
-list_schemas = DQLQuery(
-    f"SELECT class_key, schema_id, created_at FROM {CONFIGS_SCHEMA}.schemas ORDER BY class_key, created_at",
-    result_handler=ResultHandler.ALL,
-)
-
-list_schemas_keys = DQLQuery(
-    f"SELECT class_key, schema_id FROM {CONFIGS_SCHEMA}.schemas",
-    result_handler=ResultHandler.ALL,
-)
-
-get_schemas_by_ids = DQLQuery(
-    f"SELECT schema_id, schema_json FROM {CONFIGS_SCHEMA}.schemas WHERE schema_id = ANY(:ids)",
+# Distinct (class_key, schema_id) actually serialized in platform config rows.
+# Schemas are not persisted in a registry table — they are generated on demand
+# from the registered class (``cls.model_json_schema()``). This query backs the
+# diagnostic audit of which schema versions live in real config rows.
+list_platform_config_schema_ids = DQLQuery(
+    f"SELECT DISTINCT class_key, schema_id FROM {CONFIGS_SCHEMA}.platform_configs ORDER BY class_key, schema_id;",
     result_handler=ResultHandler.ALL,
 )
 
@@ -181,19 +200,49 @@ def select_catalog_config_for_update(phys_schema: str) -> DQLQuery:
     )
 
 
+def select_catalog_config_versioned(phys_schema: str) -> DQLQuery:
+    """SELECT config_data + updated_at (CAS token) for a single ref_key, no lock."""
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f'SELECT config_data, updated_at FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE ref_key = :ref_key;',
+        result_handler=ResultHandler.ONE_DICT,
+    )
+
+
+def cas_update_catalog_config(phys_schema: str) -> DQLQuery:
+    """Atomic ``UPDATE ... WHERE ref_key = :ref_key AND updated_at = :expected_version``.
+
+    ``rowcount == 0`` means the row was absent or a concurrent writer
+    already moved ``updated_at`` past ``expected_version`` — the caller
+    (``ConfigService._set_catalog_config``) raises ``ConfigVersionConflictError``.
+    """
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f"""
+        UPDATE "{phys_schema}".{CATALOG_CONFIGS_TABLE} SET
+            class_key   = :class_key,
+            schema_id   = :schema_id,
+            config_data = CAST(:config_data AS jsonb),
+            updated_at  = NOW()
+        WHERE ref_key = :ref_key AND updated_at = :expected_version;
+        """,
+        result_handler=ResultHandler.ROWCOUNT,
+    )
+
+
 def upsert_catalog_config(phys_schema: str) -> DQLQuery:
     """INSERT … ON CONFLICT DO UPDATE for catalog-level config."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f"""
-        INSERT INTO "{phys_schema}".{CATALOG_CONFIGS_TABLE} (ref_key, class_key, schema_id, config_data, updated_at)
-        VALUES (:ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-        ON CONFLICT (ref_key) DO UPDATE SET
-            class_key   = EXCLUDED.class_key,
-            schema_id   = EXCLUDED.schema_id,
-            config_data = EXCLUDED.config_data,
-            updated_at  = NOW();
-        """,
+        build_upsert(
+            table=f'"{phys_schema}".{CATALOG_CONFIGS_TABLE}',
+            columns=("ref_key", "class_key", "schema_id", "config_data", "updated_at"),
+            conflict_cols=("ref_key",),
+            literal_values={
+                "config_data": "CAST(:config_data AS jsonb)",
+                "updated_at": "NOW()",
+            },
+        ),
         result_handler=ResultHandler.ROWCOUNT,
     )
 
@@ -216,18 +265,18 @@ def list_catalog_configs(phys_schema: str) -> DQLQuery:
     )
 
 
-def list_catalog_configs_paginated(phys_schema: str) -> DQLQuery:
-    """SELECT with window COUNT + ORDER BY ref_key, LIMIT/OFFSET pagination."""
+async def list_catalog_configs_paginated(
+    conn: DbResource, phys_schema: str, limit: int, offset: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Page catalog-level configs, ordered by ref_key. Returns ``(rows, total)``."""
     validate_sql_identifier(phys_schema)
-    return DQLQuery(
-        f"""
+    sql = f"""
         SELECT COUNT(*) OVER() AS total_count, ref_key, class_key, config_data
         FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE}
         ORDER BY ref_key
         LIMIT :limit OFFSET :offset;
-        """,
-        result_handler=ResultHandler.ALL_DICTS,
-    )
+    """
+    return await list_page_with_count(conn, sql, limit=limit, offset=offset)
 
 
 # --- collection_configs -------------------------------------------------------
@@ -250,6 +299,19 @@ def select_collection_config_by_ref(phys_schema: str) -> DQLQuery:
     )
 
 
+def select_collection_configs_batch(phys_schema: str) -> DQLQuery:
+    """Batched read: config_data for every ``collection_id`` in ``:collection_ids``
+    at one ``ref_key`` (no lock). One round trip instead of one per collection —
+    see :meth:`ConfigService.get_configs_batch`.
+    """
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f'SELECT collection_id, config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} '
+        f'WHERE collection_id = ANY(:collection_ids) AND ref_key = :ref_key;',
+        result_handler=ResultHandler.ALL_DICTS,
+    )
+
+
 def list_collection_refs(phys_schema: str) -> DQLQuery:
     """F.4c.2 enumerate {ref_key: class_key} for a given collection_id."""
     validate_sql_identifier(phys_schema)
@@ -268,19 +330,54 @@ def select_collection_config_for_update(phys_schema: str) -> DQLQuery:
     )
 
 
+def select_collection_config_versioned(phys_schema: str) -> DQLQuery:
+    """SELECT config_data + updated_at (CAS token) for (collection_id, ref_key), no lock."""
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f'SELECT config_data, updated_at FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} '
+        f'WHERE collection_id = :collection_id AND ref_key = :ref_key;',
+        result_handler=ResultHandler.ONE_DICT,
+    )
+
+
+def cas_update_collection_config(phys_schema: str) -> DQLQuery:
+    """Atomic ``UPDATE ... WHERE (collection_id, ref_key) = (...) AND updated_at = :expected_version``.
+
+    ``rowcount == 0`` means the row was absent or a concurrent writer
+    already moved ``updated_at`` past ``expected_version`` — the caller
+    (``ConfigService._set_collection_config``) raises ``ConfigVersionConflictError``.
+    """
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f"""
+        UPDATE "{phys_schema}".{COLLECTION_CONFIGS_TABLE} SET
+            class_key   = :class_key,
+            schema_id   = :schema_id,
+            config_data = CAST(:config_data AS jsonb),
+            updated_at  = NOW()
+        WHERE collection_id = :collection_id AND ref_key = :ref_key
+            AND updated_at = :expected_version;
+        """,
+        result_handler=ResultHandler.ROWCOUNT,
+    )
+
+
 def upsert_collection_config(phys_schema: str) -> DQLQuery:
     """INSERT … ON CONFLICT DO UPDATE for collection-level config."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f"""
-        INSERT INTO "{phys_schema}".{COLLECTION_CONFIGS_TABLE} (collection_id, ref_key, class_key, schema_id, config_data, updated_at)
-        VALUES (:collection_id, :ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-        ON CONFLICT (collection_id, ref_key) DO UPDATE SET
-            class_key   = EXCLUDED.class_key,
-            schema_id   = EXCLUDED.schema_id,
-            config_data = EXCLUDED.config_data,
-            updated_at  = NOW();
-        """,
+        build_upsert(
+            table=f'"{phys_schema}".{COLLECTION_CONFIGS_TABLE}',
+            columns=(
+                "collection_id", "ref_key", "class_key", "schema_id",
+                "config_data", "updated_at",
+            ),
+            conflict_cols=("collection_id", "ref_key"),
+            literal_values={
+                "config_data": "CAST(:config_data AS jsonb)",
+                "updated_at": "NOW()",
+            },
+        ),
         result_handler=ResultHandler.ROWCOUNT,
     )
 
@@ -294,16 +391,21 @@ def delete_collection_config(phys_schema: str) -> DQLQuery:
     )
 
 
-def list_collection_configs_paginated(phys_schema: str) -> DQLQuery:
-    """SELECT with window COUNT + ORDER BY ref_key for a given collection_id."""
+async def list_collection_configs_paginated(
+    conn: DbResource, phys_schema: str, collection_id: str, limit: int, offset: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Page collection-level configs for one collection, ordered by ref_key.
+
+    Returns ``(rows, total)``.
+    """
     validate_sql_identifier(phys_schema)
-    return DQLQuery(
-        f"""
+    sql = f"""
         SELECT COUNT(*) OVER() AS total_count, ref_key, class_key, config_data
         FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE}
         WHERE collection_id = :collection_id
         ORDER BY ref_key
         LIMIT :limit OFFSET :offset;
-        """,
-        result_handler=ResultHandler.ALL_DICTS,
+    """
+    return await list_page_with_count(
+        conn, sql, {"collection_id": collection_id}, limit=limit, offset=offset
     )

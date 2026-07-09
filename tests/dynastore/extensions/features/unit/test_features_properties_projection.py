@@ -126,7 +126,7 @@ def _wire(monkeypatch, svc, catalogs, valid_props=("title", "rainfall_mm", "coun
 
     async def _get_configs():
         class _Cfg:
-            async def get_config(self, cls, catalog_id=None, ctx=None):
+            async def get_config(self, cls, catalog_id=None, collection_id=None, ctx=None):
                 return FeaturesPluginConfig()
 
         return _Cfg()
@@ -260,6 +260,71 @@ async def test_properties_unknown_name_400(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_properties_accepts_canonical_stats_and_system_fields(monkeypatch):
+    """The ``properties`` query parameter must accept the same canonical
+    ``system``/``stats`` lanes the Queryables endpoint advertises (refs
+    #2230), even though this collection's own field definitions don't
+    declare them — mirrors the ``setdefault`` merge in
+    ``create_queryables_response`` (#2235)."""
+    import dynastore.tools.discovery as _discovery_mod
+    from dynastore.extensions.features.features_service import OGCFeaturesService
+    from dynastore.models.protocols.field_definition import FieldDefinition
+
+    class _FakeItemsProtocol:
+        async def get_collection_fields(self, catalog_id, collection_id):
+            return {
+                "title": FieldDefinition(name="title", data_type="string"),
+            }
+
+    # ``_resolve_property_names`` delegates to the shared
+    # ``resolve_queryable_property_names`` (SSOT also used to validate the
+    # ad-hoc ``?{property}={value}`` filter shorthand), which resolves
+    # ``get_protocol`` from ``dynastore.tools.discovery`` at call time.
+    monkeypatch.setattr(
+        _discovery_mod,
+        "get_protocol",
+        lambda proto: _FakeItemsProtocol(),
+    )
+
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    valid = await svc._resolve_property_names("cat", "col")
+    assert "title" in valid
+    # Canonical stats/system names, absent from the fake field defs, are
+    # still accepted.
+    assert "area" in valid
+    assert "validity" in valid
+    assert "geometry_hash" in valid
+
+
+@pytest.mark.asyncio
+async def test_properties_selects_canonical_field_end_to_end(monkeypatch):
+    """``?properties=area`` (a canonical stats field, not one of the
+    collection's own field defs) is accepted and, when present on the
+    streamed feature, survives the projection."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(
+        stream_features=[_feature("f-1", props={"title": "f-1", "area": 42.0})],
+        total=1,
+    )
+
+    async def _resolve_props(catalog_id, collection_id):
+        # Real resolver behaviour: declared fields + canonical lanes.
+        from dynastore.modules.elasticsearch.mappings import (
+            canonical_queryable_properties,
+        )
+
+        return {"title"} | canonical_queryable_properties().keys()
+
+    _wire(monkeypatch, svc, catalogs)
+    monkeypatch.setattr(svc, "_resolve_property_names", _resolve_props, raising=False)
+
+    resp = await _call_get_items(svc, properties="area")
+    body = json.loads(await _read_body(resp))
+    feat = body["features"][0]
+    assert feat["properties"] == {"area": 42.0}
+
+
+@pytest.mark.asyncio
 async def test_properties_threaded_into_query_request_select(monkeypatch):
     """Validated names are placed onto ``QueryRequest.select`` so PG/ES drivers
     that honour projection can narrow the read."""
@@ -271,6 +336,141 @@ async def test_properties_threaded_into_query_request_select(monkeypatch):
     assert catalogs.last_request is not None
     selected = {sel.field for sel in catalogs.last_request.select}
     assert {"title", "country"}.issubset(selected)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Ad-hoc ``?{property}={value}`` filter shorthand validation (#2682)
+# ---------------------------------------------------------------------------
+
+
+class _FakeFilteringCatalogs:
+    """``stream_items`` stand-in that actually applies a ``country = 'IT'``
+    shorthand equality filter threaded through ``QueryRequest.cql_filter`` —
+    real drivers do the equivalent via CQL→SQL/ES-query translation. Lets a
+    test assert that a *mapped* filter narrows the returned features and
+    ``numberMatched`` together; the two must never disagree (#2682)."""
+
+    def __init__(self, all_features):
+        self._all = all_features
+
+    async def get_collection(self, catalog_id, collection_id, lang="en"):
+        return {"id": collection_id}
+
+    async def stream_items(self, **kwargs):
+        req = kwargs["request"]
+        cql = req.cql_filter or ""
+        if "country = 'IT'" in cql:
+            matched = [f for f in self._all if f.properties.get("country") == "IT"]
+        else:
+            matched = list(self._all)
+
+        async def _gen():
+            for f in matched:
+                yield f
+
+        return QueryResponse(
+            items=_gen(),
+            total_count=len(matched),
+            catalog_id=kwargs["catalog_id"],
+            collection_id=kwargs["collection_id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_filter_param_returns_400_naming_the_param(monkeypatch):
+    """An ad-hoc ``?{property}={value}`` filter with no queryable mapping is
+    rejected with HTTP 400 naming the offending parameter — before any driver
+    is asked to serve the count or the listing, so the two can never disagree
+    (#2682)."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(
+        stream_features=[_feature("f-1"), _feature("f-2")], total=2
+    )
+    _wire(monkeypatch, svc, catalogs)
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _call_get_items(
+            svc, request=_make_request(query_string=b"GAUL1_CODE=3296")
+        )
+    assert excinfo.value.status_code == 400
+    assert "GAUL1_CODE" in str(excinfo.value.detail)
+    # The unknown filter must short-circuit before the driver is invoked —
+    # otherwise the count and listing paths could still disagree.
+    assert catalogs.stream_called is False
+
+
+@pytest.mark.asyncio
+async def test_valid_filter_param_filters_and_matches_count(monkeypatch):
+    """A filter name that IS in the collection's queryable surface narrows
+    both the returned features and ``numberMatched`` together."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    all_features = [
+        _feature("f-1", props={"title": "f-1", "country": "IT"}),
+        _feature("f-2", props={"title": "f-2", "country": "FR"}),
+    ]
+    catalogs = _FakeFilteringCatalogs(all_features)
+    _wire(monkeypatch, svc, catalogs)
+
+    resp = await _call_get_items(
+        svc, request=_make_request(query_string=b"country=IT")
+    )
+    body = json.loads(await _read_body(resp))
+    assert [f["id"] for f in body["features"]] == ["f-1"]
+    assert body["numberMatched"] == 1
+    assert len(body["features"]) == body["numberMatched"]
+
+
+@pytest.mark.asyncio
+async def test_canonical_queryable_name_accepted_as_filter(monkeypatch):
+    """A canonical system/stats lane (the same surface ``/queryables``
+    advertises via ``canonical_queryable_properties()``) is accepted as an
+    ad-hoc filter even when absent from the collection's own field defs —
+    mirrors the ``properties=`` acceptance (refs #2230/#2235)."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[_feature("f-1")], total=1)
+
+    async def _resolve_props(catalog_id, collection_id):
+        from dynastore.modules.elasticsearch.mappings import (
+            canonical_queryable_properties,
+        )
+
+        return {"title"} | canonical_queryable_properties().keys()
+
+    _wire(monkeypatch, svc, catalogs)
+    monkeypatch.setattr(svc, "_resolve_property_names", _resolve_props, raising=False)
+
+    # No exception → the canonical name "area" is an accepted filter.
+    await _call_get_items(svc, request=_make_request(query_string=b"area=42"))
+    assert catalogs.last_request is not None
+    assert catalogs.last_request.cql_filter is not None
+    assert "area" in catalogs.last_request.cql_filter
+
+
+@pytest.mark.asyncio
+async def test_reserved_params_are_never_treated_as_filters(monkeypatch):
+    """OGC reserved query parameters (``sortby``, ``skipGeometry``, …) must
+    never be swept into the ad-hoc filter shorthand, even though none of
+    them is a queryable property name — a request carrying only reserved
+    params must not 400 and must not thread a ``cql_filter``."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[_feature("f-1")], total=1)
+    _wire(monkeypatch, svc, catalogs)
+
+    resp = await _call_get_items(
+        svc,
+        request=_make_request(
+            query_string=b"sortby=title&skipGeometry=false&crs=CRS84"
+        ),
+        sortby="title",
+        skip_geometry=False,
+        crs="http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    )
+    body = json.loads(await _read_body(resp))
+    assert [f["id"] for f in body["features"]] == ["f-1"]
+    assert catalogs.last_request is not None
+    assert catalogs.last_request.cql_filter is None
 
 
 # ---------------------------------------------------------------------------

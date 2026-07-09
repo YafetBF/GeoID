@@ -104,11 +104,14 @@ class TaskIngestionRequest(BaseModel):
     reporting: Optional[IngestionReportingConfig] = Field(default=None, description="Configuration for generating detailed ingestion reports.")
     pre_operations: Optional[Dict[str, Dict[str, Any]]] = Field(default=None, description="Configuration for pre-ingestion operations.")
     post_operations: Optional[Dict[str, Dict[str, Any]]] = Field(default=None, description="Configuration for post-ingestion operations.")
-    database_batch_size: Optional[int] = Field(default=None, description="Number of records to insert into the database in a single transaction. If not set, max_batch_memory_mb is used.")
-    max_batch_memory_mb: int = Field(default=100, description="Maximum memory (in MB) to accumulate in a batch before flushing to database. Takes precedence over database_batch_size if both are set.")
+    database_batch_size: Optional[int] = Field(default=None, description="Maximum number of records per write batch (defaults to 50 when unset). A batch is flushed when this row cap OR max_batch_memory_mb is reached, whichever comes first. The conservative default keeps dense-geometry sources (e.g. admin-boundary polygons) safely under the memory budget without per-request tuning.")
+    max_batch_memory_mb: int = Field(default=32, description="Approximate geometry memory budget (in MB) accumulated before a batch is flushed. Bounds peak memory for geometry-heavy sources independently of the row count: a batch flushes when either this budget or database_batch_size is reached. Conservative default (32 MB) prevents OOM on dense polygon sources such as large admin-boundary datasets.")
     offset: int = Field(default=0, description="Number of records to skip from the beginning of the source file.")
     limit: Optional[int] = Field(default=None, description="Maximum number of records to process from the source file.")
     read_batch_size:  int = Field(default=1000, description="Number of records to read from the source file if supported by the source file format.")
+
+    reader: Optional[str] = Field(default=None, description="Explicit reader_id override (e.g. 'gdal_osgeo', 'pyogrio', 'duckdb'). When unset, the registry auto-selects by priority/extension match.")
+    reader_options: Optional[Dict[str, Any]] = Field(default=None, description="Extra reader-specific options forwarded to the chosen reader's open() call (e.g. {'read_batch_size': 500, 'use_vsicache': True}). Overrides the corresponding top-level field (e.g. read_batch_size) when both are set.")
 
     @model_validator(mode='after')
     def validate_asset_present(self) -> 'TaskIngestionRequest':

@@ -95,15 +95,21 @@ _logger = logging.getLogger(__name__)
 class DuckDBConfig:
     """DuckDB driver-level configuration (env vars).
 
-    Controls connection pooling, resource limits, and extension loading for
-    the DuckDB storage driver.  Follows the same pattern as
-    ``DBConfig`` (``DB_POOL_*``) and Elasticsearch (``ES_*``).
+    Controls resource limits and extension loading for the DuckDB storage
+    driver.  Follows the same pattern as ``DBConfig`` (``DB_POOL_*``) and
+    Elasticsearch (``ES_*``).
 
     Per-collection configs (``ItemsDuckdbDriverConfig``) hold only file
     paths and format overrides; they should be relative to ``data_root``.
+
+    Connection-pool sizing is NOT here: it is behavioral (an operator tunes
+    it live to relieve read-throughput pressure) rather than a boot-time
+    infra constant, so it lives on ``DuckdbEngineConfig.pool_size``
+    (``modules/db_config/engine_config.py``) — the hot-reloadable config
+    registry entry the driver reads at ``lifespan()`` time. See
+    ``drivers/duckdb.py::_read_live_pool_size``.
     """
 
-    pool_size: int = int(os.getenv("DUCKDB_POOL_SIZE", "4"))
     max_memory: str = os.getenv("DUCKDB_MAX_MEMORY", "4GB")
     threads: int = int(os.getenv("DUCKDB_THREADS", "4"))
     extensions: str = os.getenv("DUCKDB_EXTENSIONS", "spatial")
@@ -518,6 +524,20 @@ class ItemsWritePolicy(PluginConfig):
             "entity document — provenance tracking. Disable only when source "
             "tracking is intentionally severed (e.g. derived collections "
             "produced from a join)."
+        ),
+    )
+    enable_batch_insert: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "Enable the batched bulk-insert fast path for Phase 4 chunk writes. "
+            "When True, each chunk collapses identity resolution into a single "
+            "ANY-lookup and hub+sidecar rows into multi-row INSERT statements, "
+            "reducing per-feature round-trips from ~5 to ~3 per chunk. "
+            "Enabled by default — validated on live data with ~6x ingestion "
+            "speedup. The per-row path is the automatic fallback for the UPDATE "
+            "partition, NEW_VERSION archival, geohash/attributes_hash identity "
+            "matchers, and any batch exception, so correctness is always "
+            "preserved. Set False to revert to per-row for a specific collection."
         ),
     )
     validity: Immutable[Optional[ValiditySpec]] = Field(
@@ -1126,8 +1146,8 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
         ),
     )
     # Issue #1248: geometry simplification is on by default. The driver
-    # simplifies oversized geometries to fit the ES 10 MB per-document
-    # limit; the PostgreSQL primary always keeps full resolution.
+    # simplifies oversized geometries to fit the ES byte budget; the
+    # PostgreSQL primary always keeps full resolution.
     simplify_geometry: Mutable[bool] = Field(
         default=True,
         description=(
@@ -1139,16 +1159,38 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
         ),
     )
     simplify_target_bytes: Mutable[Optional[int]] = Field(
-        default=None,
+        default=1_048_576,
         ge=1,
-        examples=[None, 1_000_000],
+        examples=[1_048_576, 5_000_000],
         description=(
-            "Target byte budget for ES geometry simplification. When set, "
-            "geometry is simplified to fit under this size instead of the "
-            "10 MB Elasticsearch per-document limit — lower values keep ES "
-            "indices smaller at the cost of geometry fidelity. Values above "
-            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
-            "limit when unset. Does not affect the PostgreSQL primary."
+            "Target byte budget for ES geometry simplification. Geometry is "
+            "simplified to fit under this size before indexing — lower values "
+            "keep ES indices smaller and writes faster. The hard 10 MB ES "
+            "per-document ceiling is always enforced as an upper bound. "
+            "Defaults to 1 MB (1 048 576 bytes). Does not affect the "
+            "PostgreSQL primary."
+        ),
+    )
+    snap_to_grid: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, an O(n) coordinate snap-to-grid step runs before the "
+            "iterative Douglas-Peucker simplification loop. Snapping is fast "
+            "and reduces vertex count cheaply for heavy layers; if snap alone "
+            "brings the document under the byte budget the D-P loop is skipped "
+            "entirely. Recorded as mode 'snap_to_grid' (or 'snap_to_grid+"
+            "tolerance'/'snap_to_grid+bbox' when the D-P loop also runs). "
+            "Off by default; useful for collections with very dense geometries."
+        ),
+    )
+    snap_grid_size: Mutable[float] = Field(
+        default=1e-5,
+        gt=0,
+        description=(
+            "Grid cell size (in geometry CRS units) for the snap-to-grid "
+            "pre-pass. For geographic coordinates (degrees) the default "
+            "1e-5 ≈ 1.1 m at the equator — sub-visual at all tile zoom "
+            "levels. Only active when snap_to_grid=True."
         ),
     )
 
@@ -1225,16 +1267,32 @@ class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
         ),
     )
     simplify_target_bytes: Mutable[Optional[int]] = Field(
-        default=None,
+        default=1_048_576,
         ge=1,
-        examples=[None, 1_000_000],
+        examples=[1_048_576, 5_000_000],
         description=(
-            "Target byte budget for ES geometry simplification. When set, "
-            "geometry is simplified to fit under this size instead of the "
-            "10 MB Elasticsearch per-document limit — lower values keep ES "
-            "indices smaller at the cost of geometry fidelity. Values above "
-            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
-            "limit when unset. Does not affect the PostgreSQL primary."
+            "Target byte budget for ES geometry simplification. Geometry is "
+            "simplified to fit under this size before indexing. The hard 10 MB "
+            "ES per-document ceiling is always enforced as an upper bound. "
+            "Defaults to 1 MB (1 048 576 bytes). Does not affect the "
+            "PostgreSQL primary."
+        ),
+    )
+    snap_to_grid: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, an O(n) coordinate snap-to-grid step runs before the "
+            "iterative Douglas-Peucker simplification loop. Off by default; "
+            "useful for collections with very dense geometries."
+        ),
+    )
+    snap_grid_size: Mutable[float] = Field(
+        default=1e-5,
+        gt=0,
+        description=(
+            "Grid cell size for the snap-to-grid pre-pass (geometry CRS "
+            "units). Default 1e-5 degrees ≈ 1.1 m at the equator. "
+            "Only active when snap_to_grid=True."
         ),
     )
 
@@ -1292,16 +1350,32 @@ class ItemsElasticsearchEnvelopeDriverConfig(CollectionDriverConfig):
         ),
     )
     simplify_target_bytes: Mutable[Optional[int]] = Field(
-        default=None,
+        default=1_048_576,
         ge=1,
-        examples=[None, 1_000_000],
+        examples=[1_048_576, 5_000_000],
         description=(
-            "Target byte budget for ES geometry simplification. When set, "
-            "geometry is simplified to fit under this size instead of the "
-            "10 MB Elasticsearch per-document limit — lower values keep ES "
-            "indices smaller at the cost of geometry fidelity. Values above "
-            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
-            "limit when unset. Does not affect the PostgreSQL primary."
+            "Target byte budget for ES geometry simplification. Geometry is "
+            "simplified to fit under this size before indexing. The hard 10 MB "
+            "ES per-document ceiling is always enforced as an upper bound. "
+            "Defaults to 1 MB (1 048 576 bytes). Does not affect the "
+            "PostgreSQL primary."
+        ),
+    )
+    snap_to_grid: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, an O(n) coordinate snap-to-grid step runs before the "
+            "iterative Douglas-Peucker simplification loop. Off by default; "
+            "useful for collections with very dense geometries."
+        ),
+    )
+    snap_grid_size: Mutable[float] = Field(
+        default=1e-5,
+        gt=0,
+        description=(
+            "Grid cell size for the snap-to-grid pre-pass (geometry CRS "
+            "units). Default 1e-5 degrees ≈ 1.1 m at the equator. "
+            "Only active when snap_to_grid=True."
         ),
     )
 
@@ -1601,13 +1675,15 @@ class ItemsSchema(PluginConfig):
     DuckDB CREATE TABLE) and optional service-layer enforcement.
 
     ``constraints`` is an open list of :class:`~dynastore.modules.storage.schema_types.FieldConstraint`
-    instances, e.g.::
+    instances, e.g. a 2-column composite uniqueness constraint::
 
         ItemsSchema(
-            fields={"name": FieldDefinition(data_type="string")},
+            fields={
+                "name": FieldDefinition(data_type="string"),
+                "code": FieldDefinition(data_type="string"),
+            },
             constraints=[
-                RequiredConstraint(field="name"),
-                UniqueConstraint(field="name"),
+                UniqueConstraint(field_names=["name", "code"]),
             ],
         )
     """
@@ -1675,6 +1751,45 @@ class ItemsSchema(PluginConfig):
             "Examples: RequiredConstraint, UniqueConstraint."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_constraints(self) -> "ItemsSchema":
+        """Validate declarative ``constraints`` against ``self.fields``.
+
+        Every ``UniqueConstraint.field_names`` entry must reference a field
+        declared in ``self.fields``. An empty ``field_names`` (the default)
+        is a legacy no-op placeholder — per-field uniqueness is expressed on
+        ``FieldDefinition.unique``, not here — and is skipped entirely.
+        Composite (2+ column) constraints may not repeat the same column
+        twice within themselves, nor duplicate another composite
+        constraint's exact column set (both would produce the identical
+        PostgreSQL unique index and are almost certainly a config mistake).
+        """
+        from dynastore.modules.storage.schema_types import UniqueConstraint
+
+        seen_composite: set[Tuple[str, ...]] = set()
+        for constraint in self.constraints:
+            if not isinstance(constraint, UniqueConstraint) or not constraint.field_names:
+                continue
+            names = constraint.field_names
+            if len(names) != len(set(names)):
+                raise ValueError(
+                    f"UniqueConstraint.field_names has repeated column(s): {names}"
+                )
+            missing = [n for n in names if n not in self.fields]
+            if missing:
+                raise ValueError(
+                    f"UniqueConstraint.field_names references undeclared field(s) "
+                    f"{missing}; declared fields: {sorted(self.fields)}"
+                )
+            if len(names) >= 2:
+                key = tuple(names)
+                if key in seen_composite:
+                    raise ValueError(
+                        f"Duplicate composite UniqueConstraint on fields {names}"
+                    )
+                seen_composite.add(key)
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -1851,6 +1966,24 @@ async def _validate_items_schema(
 ItemsSchema.register_validate_handler(_validate_items_schema)
 
 
+# GeoJSON/STAC top-level member names — never legitimately live inside
+# ``properties`` on a tenant feature doc, regardless of ``container``.
+# Mirrors ``elasticsearch_private.mappings._RESERVED_MEMBER_KEYS`` (kept
+# as a separate copy here, not imported, for the same config->driver
+# layering reason documented on ``_PRIVATE_RESERVED_ROOT_FIELDS`` below).
+_RESERVED_MEMBER_KEYS: FrozenSet[str] = frozenset({
+    "id",
+    "type",
+    "geometry",
+    "bbox",
+    "links",
+    "assets",
+    "collection",
+    "stac_version",
+    "stac_extensions",
+})
+
+
 async def _validate_items_schema_reserved_names(
     config: PluginConfig,
     catalog_id: "Optional[str]",
@@ -1865,21 +1998,40 @@ async def _validate_items_schema_reserved_names(
     fail downstream in opaque ways (DDL collision, JSONB extract returning
     the system value, sidecar config rebuild loops). Fail loud at config-save
     so the operator picks a different name before any write hits the driver.
+
+    #2642: a name outside the true-structural ``_RESERVED_MEMBER_KEYS`` set
+    (e.g. ``external_id``) is allowed when the field's ``container`` is
+    ``"properties"`` — it resolves to the distinct ``properties.<name>``
+    path, not the doc root, so it never shadows the system field there (the
+    private write projection additionally quarantines any accidental
+    structural leak into ``properties.extras``). The nested-container names
+    ``properties`` / ``extras`` stay blocked regardless of ``container`` —
+    those would collide with the quarantine bucket itself.
     """
     if not isinstance(config, ItemsSchema):
         return
     if not config.fields:
         return
+
+    def _collides(name: str, container: str) -> bool:
+        if name in _RESERVED_MEMBER_KEYS or name in ("properties", "extras"):
+            return True
+        if container == "properties":
+            return False
+        return name in _PRIVATE_RESERVED_ROOT_FIELDS
+
     # A field collides whether the reserved name is used as the declared key
     # (``name``) OR as the read-time rename (``alias``): an alias of e.g.
     # ``geometry`` would shadow the system field on the wire exactly as a
     # like-named key would in storage (#1489 item 3). Both are reported in one
     # error so the operator fixes every offender in a single pass.
-    collisions = sorted(n for n in config.fields if n in _PRIVATE_RESERVED_ROOT_FIELDS)
+    collisions = sorted(
+        n for n, fd in config.fields.items() if _collides(n, fd.container)
+    )
     alias_collisions = sorted(
         f"{n} (alias={fd.alias!r})"
         for n, fd in config.fields.items()
-        if fd.alias and fd.alias in _PRIVATE_RESERVED_ROOT_FIELDS
+        if fd.alias and _collides(fd.alias, fd.container)
     )
     if collisions or alias_collisions:
         offenders = collisions + alias_collisions

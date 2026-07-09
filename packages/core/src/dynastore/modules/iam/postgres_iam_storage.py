@@ -25,9 +25,13 @@ import json
 import logging
 import time
 
-from dynastore.modules.db_config.exceptions import TableNotFoundError
+from dynastore.modules.db_config.exceptions import (
+    SchemaNotFoundError,
+    TableNotFoundError,
+)
 from dynastore.modules.db_config.query_executor import (
     DDLBatch,
+    DDLQuery,
     DQLQuery,
     ResultHandler,
     DbResource,
@@ -113,15 +117,16 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         (consumed via `PolicyService._resolve_schema(catalog_id)`).
         `principals` / `identity_links` / `refresh_tokens` / `audit_log` /
         `usage_counters` live platform-only: every read/write path pins
-        `schema="iam"`, so the tenant copies were dead weight. The
-        catalog provisioning lifecycle hook
-        (`catalog_service._build_tenant_core_ddl_batch`) bootstraps the
-        tenant subset; this method overlaps with it (idempotent CREATE
-        TABLE IF NOT EXISTS) and adds the `policies` table that the
-        catalog hook doesn't.
+        `schema="iam"`, so the tenant copies were dead weight. This method
+        is the single owner of the tenant subset — it is invoked by the
+        `critical` catalog lifecycle hook `initialize_iam_tenant`, so the
+        four per-tenant tables (`roles`, `role_hierarchy`, `grants`,
+        `policies`) commit atomically with the catalog or the create is
+        aborted (#2610). Core no longer bootstraps any IAM table.
 
         Uses DDLBatch sentinel check — on warm start, 1 query confirms
-        all tables exist.
+        all tables exist; missing tables self-heal on the next provision
+        (idempotent CREATE TABLE IF NOT EXISTS + 4-table sentinel).
         """
         # Strip quotes just in case, to prevent double quoting.
         schema = schema.strip('"')
@@ -186,11 +191,25 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             sentinel = CREATE_USAGE_COUNTERS_TABLE
         else:
             platform_steps = []
-            # Tenant sentinel: `grants` is the newest of the per-scope
-            # tables; if it exists the whole batch can be skipped on warm
-            # DBs (mirrors the cold-cut rationale above, scoped to the
-            # tenant set).
-            sentinel = CREATE_GRANTS_TABLE
+            # Tenant sentinel: ALL four per-scope IAM tables must be present
+            # for the warm-start skip to fire.  A catalog missing any one of
+            # them — e.g. role_hierarchy added after the catalog was first
+            # provisioned — will have the missing table(s) created on the next
+            # provision without a full re-provision (#2569 residual fix).
+            from dynastore.modules.db_config.locking_tools import check_table_exists as _cte
+
+            _tenant_sentinel_tables = ("roles", "role_hierarchy", "grants", "policies")
+
+            async def _check_tenant_sentinel(conn):
+                for _tbl in _tenant_sentinel_tables:
+                    if not await _cte(conn, _tbl, schema):
+                        return False
+                return True
+
+            sentinel = DDLQuery(
+                "SELECT 1 -- iam tenant sentinel: all per-tenant IAM tables",
+                check_query=_check_tenant_sentinel,
+            )
 
         await DDLBatch(
             sentinel=sentinel,
@@ -407,9 +426,22 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 return list(result)
 
         async with managed_transaction(conn or self.engine) as db:
-            children = await GET_FULL_ROLE_HIERARCHY.execute(
-                db, schema=schema, role_names=role_names
-            )
+            try:
+                children = await GET_FULL_ROLE_HIERARCHY.execute(
+                    db, schema=schema, role_names=role_names
+                )
+            except (TableNotFoundError, SchemaNotFoundError):
+                # Tombstoned catalog whose schema was dropped, or a catalog
+                # still provisioning — treat as an empty role hierarchy
+                # (no custom roles) rather than raising and forcing token
+                # validation into an ERROR-logged 500. Mirrors the
+                # TableNotFoundError tolerance already used elsewhere in
+                # this class (list_catalog_roles, get_identity_roles).
+                logger.debug(
+                    "role_hierarchy table/schema absent for schema %r; "
+                    "treating as empty hierarchy", schema,
+                )
+                children = []
             merged = list(set(role_names + children))
             self._role_hierarchy_cache[cache_key] = (merged, time.monotonic())
             return merged
@@ -1260,7 +1292,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
 
         async with managed_transaction(self.engine) as db:
             rows = await DQLQuery(
-                "SELECT id, physical_schema FROM catalog.catalogs "
+                "SELECT id FROM catalog.catalogs "
                 "WHERE deleted_at IS NULL ORDER BY id;",
                 result_handler=ResultHandler.ALL_DICTS,
             ).execute(conn=db)
@@ -1268,7 +1300,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         result: Dict[str, List[str]] = {}
         for row in rows or []:
             cid = row.get("id")
-            schema = row.get("physical_schema") or row.get("schema")
+            schema = cid  # the catalog's internal id IS its per-tenant schema name
             if not cid or not schema:
                 continue
             try:

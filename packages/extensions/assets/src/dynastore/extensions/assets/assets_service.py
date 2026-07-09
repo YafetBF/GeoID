@@ -16,6 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import asyncio
 import json
 import logging
 import os
@@ -232,456 +233,444 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         _ = _wpa.AssetWritePolicyDefaults
 
     def _setup_routes(self):
-        # ---------------------------------------------------------------
-        # OGC API - Assets landing page + conformance (registered BEFORE
-        # parametric ``/catalogs/{catalog_id}`` routes so they don't get
-        # shadowed by FastAPI's declaration-order match).
-        # ---------------------------------------------------------------
-        self.router.add_api_route(
-            "/",
-            self.ogc_landing_page_handler,
-            methods=["GET"],
-            summary="Landing Page (OGC API - Assets)",
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.ogc_conformance_handler,
-            methods=["GET"],
-            summary="Conformance Declaration (OGC API - Assets)",
-        )
-        # ---------------------------------------------------------------
-        # Bulk POST routes (207 IngestionReport on partial rejection).
-        # The trailing ``:bulk`` action segment cannot collide with the
-        # ``{asset_id}`` parametric routes registered later because FastAPI
-        # matches the literal ``assets:bulk`` path component first.
-        # ---------------------------------------------------------------
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets:bulk",
-            self.bulk_create_catalog_assets,
-            methods=["POST"],
-            summary="Bulk Create Catalog Assets",
-            description=(
-                "Atomic bulk asset creation for a catalog. Each payload is "
-                "dispatched through the per-collection AssetsWritePolicy "
-                "chain. Returns 201 ``BulkCreationResponse`` when every "
-                "asset is accepted, or 207 ``IngestionReport`` when one or "
-                "more assets are refused by the write-policy."
+        col = "/catalogs/{catalog_id}/collections/{collection_id}"
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            # ---------------------------------------------------------------
+            # OGC API - Assets landing page + conformance (registered BEFORE
+            # parametric ``/catalogs/{catalog_id}`` routes so they don't get
+            # shadowed by FastAPI's declaration-order match).
+            # ---------------------------------------------------------------
+            (
+                "/", "ogc_landing_page_handler", ["GET"],
+                {"summary": "Landing Page (OGC API - Assets)"},
             ),
-            responses={
-                201: {"description": "All assets accepted."},
-                207: {"description": "Partial or full rejection — see IngestionReport."},
-            },
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets:bulk",
-            self.bulk_create_collection_assets,
-            methods=["POST"],
-            summary="Bulk Create Collection Assets",
-            description=(
-                "Atomic bulk asset creation scoped to a collection. Same "
-                "semantics as the catalog-level endpoint; the AssetsWritePolicy "
-                "is resolved at the collection scope."
+            (
+                "/conformance", "ogc_conformance_handler", ["GET"],
+                {"summary": "Conformance Declaration (OGC API - Assets)"},
             ),
-            responses={
-                201: {"description": "All assets accepted."},
-                207: {"description": "Partial or full rejection — see IngestionReport."},
-            },
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.list_catalog_assets,
-            methods=["GET"],
-            summary="List Catalog Assets",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.create_catalog_asset,
-            methods=["POST"],
-            response_model=Asset,
-            status_code=status.HTTP_201_CREATED,
-            summary="Create Catalog Asset",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.delete_catalog_assets,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete All Catalog Assets",
-        )
-        # Virtual asset register routes (catalog + collection scoped).
-        # External-href registrations land here so they don't collide with the
-        # physical-asset upload-create surface.
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/virtual-assets",
-            self.create_catalog_virtual_asset,
-            methods=["POST"],
-            response_model=Asset,
-            status_code=status.HTTP_201_CREATED,
-            summary="Register Virtual Catalog Asset",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/virtual-assets",
-            self.create_collection_virtual_asset,
-            methods=["POST"],
-            response_model=Asset,
-            status_code=status.HTTP_201_CREATED,
-            summary="Register Virtual Collection Asset",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.list_collection_assets,
-            methods=["GET"],
-            summary="List Collection Assets",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.create_collection_asset,
-            methods=["POST"],
-            response_model=Asset,
-            status_code=status.HTTP_201_CREATED,
-            summary="Create Collection Asset",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}",
-            self.get_catalog_asset,
-            methods=["GET"],
-            response_model=Asset,
-            summary="Get Asset",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}",
-            self.update_catalog_asset,
-            methods=["PUT"],
-            response_model=Asset,
-            summary="Replace Asset (full)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}",
-            self.patch_catalog_asset,
-            methods=["PATCH"],
-            response_model=Asset,
-            summary="Update Asset (partial)",
-            description=(
-                "Partial update via **RFC 7396 JSON Merge Patch**. The only "
-                "patchable top-level key is `metadata`; inside it, keys absent "
-                "from the patch are preserved, a key set to `null` is removed, "
-                "and nested objects are deep-merged. Lists and scalars replace. "
-                "Use `PUT` to replace `metadata` wholesale."
-            ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}",
-            self.delete_catalog_asset_by_id,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete Asset",
-            description=(
-                "Deletes an asset by ID. "
-                "Soft-delete (default) sets `status='deleted'`; hard-delete (`force=true`) removes "
-                "the row entirely. Hard-deletion is **blocked** (HTTP 409) when the asset is "
-                "owned by a storage backend (`owned_by` is set) and one or more non-cascading "
-                "references remain. Use `GET .../references` to diagnose blocking references."
-            ),
-            responses={
-                204: {"description": "Asset deleted."},
-                404: {"description": "Asset not found."},
-                409: {
-                    "description": "Asset has blocking references. Hard-deletion is not allowed until they are removed.",
-                    "content": {
-                        "application/json": {
-                            "example": {
-                                "detail": {
-                                    "message": "Asset 'my_asset' cannot be hard-deleted: 1 blocking reference(s) remain.",
-                                    "asset_id": "my_asset",
-                                    "blocking_references": [
-                                        {
-                                            "ref_type": "duckdb:table",
-                                            "ref_id": "my_collection_table",
-                                            "cascade_delete": False,
-                                            "created_at": "2025-03-25T10:00:00Z",
-                                        }
-                                    ],
-                                }
-                            }
-                        }
+            # ---------------------------------------------------------------
+            # Bulk POST routes (207 IngestionReport on partial rejection).
+            # The trailing ``:bulk`` action segment cannot collide with the
+            # ``{asset_id}`` parametric routes registered later because FastAPI
+            # matches the literal ``assets:bulk`` path component first.
+            # ---------------------------------------------------------------
+            (
+                "/catalogs/{catalog_id}/assets:bulk", "bulk_create_catalog_assets", ["POST"],
+                {
+                    "summary": "Bulk Create Catalog Assets",
+                    "description": (
+                        "Atomic bulk asset creation for a catalog. Each payload is "
+                        "dispatched through the per-collection AssetsWritePolicy "
+                        "chain. Returns 201 ``BulkCreationResponse`` when every "
+                        "asset is accepted, or 207 ``IngestionReport`` when one or "
+                        "more assets are refused by the write-policy."
+                    ),
+                    "responses": {
+                        201: {"description": "All assets accepted."},
+                        207: {"description": "Partial or full rejection — see IngestionReport."},
                     },
                 },
-            },
-        )
-        # Collection-level single asset routes
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}",
-            self.get_collection_asset,
-            methods=["GET"],
-            response_model=Asset,
-            summary="Get Collection Asset",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}",
-            self.update_collection_asset,
-            methods=["PUT"],
-            response_model=Asset,
-            summary="Replace Collection Asset (full)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}",
-            self.patch_collection_asset,
-            methods=["PATCH"],
-            response_model=Asset,
-            summary="Update Collection Asset (partial)",
-            description=(
-                "Partial update via **RFC 7396 JSON Merge Patch**. The only "
-                "patchable top-level key is `metadata`; inside it, keys absent "
-                "from the patch are preserved, a key set to `null` is removed, "
-                "and nested objects are deep-merged. Lists and scalars replace. "
-                "Use `PUT` to replace `metadata` wholesale."
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}",
-            self.delete_collection_asset_by_id,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete Collection Asset",
-            description=(
-                "Deletes a collection-scoped asset by ID. "
-                "Hard-deletion (`force=true`) is blocked (HTTP 409) when blocking "
-                "references remain. See `GET .../references` for details."
+            (
+                f"{col}/assets:bulk", "bulk_create_collection_assets", ["POST"],
+                {
+                    "summary": "Bulk Create Collection Assets",
+                    "description": (
+                        "Atomic bulk asset creation scoped to a collection. Same "
+                        "semantics as the catalog-level endpoint; the AssetsWritePolicy "
+                        "is resolved at the collection scope."
+                    ),
+                    "responses": {
+                        201: {"description": "All assets accepted."},
+                        207: {"description": "Partial or full rejection — see IngestionReport."},
+                    },
+                },
             ),
-            responses={
-                204: {"description": "Asset deleted."},
-                404: {"description": "Asset not found."},
-                409: {"description": "Asset has blocking references preventing hard-deletion."},
-            },
-        )
-        # Collection delete all
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.delete_collection_assets,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete All Collection Assets",
-        )
-        # Canonical asset search routes (path-scoped, routing-aware).
-        # All three share one ``_run_scoped_search`` impl; the scope is
-        # taken from the path. Search resolves the ``SEARCH`` asset driver
-        # with a fallback to ``READ`` (see ``get_asset_search_driver``), so
-        # an operator can route asset search to a dedicated index driver
-        # (e.g. Elasticsearch) per catalog/collection without code changes.
-        self.router.add_api_route(
-            "/assets-search",
-            self.advanced_search_global,
-            methods=["POST"],
-            summary="Advanced Asset Search (cross-catalog)",
-            description=(
-                "Cross-catalog asset search. Aggregates up to ``limit`` "
-                "matches across the catalogs the caller can see. Resolves "
-                "each catalog's routed SEARCH driver (READ fallback)."
+            (
+                "/catalogs/{catalog_id}", "list_catalog_assets", ["GET"],
+                {"summary": "List Catalog Assets"},
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets-search",
-            self.advanced_search,
-            methods=["POST"],
-            summary="Advanced Asset Search (scoped to catalog)",
-            description=(
-                "Search catalog-tier assets (those not bound to a "
-                "collection). Resolves the catalog's routed SEARCH driver "
-                "with a READ fallback."
+            (
+                "/catalogs/{catalog_id}", "create_catalog_asset", ["POST"],
+                {
+                    "response_model": Asset,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Create Catalog Asset",
+                },
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets-search",
-            self.advanced_search_collection,
-            methods=["POST"],
-            summary="Advanced Asset Search (scoped to collection)",
-            description=(
-                "Search assets within a single collection. The "
-                "``collection_id`` from the path is authoritative. Resolves "
-                "the collection's routed SEARCH driver with a READ fallback."
+            (
+                "/catalogs/{catalog_id}", "delete_catalog_assets", ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Delete All Catalog Assets",
+                },
             ),
-        )
-        # -----------------------------------------------------------------
-        # Upload endpoints (backend-agnostic)
-        # -----------------------------------------------------------------
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/upload",
-            self.initiate_catalog_upload,
-            methods=["POST"],
-            response_model=UploadTicket,
-            status_code=status.HTTP_200_OK,
-            summary="Initiate Asset Upload (Catalog Level)",
-            description=(
-                "Starts a new upload session for a catalog-level asset. "
-                "Returns an `UploadTicket` containing a backend-specific upload URL, "
-                "the HTTP method to use (`PUT` for GCS/S3, `POST` for local), and any "
-                "required headers. "
-                "After delivering the file the backend registers the asset automatically "
-                "(event-driven for GCS/S3, synchronous for local storage). "
-                "Poll `/upload/{ticket_id}/status` to confirm registration."
+            # Virtual asset register routes (catalog + collection scoped).
+            # External-href registrations land here so they don't collide with the
+            # physical-asset upload-create surface.
+            (
+                "/catalogs/{catalog_id}/virtual-assets", "create_catalog_virtual_asset", ["POST"],
+                {
+                    "response_model": Asset,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Register Virtual Catalog Asset",
+                },
             ),
-            responses={
-                200: {"description": "Upload session created. Use the returned ticket to upload the file."},
-                503: {"description": "No upload backend available or storage not provisioned."},
-                424: {"description": "Catalog storage provisioning failed."},
-            },
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/upload",
-            self.initiate_collection_upload,
-            methods=["POST"],
-            response_model=UploadTicket,
-            status_code=status.HTTP_200_OK,
-            summary="Initiate Asset Upload (Collection Level)",
-            description=(
-                "Starts a new upload session for an asset scoped to a collection. "
-                "Identical to the catalog-level endpoint but the file is stored under "
-                "the collection's path prefix. "
-                "The `collection_id` from the path is authoritative over any value "
-                "in the request body."
+            (
+                f"{col}/virtual-assets", "create_collection_virtual_asset", ["POST"],
+                {
+                    "response_model": Asset,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Register Virtual Collection Asset",
+                },
             ),
-            responses={
-                200: {"description": "Upload session created."},
-                503: {"description": "No upload backend available or storage not provisioned."},
-                424: {"description": "Catalog/collection storage provisioning failed."},
-            },
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/upload/{ticket_id}/status",
-            self.get_upload_status,
-            methods=["GET"],
-            response_model=UploadStatusResponse,
-            status_code=status.HTTP_200_OK,
-            summary="Get Upload Status",
-            description=(
-                "Polls the status of a previously initiated upload session.\n\n"
-                "For **event-driven backends** (GCS, S3) the status transitions "
-                "`pending → uploading → completed` asynchronously after the cloud event "
-                "fires and the asset is registered.\n\n"
-                "For **local/HTTP backends** the status is `completed` immediately "
-                "after the server receives the file."
+            (
+                col, "list_collection_assets", ["GET"],
+                {"summary": "List Collection Assets"},
             ),
-            responses={
-                200: {"description": "Current upload status."},
-                404: {"description": "Ticket not found or expired."},
-            },
-        )
-        # -----------------------------------------------------------------
-        # Asset reference endpoints
-        # -----------------------------------------------------------------
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}/references",
-            self.list_asset_references,
-            methods=["GET"],
-            response_model=List[AssetReference],
-            status_code=status.HTTP_200_OK,
-            summary="List Asset References",
-            description=(
-                "Returns all active references to this asset from collections, "
-                "DuckDB tables, Iceberg tables, or other drivers.\n\n"
-                "References with `cascade_delete=false` will **block** hard-deletion "
-                "of the asset (HTTP 409 Conflict). "
-                "Use this endpoint to diagnose why a deletion was rejected."
+            (
+                col, "create_collection_asset", ["POST"],
+                {
+                    "response_model": Asset,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Create Collection Asset",
+                },
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}/references/{ref_type}/{ref_id}",
-            self.remove_asset_reference,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Remove Asset Reference",
-            description=(
-                "Manually removes a reference to this asset.\n\n"
-                "**Warning:** removing a blocking reference (`cascade_delete=false`) "
-                "allows hard-deletion of the asset even if the referencing "
-                "collection or table has **not** been dropped yet. "
-                "Only call this after confirming the referencing entity has been cleaned up."
+            (
+                "/catalogs/{catalog_id}/assets/{asset_id}", "get_catalog_asset", ["GET"],
+                {"response_model": Asset, "summary": "Get Asset"},
             ),
-            responses={
-                204: {"description": "Reference removed successfully."},
-                404: {"description": "Asset or reference not found."},
-            },
-        )
-        # -----------------------------------------------------------------
-        # Asset download (backend-resolved 302 redirect; see
-        # models/protocols/asset_download.py). Registered AFTER specific routes
-        # so ``download`` does not shadow ``references`` / ``upload``.
-        # -----------------------------------------------------------------
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets/{asset_id}/download",
-            self.download_catalog_asset,
-            methods=["GET"],
-            status_code=status.HTTP_302_FOUND,
-            summary="Download Asset",
-            description=(
-                "Redirects (302) to a backend-resolved download URL for the "
-                "asset bytes: a short-lived GCS signed URL, the bearer-auth "
-                "local-download route, or the asset's external URL. Optional "
-                "``ttl`` (seconds) tunes signed-URL lifetime where supported."
+            (
+                "/catalogs/{catalog_id}/assets/{asset_id}", "update_catalog_asset", ["PUT"],
+                {"response_model": Asset, "summary": "Replace Asset (full)"},
             ),
-            responses={
-                302: {"description": "Redirect to the download URL."},
-                404: {"description": "Asset not found or no download backend."},
-            },
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets/{asset_id}/download",
-            self.download_collection_asset,
-            methods=["GET"],
-            status_code=status.HTTP_302_FOUND,
-            summary="Download Collection Asset",
-        )
-        # ---------------------------------------------------------------
-        # Bucket↔DB drift endpoints (Stage 6 reconcile surface).
-        # The literal ``:drift`` action segment cannot collide with the
-        # ``{asset_id}`` parametric routes. Read-only dry-run path; the
-        # apply path is exposed via ``tasks/bucket-reconcile/execute``.
-        # ---------------------------------------------------------------
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/assets:drift",
-            self.get_catalog_assets_drift,
-            methods=["GET"],
-            summary="Inspect Bucket↔DB Drift (Catalog)",
-            description=(
-                "Read-only diff between bucket blobs and the assets table "
-                "for the catalog. Returns a ``BucketReconcileReport`` with "
-                "orphan_blob / ghost_row / stuck_pending counts plus a "
-                "per-row ``drift_details`` list. Does not mutate state. "
-                "Apply the diff via "
-                "``POST /catalogs/{catalog_id}/tasks/bucket-reconcile/execute``."
+            (
+                "/catalogs/{catalog_id}/assets/{asset_id}", "patch_catalog_asset", ["PATCH"],
+                {
+                    "response_model": Asset,
+                    "summary": "Update Asset (partial)",
+                    "description": (
+                        "Partial update via **RFC 7396 JSON Merge Patch**. The only "
+                        "patchable top-level key is `metadata`; inside it, keys absent "
+                        "from the patch are preserved, a key set to `null` is removed, "
+                        "and nested objects are deep-merged. Lists and scalars replace. "
+                        "Use `PUT` to replace `metadata` wholesale."
+                    ),
+                },
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/assets:drift",
-            self.get_collection_assets_drift,
-            methods=["GET"],
-            summary="Inspect Bucket↔DB Drift (Collection)",
-            description=(
-                "Same as the catalog-level drift endpoint, scoped to a "
-                "single collection's prefix."
+            (
+                "/catalogs/{catalog_id}/assets/{asset_id}", "delete_catalog_asset_by_id", ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Delete Asset",
+                    "description": (
+                        "Deletes an asset by ID. "
+                        "Soft-delete (default) sets `status='deleted'`; hard-delete (`force=true`) removes "
+                        "the row entirely. Hard-deletion is **blocked** (HTTP 409) when the asset is "
+                        "owned by a storage backend (`owned_by` is set) and one or more non-cascading "
+                        "references remain. Use `GET .../references` to diagnose blocking references."
+                    ),
+                    "responses": {
+                        204: {"description": "Asset deleted."},
+                        404: {"description": "Asset not found."},
+                        409: {
+                            "description": "Asset has blocking references. Hard-deletion is not allowed until they are removed.",
+                            "content": {
+                                "application/json": {
+                                    "example": {
+                                        "detail": {
+                                            "message": "Asset 'my_asset' cannot be hard-deleted: 1 blocking reference(s) remain.",
+                                            "asset_id": "my_asset",
+                                            "blocking_references": [
+                                                {
+                                                    "ref_type": "duckdb:table",
+                                                    "ref_id": "my_collection_table",
+                                                    "cascade_delete": False,
+                                                    "created_at": "2025-03-25T10:00:00Z",
+                                                }
+                                            ],
+                                        }
+                                    }
+                                }
+                            },
+                        },
+                    },
+                },
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/tasks/bucket-reconcile/execute",
-            self.execute_catalog_bucket_reconcile,
-            methods=["POST"],
-            status_code=status.HTTP_200_OK,
-            summary="Execute Bucket Reconcile (Catalog)",
-            description=(
-                "Apply-mode bucket↔DB reconciliation: imports orphan blobs "
-                "as ACTIVE rows, marks ghost rows as failed (reason="
-                "``missing_blob``), and fails stuck PENDING rows older "
-                "than the TTL (reason=``upload_abandoned``). Executes "
-                "synchronously and returns the ``BucketReconcileReport``."
+            # Collection-level single asset routes
+            (
+                f"{col}/assets/{{asset_id}}", "get_collection_asset", ["GET"],
+                {"response_model": Asset, "summary": "Get Collection Asset"},
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/tasks/bucket-reconcile/execute",
-            self.execute_collection_bucket_reconcile,
-            methods=["POST"],
-            status_code=status.HTTP_200_OK,
-            summary="Execute Bucket Reconcile (Collection)",
-        )
+            (
+                f"{col}/assets/{{asset_id}}", "update_collection_asset", ["PUT"],
+                {"response_model": Asset, "summary": "Replace Collection Asset (full)"},
+            ),
+            (
+                f"{col}/assets/{{asset_id}}", "patch_collection_asset", ["PATCH"],
+                {
+                    "response_model": Asset,
+                    "summary": "Update Collection Asset (partial)",
+                    "description": (
+                        "Partial update via **RFC 7396 JSON Merge Patch**. The only "
+                        "patchable top-level key is `metadata`; inside it, keys absent "
+                        "from the patch are preserved, a key set to `null` is removed, "
+                        "and nested objects are deep-merged. Lists and scalars replace. "
+                        "Use `PUT` to replace `metadata` wholesale."
+                    ),
+                },
+            ),
+            (
+                f"{col}/assets/{{asset_id}}", "delete_collection_asset_by_id", ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Delete Collection Asset",
+                    "description": (
+                        "Deletes a collection-scoped asset by ID. "
+                        "Hard-deletion (`force=true`) is blocked (HTTP 409) when blocking "
+                        "references remain. See `GET .../references` for details."
+                    ),
+                    "responses": {
+                        204: {"description": "Asset deleted."},
+                        404: {"description": "Asset not found."},
+                        409: {"description": "Asset has blocking references preventing hard-deletion."},
+                    },
+                },
+            ),
+            # Collection delete all
+            (
+                col, "delete_collection_assets", ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Delete All Collection Assets",
+                },
+            ),
+            # Canonical asset search routes (path-scoped, routing-aware).
+            # All three share one ``_run_scoped_search`` impl; the scope is
+            # taken from the path. Search resolves the ``SEARCH`` asset driver
+            # with a fallback to ``READ`` (see ``get_asset_search_driver``), so
+            # an operator can route asset search to a dedicated index driver
+            # (e.g. Elasticsearch) per catalog/collection without code changes.
+            (
+                "/assets-search", "advanced_search_global", ["POST"],
+                {
+                    "summary": "Advanced Asset Search (cross-catalog)",
+                    "description": (
+                        "Cross-catalog asset search. Aggregates up to ``limit`` "
+                        "matches across the catalogs the caller can see. Resolves "
+                        "each catalog's routed SEARCH driver (READ fallback)."
+                    ),
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/assets-search", "advanced_search", ["POST"],
+                {
+                    "summary": "Advanced Asset Search (scoped to catalog)",
+                    "description": (
+                        "Search catalog-tier assets (those not bound to a "
+                        "collection). Resolves the catalog's routed SEARCH driver "
+                        "with a READ fallback."
+                    ),
+                },
+            ),
+            (
+                f"{col}/assets-search", "advanced_search_collection", ["POST"],
+                {
+                    "summary": "Advanced Asset Search (scoped to collection)",
+                    "description": (
+                        "Search assets within a single collection. The "
+                        "``collection_id`` from the path is authoritative. Resolves "
+                        "the collection's routed SEARCH driver with a READ fallback."
+                    ),
+                },
+            ),
+            # -----------------------------------------------------------------
+            # Upload endpoints (backend-agnostic)
+            # -----------------------------------------------------------------
+            (
+                "/catalogs/{catalog_id}/upload", "initiate_catalog_upload", ["POST"],
+                {
+                    "response_model": UploadTicket,
+                    "status_code": status.HTTP_200_OK,
+                    "summary": "Initiate Asset Upload (Catalog Level)",
+                    "description": (
+                        "Starts a new upload session for a catalog-level asset. "
+                        "Returns an `UploadTicket` containing a backend-specific upload URL, "
+                        "the HTTP method to use (`PUT` for GCS/S3, `POST` for local), and any "
+                        "required headers. "
+                        "After delivering the file the backend registers the asset automatically "
+                        "(event-driven for GCS/S3, synchronous for local storage). "
+                        "Poll `/upload/{ticket_id}/status` to confirm registration."
+                    ),
+                    "responses": {
+                        200: {"description": "Upload session created. Use the returned ticket to upload the file."},
+                        503: {"description": "No upload backend available or storage not provisioned."},
+                        424: {"description": "Catalog storage provisioning failed."},
+                    },
+                },
+            ),
+            (
+                f"{col}/upload", "initiate_collection_upload", ["POST"],
+                {
+                    "response_model": UploadTicket,
+                    "status_code": status.HTTP_200_OK,
+                    "summary": "Initiate Asset Upload (Collection Level)",
+                    "description": (
+                        "Starts a new upload session for an asset scoped to a collection. "
+                        "Identical to the catalog-level endpoint but the file is stored under "
+                        "the collection's path prefix. "
+                        "The `collection_id` from the path is authoritative over any value "
+                        "in the request body."
+                    ),
+                    "responses": {
+                        200: {"description": "Upload session created."},
+                        503: {"description": "No upload backend available or storage not provisioned."},
+                        424: {"description": "Catalog/collection storage provisioning failed."},
+                    },
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/upload/{ticket_id}/status", "get_upload_status", ["GET"],
+                {
+                    "response_model": UploadStatusResponse,
+                    "status_code": status.HTTP_200_OK,
+                    "summary": "Get Upload Status",
+                    "description": (
+                        "Polls the status of a previously initiated upload session.\n\n"
+                        "For **event-driven backends** (GCS, S3) the status transitions "
+                        "`pending → uploading → completed` asynchronously after the cloud event "
+                        "fires and the asset is registered.\n\n"
+                        "For **local/HTTP backends** the status is `completed` immediately "
+                        "after the server receives the file."
+                    ),
+                    "responses": {
+                        200: {"description": "Current upload status."},
+                        404: {"description": "Ticket not found or expired."},
+                    },
+                },
+            ),
+            # -----------------------------------------------------------------
+            # Asset reference endpoints
+            # -----------------------------------------------------------------
+            (
+                "/catalogs/{catalog_id}/assets/{asset_id}/references", "list_asset_references", ["GET"],
+                {
+                    "response_model": List[AssetReference],
+                    "status_code": status.HTTP_200_OK,
+                    "summary": "List Asset References",
+                    "description": (
+                        "Returns all active references to this asset from collections, "
+                        "DuckDB tables, Iceberg tables, or other drivers.\n\n"
+                        "References with `cascade_delete=false` will **block** hard-deletion "
+                        "of the asset (HTTP 409 Conflict). "
+                        "Use this endpoint to diagnose why a deletion was rejected."
+                    ),
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/assets/{asset_id}/references/{ref_type}/{ref_id}",
+                "remove_asset_reference", ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Remove Asset Reference",
+                    "description": (
+                        "Manually removes a reference to this asset.\n\n"
+                        "**Warning:** removing a blocking reference (`cascade_delete=false`) "
+                        "allows hard-deletion of the asset even if the referencing "
+                        "collection or table has **not** been dropped yet. "
+                        "Only call this after confirming the referencing entity has been cleaned up."
+                    ),
+                    "responses": {
+                        204: {"description": "Reference removed successfully."},
+                        404: {"description": "Asset or reference not found."},
+                    },
+                },
+            ),
+            # -----------------------------------------------------------------
+            # Asset download (backend-resolved 302 redirect; see
+            # models/protocols/asset_download.py). Registered AFTER specific routes
+            # so ``download`` does not shadow ``references`` / ``upload``.
+            # -----------------------------------------------------------------
+            (
+                "/catalogs/{catalog_id}/assets/{asset_id}/download", "download_catalog_asset", ["GET"],
+                {
+                    "status_code": status.HTTP_302_FOUND,
+                    "summary": "Download Asset",
+                    "description": (
+                        "Redirects (302) to a backend-resolved download URL for the "
+                        "asset bytes: a short-lived GCS signed URL, the bearer-auth "
+                        "local-download route, or the asset's external URL. Optional "
+                        "``ttl`` (seconds) tunes signed-URL lifetime where supported."
+                    ),
+                    "responses": {
+                        302: {"description": "Redirect to the download URL."},
+                        404: {"description": "Asset not found or no download backend."},
+                    },
+                },
+            ),
+            (
+                f"{col}/assets/{{asset_id}}/download", "download_collection_asset", ["GET"],
+                {
+                    "status_code": status.HTTP_302_FOUND,
+                    "summary": "Download Collection Asset",
+                },
+            ),
+            # ---------------------------------------------------------------
+            # Bucket↔DB drift endpoints (Stage 6 reconcile surface).
+            # The literal ``:drift`` action segment cannot collide with the
+            # ``{asset_id}`` parametric routes. Read-only dry-run path; the
+            # apply path is exposed via ``tasks/bucket-reconcile/execute``.
+            # ---------------------------------------------------------------
+            (
+                "/catalogs/{catalog_id}/assets:drift", "get_catalog_assets_drift", ["GET"],
+                {
+                    "summary": "Inspect Bucket↔DB Drift (Catalog)",
+                    "description": (
+                        "Read-only diff between bucket blobs and the assets table "
+                        "for the catalog. Returns a ``BucketReconcileReport`` with "
+                        "orphan_blob / ghost_row / stuck_pending counts plus a "
+                        "per-row ``drift_details`` list. Does not mutate state. "
+                        "Apply the diff via "
+                        "``POST /catalogs/{catalog_id}/tasks/bucket-reconcile/execute``."
+                    ),
+                },
+            ),
+            (
+                f"{col}/assets:drift", "get_collection_assets_drift", ["GET"],
+                {
+                    "summary": "Inspect Bucket↔DB Drift (Collection)",
+                    "description": (
+                        "Same as the catalog-level drift endpoint, scoped to a "
+                        "single collection's prefix."
+                    ),
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/tasks/bucket-reconcile/execute",
+                "execute_catalog_bucket_reconcile", ["POST"],
+                {
+                    "status_code": status.HTTP_200_OK,
+                    "summary": "Execute Bucket Reconcile (Catalog)",
+                    "description": (
+                        "Apply-mode bucket↔DB reconciliation: imports orphan blobs "
+                        "as ACTIVE rows, marks ghost rows as failed (reason="
+                        "``missing_blob``), and fails stuck PENDING rows older "
+                        "than the TTL (reason=``upload_abandoned``). Executes "
+                        "synchronously and returns the ``BucketReconcileReport``."
+                    ),
+                },
+            ),
+            (
+                f"{col}/tasks/bucket-reconcile/execute",
+                "execute_collection_bucket_reconcile", ["POST"],
+                {
+                    "status_code": status.HTTP_200_OK,
+                    "summary": "Execute Bucket Reconcile (Collection)",
+                },
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
         # -----------------------------------------------------------------
         # Local-backend HTTP endpoints (NOT under /assets prefix — registered
         # directly on the app so the paths are top-level).
@@ -868,6 +857,79 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         from dynastore.modules.storage.router import get_asset_upload_driver
         return await get_asset_upload_driver(catalog_id, collection_id)
 
+    @staticmethod
+    def _stamp_external_ids(
+        asset: "Asset",
+        catalog_external_id: str,
+        collection_external_id: Optional[str],
+    ) -> "Asset":
+        """Overwrite stored internal catalog_id/collection_id with the public
+        external labels so the REST response never leaks internal tokens.
+
+        Asset rows are keyed on immutable internal ids; path params carry the
+        logical (external) ids the caller used.  Stamping the path values back
+        onto the returned model is both cheaper and more correct than a DB
+        round-trip: the caller already holds the right labels.
+        """
+        asset.catalog_id = catalog_external_id
+        asset.collection_id = collection_external_id
+        return asset
+
+    @staticmethod
+    def _stamp_external_ids_list(
+        assets: List["Asset"],
+        catalog_external_id: str,
+        collection_external_id: Optional[str],
+    ) -> List["Asset"]:
+        """Bulk variant of :meth:`_stamp_external_ids` for list responses."""
+        for asset in assets:
+            asset.catalog_id = catalog_external_id
+            asset.collection_id = collection_external_id
+        return assets
+
+    @staticmethod
+    async def _stamp_external_ids_list_resolve_collections(
+        assets: List["Asset"],
+        catalog_external_id: str,
+    ) -> List["Asset"]:
+        """Stamp catalog_external_id and resolve each asset's internal
+        collection_id to its public external label.
+
+        Used when the response may contain assets from multiple collections
+        (all_collections=True or global search) so a single fixed collection_id
+        cannot be echoed from the path.
+
+        When no CatalogsProtocol is registered the catalog module is absent, so
+        no rename can have occurred and the stored collection_id IS the public
+        label — it is kept as-is.  When the protocol IS present but a stored id
+        fails to resolve (a deleted/orphaned collection), the label is nulled
+        rather than emitting the internal token — the response must never leak
+        an internal id.
+        """
+        catalogs_svc = cast(
+            Optional[CatalogsProtocol], get_protocol(CatalogsProtocol)
+        )
+        for asset in assets:
+            asset.catalog_id = catalog_external_id
+            if asset.collection_id is not None and catalogs_svc is not None:
+                # resolve_collection_external_id is cached (300 s TTL, 4096 entries)
+                # so repeated calls for the same internal id cost one DB round-trip.
+                external_col = await catalogs_svc.collections.resolve_collection_external_id(
+                    catalog_external_id, asset.collection_id, allow_missing=True
+                )
+                if external_col is not None:
+                    asset.collection_id = external_col
+                else:
+                    logger.warning(
+                        "asset %s references collection %r that did not resolve to "
+                        "an external id; nulling collection_id to avoid leaking an "
+                        "internal token",
+                        getattr(asset, "asset_id", "<unknown>"),
+                        asset.collection_id,
+                    )
+                    asset.collection_id = None
+        return assets
+
     # =============================================================================
     #  CATALOG LEVEL OPERATIONS
     # =============================================================================
@@ -883,9 +945,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Returns a list of assets associated directly with the catalog (no collection)."""
         # Accepted for uniform cross-protocol routing-hints support; this route
         # reads asset metadata rows and performs no vector-geometry read.
-        return await self.assets.list_assets(
+        assets = await self.assets.list_assets(
             catalog_id=catalog_id, collection_id=None, limit=limit, offset=offset
         )
+        return self._stamp_external_ids_list(assets, catalog_id, None)
 
 
     async def create_catalog_asset(
@@ -895,9 +958,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Creates a new physical asset at the catalog level."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=None
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -913,9 +977,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Registers a virtual (external-href) asset at the catalog level."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=None
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -957,6 +1022,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         )
         if not asset:
             raise HTTPException(status_code=404, detail="Asset not found")
+        self._stamp_external_ids(asset, catalog_id, None)
         asset.links = self._asset_links_for(asset, request)
         return asset
 
@@ -970,9 +1036,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Updates the metadata of an existing catalog asset. All other fields are immutable."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.update_asset(
+            asset = await self.assets.update_asset(
                 catalog_id=catalog_id, asset_id=asset_id, update=asset_in
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -985,9 +1052,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """RFC 7396 JSON Merge Patch over an asset's ``metadata``."""
         await require_catalog_ready(catalog_id)
         try:
-            return await self.assets.patch_asset(
+            asset = await self.assets.patch_asset(
                 catalog_id=catalog_id, asset_id=asset_id, patch=patch,
             )
+            return self._stamp_external_ids(asset, catalog_id, None)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -1038,12 +1106,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Returns a list of assets associated with a specific collection."""
         # Accepted for uniform cross-protocol routing-hints support; this route
         # reads asset metadata rows and performs no vector-geometry read.
-        return await self.assets.list_assets(
+        assets = await self.assets.list_assets(
             catalog_id=catalog_id,
             collection_id=collection_id,
             limit=limit,
             offset=offset,
         )
+        return self._stamp_external_ids_list(assets, catalog_id, collection_id)
 
 
     async def create_collection_asset(
@@ -1059,9 +1128,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         # scope comes from the path. AssetCreate has no collection_id field
         # so there is no conflict to reconcile.
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=collection_id
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -1080,9 +1150,10 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         await require_catalog_ready(catalog_id)
         await require_collection_ready(catalog_id, collection_id)
         try:
-            return await self.assets.create_asset(
+            asset = await self.assets.create_asset(
                 catalog_id=catalog_id, asset=asset_in, collection_id=collection_id
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except Exception as e:
             raise handle_exception(
                 e,
@@ -1132,6 +1203,7 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             raise HTTPException(
                 status_code=404, detail="Asset not found in this collection"
             )
+        self._stamp_external_ids(asset, catalog_id, collection_id)
         asset.links = self._asset_links_for(asset, request)
         return asset
 
@@ -1147,12 +1219,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         await require_catalog_ready(catalog_id)
         await require_collection_ready(catalog_id, collection_id)
         try:
-            return await self.assets.update_asset(
+            asset = await self.assets.update_asset(
                 catalog_id=catalog_id,
                 asset_id=asset_id,
                 update=asset_in,
                 collection_id=collection_id,
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -1167,12 +1240,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         await require_catalog_ready(catalog_id)
         await require_collection_ready(catalog_id, collection_id)
         try:
-            return await self.assets.patch_asset(
+            asset = await self.assets.patch_asset(
                 catalog_id=catalog_id,
                 asset_id=asset_id,
                 patch=patch,
                 collection_id=collection_id,
             )
+            return self._stamp_external_ids(asset, catalog_id, collection_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
@@ -1325,6 +1399,18 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             catalog_id=catalog_id,
             collection_id=collection_id,
         )
+        # Resolve public external ids to immutable internal ids before keying
+        # storage so rows are stable across catalog/collection renames.
+        _icat = await catalogs_svc.resolve_catalog_id(catalog_id, allow_missing=True)
+        if _icat is not None:
+            catalog_id = _icat
+        if collection_id is not None:
+            _icol = await catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if _icol is not None:
+                collection_id = _icol
+
         scope = Scope(
             schema=schema, catalog_id=catalog_id, collection_id=collection_id
         )
@@ -1496,12 +1582,27 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         every collection under the catalog in one call.
         """
         try:
-            return await self._run_scoped_search(
+            assets = await self._run_scoped_search(
                 catalog_id=catalog_id,
                 collection_id=None,
                 query=query,
                 offset=query.offset,
                 all_collections=all_collections,
+            )
+            # When all_collections=False every asset is catalog-tier (no
+            # collection); stamp catalog from the path param and leave
+            # collection_id as-is (it will be None for catalog-tier assets).
+            # When all_collections=True assets may span multiple collections;
+            # we cannot echo one fixed collection_id, so only stamp catalog_id
+            # and leave each asset's collection_id for per-row resolution.
+            # Per-row collection resolution is deferred: the caller can filter
+            # by collection using the search filters if needed.
+            if not all_collections:
+                return self._stamp_external_ids_list(assets, catalog_id, None)
+            # all_collections=True: stamp catalog_id from path; resolve each
+            # asset's collection_id from internal→external if set.
+            return await self._stamp_external_ids_list_resolve_collections(
+                assets, catalog_id
             )
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -1518,12 +1619,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         The ``collection_id`` from the path is authoritative.
         """
         try:
-            return await self._run_scoped_search(
+            assets = await self._run_scoped_search(
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 query=query,
                 offset=query.offset,
             )
+            return self._stamp_external_ids_list(assets, catalog_id, collection_id)
         except Exception as e:
             logger.error(f"Search failed: {e}")
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1563,12 +1665,19 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         for cat in catalogs:
             if remaining <= 0:
                 break
-            cat_id = getattr(cat, "catalog_id", None) or getattr(cat, "id", None)
-            if not cat_id:
+            # Use the internal id for the storage query (search_assets resolves
+            # it to schema-level ids internally), but keep the public label so
+            # the response carries the logical external id, not the c_... token.
+            cat_internal_id = getattr(cat, "id", None)
+            if not cat_internal_id:
                 continue
+            # Explicit None check, not `or`: an empty external_id must never
+            # silently fall through to the internal c_... token (leak guard).
+            _cat_ext = getattr(cat, "external_id", None)
+            cat_external_id = str(_cat_ext) if _cat_ext is not None else cat_internal_id
             try:
                 rows = await self._run_scoped_search(
-                    catalog_id=cat_id,
+                    catalog_id=cat_internal_id,
                     collection_id=None,
                     query=query,
                     limit=remaining,
@@ -1576,8 +1685,13 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                     all_collections=all_collections,
                 )
             except Exception as e:
-                logger.warning(f"Global search: catalog={cat_id} failed: {e}")
+                logger.warning(f"Global search: catalog={cat_internal_id} failed: {e}")
                 continue
+            # Stamp external catalog_id; resolve each asset's collection_id
+            # (may be internal) to its external label.
+            rows = await self._stamp_external_ids_list_resolve_collections(
+                rows, cat_external_id
+            )
             aggregated.extend(rows)
             remaining = query.limit - len(aggregated)
 
@@ -1829,6 +1943,18 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             owned_by=None,
         )
 
+        # Resolve public external ids to immutable internal ids before keying
+        # storage so rows are stable across catalog/collection renames.
+        _icat = await catalogs_svc.resolve_catalog_id(catalog_id, allow_missing=True)
+        if _icat is not None:
+            catalog_id = _icat
+        if collection_id is not None:
+            _icol = await catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if _icol is not None:
+                collection_id = _icol
+
         scope = Scope(
             schema=schema, catalog_id=catalog_id, collection_id=collection_id
         )
@@ -1872,6 +1998,28 @@ class AssetService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             )
         except HTTPException:
             await self._rollback_pending_row(engine, scope, payload.asset_id)
+            raise
+        except asyncio.CancelledError:
+            # A client/gateway disconnect (e.g. the ingress request timeout)
+            # cancels this coroutine with CancelledError — a BaseException the
+            # broad ``except Exception`` below does not catch. Without
+            # compensating here the just-committed PENDING row would linger
+            # until the reconcile sweep's TTL. Shield the soft-delete so it
+            # runs to completion as the task unwinds, then re-raise. The inner
+            # suppress mirrors managed_transaction's drain: a second cancel
+            # arriving mid-drain must not abort the compensation.
+            logger.warning(
+                "Upload initiation cancelled for '%s/%s' (asset=%s); compensating pending row.",
+                catalog_id,
+                collection_id or "_",
+                payload.asset_id,
+            )
+            try:
+                await asyncio.shield(
+                    self._rollback_pending_row(engine, scope, payload.asset_id)
+                )
+            except asyncio.CancelledError:
+                pass
             raise
         except Exception as exc:
             await self._rollback_pending_row(engine, scope, payload.asset_id)

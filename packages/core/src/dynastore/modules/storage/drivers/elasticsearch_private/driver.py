@@ -175,8 +175,21 @@ class ItemsElasticsearchPrivateDriver(
         IndexDispatcher now (Phase 2d).  No event listeners registered
         on this driver — the dispatcher resolves it via the slim
         :class:`Indexer` Protocol and routing config.
+
+        The restore scan is skipped in ephemeral job contexts (Cloud Run Jobs,
+        local dev, CI) because there is no prior in-memory DENY state to
+        recover — the scan only makes sense after a long-running service
+        restart.  Detection uses ``K_SERVICE``, which Cloud Run Services
+        always set and Cloud Run Jobs never do.
         """
-        await self._restore_deny_policies()
+        from dynastore.tools.env import is_running_as_job
+        if is_running_as_job():
+            logger.debug(
+                "PrivateDriver: skipping _restore_deny_policies() — "
+                "ephemeral job context has no prior in-memory DENY state to recover."
+            )
+        else:
+            await self._restore_deny_policies()
         yield
 
     # ------------------------------------------------------------------
@@ -217,6 +230,9 @@ class ItemsElasticsearchPrivateDriver(
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
             catalog_id, collection_id, db_resource=db_resource,
         )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
 
         # Tenant-scoped manual mapping overlay (#1295 slice 3). Empty
         # overlay → legacy fully-dynamic ``properties`` sub-tree.
@@ -248,6 +264,7 @@ class ItemsElasticsearchPrivateDriver(
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _stamp_simplification(doc, factor, mode)
             doc = project_private_doc(doc, known_fields)
@@ -285,6 +302,7 @@ class ItemsElasticsearchPrivateDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        self._reject_unsupported_group_by(request)
 
         index_name = self._items_index_name(catalog_id)
         es = self._get_client()
@@ -506,8 +524,12 @@ class ItemsElasticsearchPrivateDriver(
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
             ctx.catalog, ctx.collection,
         )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
         doc, factor, mode = maybe_simplify_for_es(
             doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+            snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
         )
         _stamp_simplification(doc, factor, mode)
         doc = project_private_doc(doc, known_fields)
@@ -544,6 +566,9 @@ class ItemsElasticsearchPrivateDriver(
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
             ctx.catalog, ctx.collection,
         )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
 
         # Tenant-scoped manual mapping overlay (#1295 slice 3).
         known_fields = await resolve_catalog_private_known_fields(ctx.catalog)
@@ -571,6 +596,7 @@ class ItemsElasticsearchPrivateDriver(
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _stamp_simplification(doc, factor, mode)
             doc = project_private_doc(doc, known_fields)

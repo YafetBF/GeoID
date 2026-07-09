@@ -739,3 +739,161 @@ async def test_ogc_delete_collection_soft_404_still_works():
     with pytest.raises(HTTPException) as exc_info:
         await svc._ogc_delete_collection("cat1", "col1", False, None, None)
     assert exc_info.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# #2667: catalog hard delete — async 202 status link (force=True)
+#
+# CatalogsProtocol.delete_catalog(force=True) already hands the schema drop
+# off to the durable catalog_provision(deprovision_hard) task instead of
+# running it inline (checklist-driven deprovision, #2340/#2421) — the request
+# never blocks on the drop. These tests cover the piece that was missing: the
+# HTTP layer reporting that hand-off via get_hard_delete_task() as a 202 +
+# status link, matching the collection hard-delete contract, instead of a
+# bare 204 that hides an in-flight teardown from the caller.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_catalog_hard_returns_202():
+    """force=True with an in-flight deprovision task returns 202 + status link."""
+    fake_task = _make_fake_task()
+    catalogs_svc = _make_catalogs_svc(
+        get_hard_delete_task=AsyncMock(return_value=fake_task)
+    )
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    fake_request = _make_fake_request()
+    resp = await svc._ogc_delete_catalog("cat1", True, None, fake_request)
+
+    assert resp.status_code == 202
+    assert resp.headers["Location"] == str(fake_request.url_for.return_value)
+    body = _json_mod.loads(resp.body)
+    assert body["task_id"] == "11111111-1111-1111-1111-111111111111"
+    assert body["catalog_id"] == "cat1"
+    assert len(body["links"]) == 1
+    assert body["links"][0]["rel"] == "monitor"
+    catalogs_svc.get_hard_delete_task.assert_awaited_once_with("cat1")
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_catalog_hard_no_task_returns_204():
+    """force=True with no active provisioners (delete_catalog purged inline,
+    nothing to poll) falls back to 204.
+    """
+    catalogs_svc = _make_catalogs_svc(
+        get_hard_delete_task=AsyncMock(return_value=None)
+    )
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    resp = await svc._ogc_delete_catalog("cat1", True, None, None)
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_catalog_hard_no_request_relative_url():
+    """Without a Request object the status link falls back to a relative path."""
+    fake_task = _make_fake_task()
+    catalogs_svc = _make_catalogs_svc(
+        get_hard_delete_task=AsyncMock(return_value=fake_task)
+    )
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    resp = await svc._ogc_delete_catalog("cat1", True, None, None)
+    assert resp.status_code == 202
+    assert resp.headers["Location"] == (
+        "/task/catalogs/cat1/tasks/11111111-1111-1111-1111-111111111111"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ogc_delete_catalog_hard_404_still_works():
+    """404 raised when delete_catalog itself returns False, before any task lookup."""
+    catalogs_svc = _make_catalogs_svc(delete_catalog=AsyncMock(return_value=False))
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._ogc_delete_catalog("cat1", True, None, None)
+    assert exc_info.value.status_code == 404
+    catalogs_svc.get_hard_delete_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Catalog create — always-async 202 path
+# ---------------------------------------------------------------------------
+
+
+class _ProvisioningCatalog:
+    """Stub catalog returned when async-create flag is ON.
+
+    Mimics a Catalog that came back with provisioning_status='provisioning'
+    and an external_id set.
+    """
+
+    provisioning_status = "provisioning"
+    external_id = "my-catalog"
+
+    def localize(self, language: str) -> Tuple[Dict[str, Any], Any]:
+        return {
+            "id": "my-catalog",
+            "provisioning_status": "provisioning",
+            "provisioning_checklist": {"catalog_core": "pending"},
+        }, {"en"}
+
+
+@pytest.mark.asyncio
+async def test_ogc_create_catalog_returns_202_when_provisioning():
+    """When create_catalog returns provisioning_status='provisioning', respond 202+Location."""
+    catalogs_svc = _make_catalogs_svc(
+        create_catalog=AsyncMock(return_value=_ProvisioningCatalog())
+    )
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    resp = await svc._ogc_create_catalog({"id": "my-catalog"}, {"id": "my-catalog"}, "en", None)
+
+    assert resp.status_code == 202
+    assert "Location" in resp.headers
+    assert resp.headers["Location"] == "/catalog/catalogs/my-catalog"
+
+    import json
+    body = json.loads(resp.body)
+    assert body["provisioning_status"] == "provisioning"
+    assert body["provisioning_checklist"]["catalog_core"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_ogc_create_catalog_returns_202_when_provisioning_from_ready_stub():
+    """Create always returns 202; the OGC layer maps provisioning_status='provisioning' to 202."""
+    catalogs_svc = _make_catalogs_svc(
+        create_catalog=AsyncMock(return_value=_ProvisioningCatalog())
+    )
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    resp = await svc._ogc_create_catalog({"id": "my-catalog"}, {"id": "my-catalog"}, "en", None)
+
+    assert resp.status_code == 202
+    assert "Location" in resp.headers
+
+    import json
+    body = json.loads(resp.body)
+    assert body["provisioning_status"] == "provisioning"
+
+
+@pytest.mark.asyncio
+async def test_ogc_create_catalog_returns_202_from_provisioning_catalog():
+    """The 202 path is exercised end-to-end with the provisioning stub."""
+    catalogs_svc = _make_catalogs_svc(
+        create_catalog=AsyncMock(return_value=_ProvisioningCatalog())
+    )
+    svc = _FeaturesSvc()
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs_svc)
+
+    resp = await svc._ogc_create_catalog({"id": "my-catalog"}, {"id": "my-catalog"}, "en", None)
+    assert resp.status_code == 202
+    assert resp.headers.get("Location") == "/catalog/catalogs/my-catalog"

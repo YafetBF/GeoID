@@ -19,13 +19,15 @@
 # dynastore/extensions/stac/stac_service.py
 
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, Tuple, List, FrozenSet
+from typing import Optional, Dict, Any, Tuple, List, FrozenSet, cast
 
 import pystac
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
+from dynastore.extensions.tools.language_utils import get_language
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols import ConfigsProtocol
 
@@ -37,6 +39,7 @@ from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.extensions.tools.exception_handlers import handle_or_raise
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
+    _read_live_fg_acquire_timeout,
 )
 from dynastore.extensions.stac.search import (
     CollectionSearchRequest,
@@ -48,9 +51,10 @@ from dynastore.extensions.stac.search import (
 from dynastore.modules.stac.stac_config import StacPluginConfig
 
 from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 from .stac_models import STACCatalogRequest, stac_localize
 from .stac_validator import validate_stac_item, validate_stac_collection
-from dynastore.models.shared_models import Feature
+from dynastore.models.ogc import Feature
 from . import stac_generator
 from .stac_models import (
     STACCollectionUpdate,
@@ -62,16 +66,33 @@ from .stac_models import (
 )
 from .stac_aggregation_models import AggregationRequest
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
-from dynastore.extensions.tools.url import get_url
+from dynastore.extensions.tools.url import get_root_url, get_url
 from dynastore.tools.discovery import get_protocol, get_protocols
 from dynastore.models.localization import normalize_i18n_for_replace
-
-logger = logging.getLogger(__name__)
-from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols.web import StaticFilesProtocol
-import os
 from .stac_virtual import StacVirtualMixin
+
+logger = logging.getLogger(__name__)
+
+
+def _reject_internal_id(value: str, prefix: str, resource_name: str) -> None:
+    """Reject a public path-param id shaped like an internal storage id.
+
+    The STAC REST surface is keyed on external ids only (#2354): an internal
+    id (``{prefix}_{13 base32}``) must never resolve to a real resource here,
+    even when a stale/lenient lookup further down the stack would find one —
+    that would let a caller route around external-id-scoped IAM policies.
+    Data-layer callers that already hold a resolved internal id never reach
+    this function; it only guards the public route-handler entry points.
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    if is_internal_physical_name(value, prefix):
+        raise HTTPException(
+            status_code=404, detail=f"{resource_name} '{value}' not found."
+        )
+
 
 def _assert_stac_capable_collection_stack() -> None:
     """Verify the catalog-tier can persist a STAC envelope; warn on the
@@ -197,7 +218,7 @@ def _pack_stac_extras(input_data: Dict[str, Any], language: str) -> Dict[str, An
     # stac_generator helpers before falling back to hardcoded defaults.
     # Only store non-empty values: an empty extent/stac_extensions carries no
     # useful data to preserve and should not force extra_metadata creation.
-    for key in ("providers", "summaries"):
+    for key in ("assets", "item_assets", "providers", "summaries"):
         if key in input_data and input_data[key] is not None:
             extras[key] = input_data[key]
     for key in ("extent", "stac_extensions"):
@@ -222,12 +243,199 @@ def _pack_stac_extras(input_data: Dict[str, Any], language: str) -> Dict[str, An
     return input_data
 
 
+def _localized_extra_metadata(localized: Dict[str, Any], language: str) -> Dict[str, Any]:
+    extra = localized.get("extra_metadata")
+    if not isinstance(extra, dict):
+        return {}
+    if language != "*" and isinstance(extra.get(language), dict):
+        return cast(Dict[str, Any], extra[language])
+    try:
+        from dynastore.models.localization import _LANGUAGE_METADATA
+
+        if any(k in _LANGUAGE_METADATA for k in extra):
+            for value in extra.values():
+                if isinstance(value, dict):
+                    return cast(Dict[str, Any], value)
+            return {}
+    except Exception:
+        pass
+    return extra
+
+
+def _asset_from_stac_dict(asset_data: Dict[str, Any]) -> pystac.Asset:
+    return pystac.Asset(
+        href=asset_data.get("href", ""),
+        title=asset_data.get("title"),
+        description=asset_data.get("description"),
+        media_type=asset_data.get("type"),
+        roles=asset_data.get("roles"),
+        extra_fields={
+            k: v for k, v in asset_data.items()
+            if k not in {"href", "title", "description", "type", "roles"}
+        },
+    )
+
+
+def _pg_collections_to_stac_dicts(
+    collections_list: List[Any], language: str,
+) -> List[Dict[str, Any]]:
+    """Convert PG-backed ``Collection`` models into STAC Collection
+    dicts, as used by the Collection Search response path.
+
+    Shared by the search branch of ``list_stac_collections`` and its
+    ES-empty/PG-populated fallback so both surfaces render collections the
+    same way without per-collection driver hydration.
+    """
+    stac_collections: List[Dict[str, Any]] = []
+    for coll in collections_list:
+        localized_coll, _ = stac_localize(coll, language)
+        extra_meta = _localized_extra_metadata(localized_coll, language)
+
+        if coll.extent is not None:
+            extent = pystac.Extent(
+                spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
+                temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
+            )
+        else:
+            spatial, temporal = stac_generator._restore_extent_from_extras(
+                extra_meta.get("extent")
+            )
+            # Harvested collections may not have an aggregated extent
+            # persisted in PG. Render the standard STAC "unknown extent"
+            # fallback instead of dropping the collection from the page —
+            # the caller already promised it in `matched`.
+            extent = pystac.Extent(
+                spatial=spatial or pystac.SpatialExtent([[-180.0, -90.0, 180.0, 90.0]]),
+                temporal=temporal or pystac.TemporalExtent([[None, None]]),
+            )
+
+        stac_extensions = list(localized_coll.get("stac_extensions") or [])
+        for uri in extra_meta.get("stac_extensions") or []:
+            if uri not in stac_extensions:
+                stac_extensions.append(uri)
+
+        stac_coll = pystac.Collection(
+            id=str(localized_coll.get("id") or ""),
+            description=str(localized_coll.get("description") or ""),
+            title=localized_coll.get("title"),
+            license=str(localized_coll.get("license") or ""),
+            extent=extent,
+            stac_extensions=stac_extensions,
+        )
+
+        providers = localized_coll.get("providers") or extra_meta.get("providers")
+        if providers and isinstance(providers, list):
+            stac_coll.providers = [
+                pystac.Provider(**p) if isinstance(p, dict) else p
+                for p in providers
+            ]
+
+        summaries = localized_coll.get("summaries") or extra_meta.get("summaries")
+        if summaries and isinstance(summaries, dict):
+            stac_coll.summaries = pystac.Summaries(summaries)
+
+        assets = localized_coll.get("assets") or extra_meta.get("assets")
+        if assets and isinstance(assets, dict):
+            stac_coll.assets = {
+                asset_id: _asset_from_stac_dict(asset_data)
+                for asset_id, asset_data in assets.items()
+                if isinstance(asset_data, dict)
+            }
+
+        item_assets = localized_coll.get("item_assets") or extra_meta.get("item_assets")
+        if item_assets and isinstance(item_assets, dict):
+            stac_coll.extra_fields["item_assets"] = item_assets
+            item_assets_uri = "https://stac-extensions.github.io/item-assets/v1.0.0/schema.json"
+            if item_assets_uri not in stac_coll.stac_extensions:
+                stac_coll.stac_extensions.append(item_assets_uri)
+
+        for key, value in extra_meta.items():
+            if key in {
+                "assets",
+                "extent",
+                "item_assets",
+                "language",
+                "languages",
+                "providers",
+                "stac_extensions",
+                "summaries",
+            }:
+                continue
+            stac_coll.extra_fields[key] = value
+
+        if "language" in localized_coll:
+            stac_coll.extra_fields["language"] = localized_coll["language"]
+        if "languages" in localized_coll:
+            stac_coll.extra_fields["languages"] = localized_coll["languages"]
+        stac_collections.append(stac_coll.to_dict())
+    return stac_collections
+
+
+def _add_collection_navigation_links(
+    collections: List[Dict[str, Any]],
+    *,
+    request: Request,
+    catalog_id: str,
+    language: str,
+) -> None:
+    """Attach deterministic STAC navigation links to listed collections.
+
+    The fast collection-listing path deliberately avoids the full
+    ``create_collection`` hydration pass. These links are derived only from
+    the already-rendered public collection id, so the listing stays bounded
+    while remaining crawlable by STAC clients.
+    """
+    root_url = get_root_url(request)
+    catalog_href = f"{root_url}/stac/catalogs/{catalog_id}"
+    root_link = {
+        "rel": "root",
+        "href": f"{root_url}/stac",
+        "type": "application/json",
+        "title": "Root Catalog",
+    }
+    parent_link = {
+        "rel": "parent",
+        "href": catalog_href,
+        "type": "application/json",
+        "title": "Parent Catalog",
+    }
+    if language != "*":
+        root_link["hreflang"] = language
+        parent_link["hreflang"] = language
+
+    for collection in collections:
+        collection_id = collection.get("id")
+        if not collection_id:
+            continue
+        collection_href = f"{catalog_href}/collections/{collection_id}"
+        self_link = {
+            "rel": "self",
+            "href": collection_href,
+            "type": "application/json",
+        }
+        items_link = {
+            "rel": "items",
+            "href": f"{collection_href}/items",
+            "type": "application/geo+json",
+            "title": "Items in this Collection",
+        }
+        if language != "*":
+            self_link["hreflang"] = language
+            items_link["hreflang"] = language
+        collection["links"] = [
+            self_link,
+            dict(root_link),
+            dict(parent_link),
+            items_link,
+        ]
+
+
 STAC_API_URIS = [
     "https://api.stacspec.org/v1.0.0/core",
     "https://api.stacspec.org/v1.0.0/item-search",
     "https://api.stacspec.org/v1.1.0/item-search#sort",
     "https://api.stacspec.org/v1.0.0/collections",
-    "https://api.stacspec.org/v1.0.0-rc.2/transactions",
+    "https://api.stacspec.org/v1.0.0/ogcapi-features/extensions/transaction",
     "https://api.stacspec.org/v1.0.0/item-search/definition",
     "https://api.stacspec.org/v1.0.0/item-search#filter",
     "https://api.stacspec.org/v1.0.0/item-search#sort",
@@ -364,7 +572,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ("/catalogs/{catalog_id}/collections", "list_stac_collections", ["GET"], {"response_class": _J}),
             ("/catalogs/{catalog_id}/collections/{collection_id}", "get_stac_collection", ["GET"], {"response_class": _J}),
             # Write Operations
-            ("/catalogs", "create_stac_catalog", ["POST"], {"status_code": status.HTTP_201_CREATED}),
+            ("/catalogs", "create_stac_catalog", ["POST"], {}),
             ("/catalogs/{catalog_id}/collections", "create_stac_collection", ["POST"], {"status_code": status.HTTP_201_CREATED}),
             ("/catalogs/{catalog_id}", "replace_stac_catalog", ["PUT"], {"status_code": status.HTTP_200_OK}),
             ("/catalogs/{catalog_id}", "update_stac_catalog", ["PATCH"], {"status_code": status.HTTP_200_OK}),
@@ -394,6 +602,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ("/virtual/hierarchy/{hierarchy_id}/catalogs/{catalog_id}/collections/{collection_id}", "get_virtual_hierarchy_collection", ["GET"], {"response_class": _J}),
             ("/virtual/hierarchy/{hierarchy_id}/catalogs/{catalog_id}/collections/{collection_id}/items", "get_virtual_hierarchy_items", ["GET"], {"response_class": _J}),
             ("/virtual/hierarchy/{hierarchy_id}/catalogs/{catalog_id}/collections/{collection_id}/search", "search_virtual_hierarchy_items", ["GET", "POST"], {"response_class": _J}),
+            # STAC Aggregation Extension
+            ("/catalogs/{catalog_id}/collections/{collection_id}/aggregate", "aggregate_collection_items", ["POST"], {"response_class": _J}),
         ]
 
         for path, handler_name, methods, kwargs in route_table:
@@ -497,9 +707,18 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     async def list_stac_catalogs(
         self,
         request: Request,
-        limit: int = Query(100, ge=1, le=10000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of catalogs to return. Omitted falls back to "
+                "the configured default; a value above the configured maximum "
+                "is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Lists available STAC catalogs.
 
@@ -509,6 +728,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         catalog picker (GET /admin/catalogs) is the surface that narrows
         the list per caller.
         """
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        platform_stac_config = await self._get_plugin_config(StacPluginConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=platform_stac_config.catalogs_default_limit,
+            max_limit=platform_stac_config.catalogs_max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset, lang=language)
 
@@ -536,16 +764,17 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     async def get_stac_catalog(
-        self, catalog_id: str, request: Request, language: str = Depends(get_language)
+        self,
+        catalog_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalog_id = validate_sql_identifier(catalog_id)
-        catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_catalog(catalog_id, lang=language):
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        await self._resolve_catalog_or_404(catalog_id, lang=language, hints=request_hints)
         catalog_dict = await stac_generator.create_catalog(
-            request, catalog_id=catalog_id, lang=language
+            request, catalog_id=catalog_id, lang=language, hints=request_hints,
         )
         return JSONResponse(content=catalog_dict)
 
@@ -555,6 +784,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         request: Request,
         engine=Depends(get_async_engine),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
         # STAC Collection Search extension query params (GET /collections)
         bbox: Optional[str] = Query(
             None,
@@ -571,7 +801,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 "collection id, title, and description."
             ),
         ),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of collections to return."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Number of collections to skip."),
         sortby: Optional[str] = Query(
             None,
@@ -583,18 +821,24 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         """GET /catalogs/{catalog_id}/collections — list or search STAC collections.
 
-        When any STAC Collection Search extension parameters are present (bbox,
-        datetime, q, sortby) the request is routed through search_collections().
-        With no search parameters the plain listing path is used
-        (stac_generator.create_collections_catalog).
+        Every request — with or without STAC Collection Search extension
+        params (bbox, datetime, q, sortby, limit, offset) — is routed through
+        the single PG-backed search_collections() path below. There used to
+        be a separate unpaginated "plain listing" path that hydrated every
+        collection through the routed READ driver one at a time
+        (stac_generator.create_collections_catalog); on a catalog with ~2,000
+        collections that took 100s of seconds and blew the gateway timeout
+        (#2865-adjacent — same per-collection O(N) hydration shape as the
+        landing-page and /search fixes for that issue).
 
         Conforms to: https://api.stacspec.org/v1.0.0/collection-search and
         http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query.
         """
         catalog_id = validate_sql_identifier(catalog_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
         catalogs_svc = await self._get_catalogs_service()
         try:
-            catalog = await catalogs_svc.get_catalog(catalog_id, lang=language)
+            catalog = await catalogs_svc.get_catalog(catalog_id, lang=language, hints=request_hints)
         except (ValueError, Exception):
             catalog = None
         if not catalog:
@@ -602,36 +846,17 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 status_code=404, detail=f"Catalog '{catalog_id}' not found."
             )
 
-        # Detect whether any Collection Search params were supplied
-        has_search_params = any([bbox, datetime, q, sortby])
-        if not has_search_params and limit == 10 and offset == 0:
-            # Plain listing — no search parameters
-            try:
-                collections = await stac_generator.create_collections_catalog(
-                    request, catalog_id=catalog_id, lang=language
-                )
-                return JSONResponse(content=collections)
-            except AttributeError as e:
-                raise HTTPException(
-                    status_code=501,
-                    detail="STAC Collection listing not yet implemented in generator.",
-                ) from e
-
         # Collection Search path — parse params into CollectionSearchRequest
         parsed_bbox = None
         if bbox:
-            parts = bbox.split(",")
-            if len(parts) != 4:
-                raise HTTPException(
-                    status_code=400,
-                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
-                )
             try:
-                parsed_bbox = tuple(float(p) for p in parts)  # type: ignore[assignment]
+                parsed_bbox = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    validate_geometry=False,
+                )
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail="bbox values must be numbers"
-                ) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         parsed_q: Optional[List[str]] = (
             [t.strip() for t in q.split(",") if t.strip()] if q else None
@@ -649,34 +874,47 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
         try:
             async with managed_transaction(engine) as conn:
-                collections_list, total_count = await search_collections(conn, search_req)
+                stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
+                collections_list, total_count = await search_collections(
+                    conn, search_req,
+                    default_limit=stac_config.default_limit,
+                    max_limit=stac_config.max_limit,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        stac_collections = []
-        for coll in collections_list:
-            localized_coll, _ = stac_localize(coll, language)
-            if coll.extent is None:
-                continue
-            stac_coll = pystac.Collection(
-                id=str(localized_coll.get("id") or ""),
-                description=str(localized_coll.get("description") or ""),
-                title=localized_coll.get("title"),
-                license=str(localized_coll.get("license") or ""),
-                extent=pystac.Extent(
-                    spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
-                    temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
-                ),
+        stac_collections = _pg_collections_to_stac_dicts(collections_list, language)
+        _add_collection_navigation_links(
+            stac_collections,
+            request=request,
+            catalog_id=catalog_id,
+            language=language,
+        )
+
+        # search_collections has resolved/clamped search_req.limit in place, so
+        # offset/limit are concrete ints here. Emit self + prev/next so a client
+        # can page through `matched` collections: this hand-built response
+        # previously carried no links at all, so any request with limit/offset/
+        # bbox/datetime/q/sortby came back with an empty `links` array even when
+        # more collections remained.
+        from dynastore.extensions.tools.pagination import build_pagination_links
+
+        links = [{"rel": "self", "type": "application/json", "href": str(request.url)}]
+        links += [
+            {"rel": rel, "type": "application/json", "href": href}
+            for rel, href in build_pagination_links(
+                request,
+                search_req.offset,
+                cast(int, search_req.limit),  # resolved to a concrete int by search_collections
+                total_count,
+                raw=True,
             )
-            if "language" in localized_coll:
-                stac_coll.extra_fields["language"] = localized_coll["language"]
-            if "languages" in localized_coll:
-                stac_coll.extra_fields["languages"] = localized_coll["languages"]
-            stac_collections.append(stac_coll.to_dict())
+        ]
 
         return JSONResponse(
             content={
                 "collections": stac_collections,
+                "links": links,
                 "context": {
                     "limit": search_req.limit,
                     "offset": search_req.offset,
@@ -692,17 +930,19 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection_id: str,
         request: Request,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
-        catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_collection(catalog_id, collection_id):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection '{catalog_id}:{collection_id}' not found.",
-            )
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
+        await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail=f"Collection '{catalog_id}:{collection_id}' not found.",
+            hints=request_hints,
+        )
         collection = await stac_generator.create_collection(
-            request, catalog_id=catalog_id, collection_id=collection_id, lang=language
+            request, catalog_id=catalog_id, collection_id=collection_id, lang=language, hints=request_hints,
         )
         if collection is None:
             raise HTTPException(
@@ -729,12 +969,17 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         self,
         definition: STACCatalogRequest,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         try:
             input_data = definition.model_dump(exclude_unset=True)
             # Pass input_data as both the payload and the exclude_unset dump so
             # detect_use_lang inside the shared body reads the same dict.
-            return await self._ogc_create_catalog(input_data, input_data, language, None)
+            # ``?hints=defer`` flows to create_catalog, deferring GCP storage
+            # provisioning so the catalog is created core-only (see Hint.DEFER).
+            return await self._ogc_create_catalog(
+                input_data, input_data, language, None, hints=request_hints
+            )
         except Exception as e:
             return handle_or_raise(
                 e,
@@ -776,36 +1021,39 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         self,
         catalog_id: str,
         definition: STACCatalogRequest,
+        request: Request,
         language: str = Depends(get_language),
     ):
-        # OGC API Features Part 4 / STAC Transaction Extension: PUT replaces
-        # the whole resource with the request body. Required-field validation
-        # is enforced by ``STACCatalogRequest`` (the same model used on POST),
-        # so a partial body is rejected at the framework boundary.
-        if definition.id != catalog_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({definition.id!r}) must match path catalog_id "
-                    f"({catalog_id!r})."
-                ),
-            )
+        # PUT replaces the whole resource.  A body ``id`` matching the path id
+        # is a normal replace.  A different body ``id`` is allowed ONLY with
+        # ``Prefer: handling=move`` (RFC 7240) — without that header STAC
+        # Transaction mandates 400 (on_id_mismatch="reject").
         input_data = definition.model_dump(exclude_unset=False)
         input_data = normalize_i18n_for_replace(input_data, language)
-        return await self._ogc_replace_catalog(catalog_id, input_data, language, None)
+        body_id = definition.id
+        return await self._ogc_replace_catalog(
+            catalog_id, input_data, language, None,
+            request=request, body_id=body_id, on_id_mismatch="reject",
+        )
 
     async def update_stac_catalog(
         self,
         catalog_id: str,
         definition: STACCatalogUpdate,
+        request: Request,
         language: str = Depends(get_language),
     ):
         input_data = definition.model_dump(exclude_unset=True)
-        return await self._ogc_update_catalog(catalog_id, input_data, language, None)
+        body_id: Optional[str] = input_data.get("id")
+        return await self._ogc_update_catalog(
+            catalog_id, input_data, language, None,
+            body_id=body_id, request=request, on_id_mismatch="reject",
+        )
 
     async def delete_stac_catalog(
         self,
         catalog_id: str,
+        request: Request,
         force: bool = Query(
             False,
             description=(
@@ -814,34 +1062,28 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ),
         ),
     ):
-        return await self._ogc_delete_catalog(catalog_id, force, None)
+        return await self._ogc_delete_catalog(catalog_id, force, None, request=request)
 
     async def replace_stac_collection(
         self,
         catalog_id: str,
         collection_id: str,
         request_body: STACCollectionRequest,
+        request: Request,
         language: str = Depends(get_language),
     ):
-        # OGC API Features Part 4 / STAC Transaction Extension: PUT replaces
-        # the whole collection. ``STACCollectionRequest`` enforces required
-        # STAC fields (id/type/license/extent/...) so partial bodies fail
-        # before reaching the manager.
-        if request_body.id != collection_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({request_body.id!r}) must match path collection_id "
-                    f"({collection_id!r})."
-                ),
-            )
+        # PUT replaces the whole collection.  A body ``id`` different from the
+        # path id is allowed ONLY with ``Prefer: handling=move`` — without that
+        # header STAC Transaction mandates 400 (on_id_mismatch="reject").
+        body_id = request_body.id
         input_data = request_body.model_dump(exclude_unset=False)
         if await self._should_validate_on_write(catalog_id, collection_id):
             validate_stac_collection(input_data)
         input_data = _pack_stac_extras(input_data, language)
         input_data = normalize_i18n_for_replace(input_data, language)
         return await self._ogc_replace_collection(
-            catalog_id, collection_id, input_data, language
+            catalog_id, collection_id, input_data, language,
+            request=request, body_id=body_id, on_id_mismatch="reject",
         )
 
     async def update_stac_collection(
@@ -854,11 +1096,13 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         # Sidecars are handled transparently by ItemsProtocol / LifecycleRegistry.
         input_data = request_body.model_dump(exclude_unset=True)
+        body_id: Optional[str] = input_data.get("id")
         # Fold any STAC extension extras in the PATCH payload (cube:dimensions,
         # themes, …) and providers/summaries into extra_metadata for round-trip.
         input_data = _pack_stac_extras(input_data, language)
         return await self._ogc_update_collection(
-            catalog_id, collection_id, input_data, language, request
+            catalog_id, collection_id, input_data, language, request,
+            body_id=body_id, on_id_mismatch="reject",
         )
 
     async def delete_stac_collection(
@@ -884,7 +1128,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         filter: Optional[str] = Query(None, description="CQL2-Text filter expression"),
         language: str = Depends(get_language),
@@ -892,7 +1144,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
-        catalogs_svc = await self._get_catalogs_service()
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
 
         # Single-field equality shorthand: any non-reserved query parameter is
         # treated as a ``?{property}={value}`` attribute filter and combined with
@@ -904,6 +1157,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             OGC_RESERVED_QUERY_PARAMS,
             combine_cql_filters,
             maybe_dispatch_items_to_search_driver,
+            reject_unknown_filter_params,
+            resolve_queryable_property_names,
         )
         from dynastore.modules.storage.hints import Hint
 
@@ -912,19 +1167,33 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             for key, value in request.query_params.items()
             if key not in OGC_RESERVED_QUERY_PARAMS and value != ""
         }
+        # Reject an unmapped filter name before it is folded into CQL and
+        # dispatched: the SEARCH-driver fast path below has no CQL-parser
+        # validation seam, so an unknown name would otherwise be silently
+        # dropped from the ES query while a count computed elsewhere
+        # disagreed with the (unfiltered) listing (#2682, same fix as the
+        # OGC Features ``/items`` endpoint).
+        if extra_filters:
+            valid_names = await resolve_queryable_property_names(
+                catalog_id, collection_id
+            )
+            reject_unknown_filter_params(extra_filters, valid_names)
         cql_filter = combine_cql_filters(filter, extra_filters)
 
         async with managed_transaction(engine) as conn:
-            collection_metadata = await catalogs_svc.get_collection(
+            await self._resolve_collection_or_404(
                 catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
             )
-            if not collection_metadata:
-                raise HTTPException(
-                    status_code=404, detail=f"Collection '{collection_id}' not found."
-                )
 
             stac_config = await self._get_stac_config(
                 catalog_id, collection_id, db_resource=conn
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             # ── Routing-aware items SEARCH-driver dispatch (#1047, #1311) ─────
@@ -1070,6 +1339,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
 
         if not engine:
             from dynastore.models.protocols import DatabaseProtocol
@@ -1078,7 +1349,12 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             if db_svc:
                 engine = db_svc.engine
 
-        async with managed_transaction(engine) as conn:
+        # Bounded, fail-fast pool acquire (#2933): under pool saturation this
+        # returns 503 well before the request risks riding the Cloud Run
+        # ceiling, instead of queuing for the engine's full pool_timeout.
+        async with managed_transaction(
+            engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+        ) as conn:
             # Use direct connection with ItemService to ensure proper sidecar filtering
             from dynastore.models.protocols import ItemsProtocol
 
@@ -1094,7 +1370,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 )
 
             # Add handling for deleted items
-            if item.properties.get("deleted_at") is not None:
+            if (item.properties or {}).get("deleted_at") is not None:
                 raise HTTPException(
                     status_code=404, detail=f"Item {item_id} not found."
                 )
@@ -1351,6 +1627,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         )
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
 
         async with managed_transaction(engine) as conn:
             return await self._delete_item(
@@ -1374,7 +1652,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         ),
         ids: Optional[str] = Query(None, description="Comma-separated Item IDs."),
         collections: Optional[str] = Query(None, description="Comma-separated Collection IDs."),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of items to return."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Number of items to skip."),
         filter: Optional[str] = Query(
             None,
@@ -1405,18 +1691,14 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # Parse bbox: comma-separated floats → 4-tuple
         parsed_bbox = None
         if bbox:
-            parts = bbox.split(",")
-            if len(parts) != 4:
-                raise HTTPException(
-                    status_code=400,
-                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
-                )
             try:
-                parsed_bbox = tuple(float(p) for p in parts)  # type: ignore[assignment]
+                parsed_bbox = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    validate_geometry=False,
+                )
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail="bbox values must be numbers"
-                ) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # Parse ids: comma-separated → list
         parsed_ids: Optional[List[str]] = (
@@ -1503,7 +1785,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             sortby=parsed_sortby,
         )
 
-        async with managed_transaction(engine) as conn:
+        # Bounded, fail-fast pool acquire (#2933) — see get_stac_item.
+        async with managed_transaction(
+            engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+        ) as conn:
             stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
             try:
                 from dynastore.modules.storage.access_scope import (
@@ -1517,6 +1802,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # ``search_items`` resolves/clamps ``search_request.limit`` in place
+        # before returning — it is never None past this point.
+        assert search_request.limit is not None
 
         from dynastore.models.shared_models import OutputFormatEnum
         if f in (OutputFormatEnum.GEOPARQUET, "geoparquet", "parquet"):
@@ -1559,7 +1848,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             search_request = search_request.model_copy(update={"catalog_id": catalog_id})
         if not search_request.catalog_id:
             raise HTTPException(status_code=400, detail="catalog_id required")
-        async with managed_transaction(engine) as conn:
+        # Bounded, fail-fast pool acquire (#2933) — see get_stac_item.
+        async with managed_transaction(
+            engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+        ) as conn:
             stac_config = await self._get_stac_config(
                 search_request.catalog_id, db_resource=conn
             )
@@ -1577,6 +1869,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 # Invalid filter (e.g. unknown queryable property) — surface as a
                 # 400 instead of a 500, matching the ``/items`` filter path.
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # ``search_items`` resolves/clamps ``search_request.limit`` in place
+        # before returning — it is never None past this point.
+        assert search_request.limit is not None
 
         from dynastore.models.shared_models import OutputFormatEnum
         if f in (OutputFormatEnum.GEOPARQUET, "geoparquet", "parquet"):
@@ -1616,7 +1912,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         intersects: Optional[Dict[str, Any]],
         datetime: Optional[str],
         sortby: Optional[List[str]],
-        limit: int,
+        limit: Optional[int],
         offset: int,
         language: str,
     ):
@@ -1632,6 +1928,14 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         """
         from dynastore.modules.elasticsearch.global_search import (
             search_public_items,
+        )
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        platform_stac_config = await self._get_plugin_config(StacPluginConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=platform_stac_config.default_limit,
+            max_limit=platform_stac_config.max_limit,
         )
 
         page = await search_public_items(
@@ -1690,7 +1994,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         ),
         ids: Optional[str] = Query(None, description="Comma-separated Item IDs."),
         collections: Optional[str] = Query(None, description="Comma-separated Collection IDs."),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of items to return."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Number of items to skip."),
         sortby: Optional[str] = Query(
             None,
@@ -1708,18 +2020,16 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         """
         parsed_bbox = None
         if bbox:
-            parts = bbox.split(",")
-            if len(parts) != 4:
-                raise HTTPException(
-                    status_code=400,
-                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
-                )
             try:
-                parsed_bbox = [float(p) for p in parts]
+                parsed_tuple = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    validate_geometry=False,
+                )
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail="bbox values must be numbers"
-                ) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            assert parsed_tuple is not None  # bbox truthy above => allow_none path not hit
+            parsed_bbox = list(parsed_tuple)
 
         parsed_ids = [i.strip() for i in ids.split(",") if i.strip()] if ids else None
         parsed_collections = (
@@ -1787,60 +2097,9 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             language=language,
         )
 
-    async def search_stac_collections_post(
-        self,
-        request: Request,
-        search_req: CollectionSearchRequest,
-        engine=Depends(get_async_engine),
-        language: str = Depends(get_language),
-    ):
-        try:
-            async with managed_transaction(engine) as conn:
-                collections, total_count = await search_collections(conn, search_req)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        # Release connection before PySTAC processing
-        stac_collections = []
-        for coll in collections:
-            # Localize before creating PySTAC collection
-            localized_coll, _ = stac_localize(coll, language)
-            if coll.extent is None:
-                continue
-            stac_coll = pystac.Collection(
-                id=str(localized_coll.get("id") or ""),
-                description=str(localized_coll.get("description") or ""),
-                title=localized_coll.get("title"),
-                license=str(localized_coll.get("license") or ""),
-                extent=pystac.Extent(
-                    spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
-                    temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
-                ),
-            )
-            # Inject language metadata
-            if "language" in localized_coll:
-                stac_coll.extra_fields["language"] = localized_coll["language"]
-            if "languages" in localized_coll:
-                stac_coll.extra_fields["languages"] = localized_coll["languages"]
-
-            stac_collections.append(stac_coll.to_dict())
-        return JSONResponse(
-            content={
-                "collections": stac_collections,
-                "context": {
-                    "limit": search_req.limit,
-                    "matched": total_count,
-                    "returned": len(stac_collections),
-                },
-            }
-        )
-
-    @router.post(
-        "/catalogs/{catalog_id}/collections/{collection_id}/aggregate",
-        response_class=JSONResponse,
-    )
     async def aggregate_collection_items(
-        catalog_id: str,  # type: ignore[reportGeneralTypeIssues]
+        self,
+        catalog_id: str,
         collection_id: str,
         request: Request,
         aggregation_request: AggregationRequest,
@@ -1854,6 +2113,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
 
         async with managed_transaction(engine) as conn:
             # Get STAC config

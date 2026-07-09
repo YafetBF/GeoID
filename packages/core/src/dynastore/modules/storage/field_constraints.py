@@ -27,7 +27,8 @@ not call these helpers.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, Mapping, Optional
+import logging
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 from dynastore.models.field_types import CANONICAL_TO_PG_DDL
 from dynastore.models.protocols.field_definition import FieldAccess, FieldCapability, FieldDefinition
@@ -36,6 +37,9 @@ from dynastore.modules.storage.errors import (
     UniqueConstraintViolationError,
     UnknownFieldsError,
 )
+from dynastore.modules.storage.schema_types import UniqueConstraint
+
+logger = logging.getLogger(__name__)
 
 
 # System-level fields that always pass the strict-unknown-fields check
@@ -278,11 +282,56 @@ def bridge_schema_to_attribute_sidecar(
         order.append(name)
         changed = True
 
-    if not changed:
-        return sidecar
+    # Composite UNIQUE constraints (``ItemsSchema.constraints``, 2+ column
+    # ``UniqueConstraint`` entries) only make sense over fields that are
+    # actually materialised as native columns — a field left inside the
+    # JSONB blob has no physical column for PostgreSQL to index. Bridge
+    # only the constraints whose every field_name resolved to a real
+    # column above (either pre-existing or just synthesised). Stashed as
+    # an extra attribute (``FeatureAttributeSidecarConfig`` allows extra
+    # fields) rather than a declared model field, so the DDL generator
+    # (``attributes.py``) can read it via ``getattr`` without this module
+    # depending on the sidecar config's schema shape.
+    composite_unique: list[list[str]] = []
+    schema_constraints = getattr(schema, "constraints", None)
+    if isinstance(schema_constraints, (list, tuple)):
+        for constraint in schema_constraints:
+            if not isinstance(constraint, UniqueConstraint):
+                continue
+            names = constraint.field_names
+            if len(names) < 2:
+                continue
+            if all(n in existing for n in names):
+                composite_unique.append(list(names))
+                continue
+            # 2+ column UniqueConstraint whose fields did not all materialise
+            # as native columns (JSONB mode, or a field left in the blob):
+            # no CREATE UNIQUE INDEX can be emitted for it, so the composite
+            # uniqueness guarantee the operator declared is silently NOT
+            # enforced. This is a config-authoring trap (#2650) — surface it
+            # loudly rather than dropping the constraint without a trace.
+            # No collection/table identifier is available at this bridge
+            # scope (neither ``ItemsSchema`` nor ``FeatureAttributeSidecarConfig``
+            # carries one), so the warning is field-name-only.
+            missing = [n for n in names if n not in existing]
+            logger.warning(
+                "Composite UniqueConstraint on fields %s cannot be enforced: "
+                "field(s) %s did not materialise as native PostgreSQL "
+                "columns (JSONB-mode or non-columnar field). No unique "
+                "index will be created for this constraint — composite "
+                "uniqueness is NOT enforced.",
+                list(names), missing,
+            )
 
-    merged = [existing[n] for n in order]
-    return sidecar.model_copy(update={"attribute_schema": merged})
+    update: Dict[str, Any] = {}
+    if changed:
+        update["attribute_schema"] = [existing[n] for n in order]
+    if composite_unique:
+        update["composite_unique_constraints"] = composite_unique
+
+    if not update:
+        return sidecar
+    return sidecar.model_copy(update=update)
 
 
 def reconcile_attribute_schema_to_columns(
@@ -426,17 +475,38 @@ async def check_unique(
     features: Iterable[Mapping[str, Any]],
     *,
     exists: Callable[[str, Any], Awaitable[bool]],
+    constraints: Optional[Iterable[Any]] = None,
 ) -> None:
     """Raise ``UniqueConstraintViolationError`` for duplicates.
 
     Checks both in-batch collisions and against existing storage via the
     caller-supplied ``exists(field_name, value) -> bool`` coroutine —
     typically a driver ``read_entities`` probe.
+
+    ``constraints`` optionally carries the collection's declarative
+    ``ItemsSchema.constraints`` list; composite (2+ column)
+    ``UniqueConstraint`` entries are enforced in-batch only, mirroring the
+    single-field path's own dedup. There is no storage-existence probe for
+    composite tuples (``exists`` is single-field only) — callers that need
+    full cross-storage composite enforcement should rely on the
+    PostgreSQL native DDL path (``Capability.UNIQUE_ENFORCEMENT``) instead.
+    A component value of ``None`` never collides with another ``None``,
+    matching standard SQL UNIQUE index semantics.
     """
     unique_names = [n for n, fd in fields.items() if fd.unique]
-    if not unique_names:
+    composite_field_sets: list[list[str]] = []
+    if constraints is not None:
+        for constraint in constraints:
+            if not isinstance(constraint, UniqueConstraint):
+                continue
+            if len(constraint.field_names) >= 2:
+                composite_field_sets.append(list(constraint.field_names))
+    if not unique_names and not composite_field_sets:
         return
     seen: Dict[str, set] = {n: set() for n in unique_names}
+    composite_seen: Dict[Tuple[str, ...], set] = {
+        tuple(names): set() for names in composite_field_sets
+    }
     for feature in features:
         for name in unique_names:
             value = _resolve_value(feature, name)
@@ -453,3 +523,15 @@ async def check_unique(
                     f"unique field '{name}' already has value {value!r}",
                     field=name, value=value,
                 )
+        for names in composite_field_sets:
+            key = tuple(names)
+            values = tuple(_resolve_value(feature, n) for n in names)
+            if any(v is None for v in values):
+                continue
+            if values in composite_seen[key]:
+                raise UniqueConstraintViolationError(
+                    f"duplicate value for composite unique constraint {names} "
+                    f"in batch",
+                    field=",".join(names), value=values,
+                )
+            composite_seen[key].add(values)

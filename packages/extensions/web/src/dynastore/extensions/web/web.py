@@ -18,7 +18,6 @@
 
 import asyncio
 import os
-import hashlib
 import itertools
 import logging
 import re
@@ -40,6 +39,7 @@ from dynastore.models.auth import Condition
 from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.policies import Policy, Role, Principal
 from dynastore.tools.discovery import get_protocol, get_protocols, register_plugin
+from dynastore.tools.http_cache import cache_control_headers, generate_strong_etag
 from dynastore.extensions.tools.language_utils import get_language
 
 # Register public access policy for web extension
@@ -409,6 +409,22 @@ class RelativeSlashRedirectMiddleware:
         if scope["type"] == "http":
             route_path = get_route_path(scope)
             if route_path != "/" and not route_path.endswith("/"):
+                # Skip redirect for static file paths (they use {prefix}/{filename:path} pattern)
+                # Static files are served at /web/{prefix}/{filename} and must not be redirected
+                path_parts = route_path.strip("/").split("/")
+                if len(path_parts) >= 2:
+                    # Check if this looks like a static file path (prefix/filename)
+                    # by checking if there's a registered static provider for the prefix
+                    from dynastore.modules import get_protocol
+                    from dynastore.models.protocols.web import WebModuleProtocol
+                    web_module = get_protocol(WebModuleProtocol)
+                    if web_module and hasattr(web_module, 'static_providers'):
+                        potential_prefix = path_parts[1] if path_parts[0] == "web" else path_parts[0]
+                        if potential_prefix in web_module.static_providers:
+                            # This is a static file path - skip redirect
+                            await self.app(scope, receive, send)
+                            return
+                
                 router = self._get_router()
                 if router is not None:
                     # Skip redirect if the original path already matches a route
@@ -546,18 +562,12 @@ class Web(ExtensionProtocol, OGCServiceMixin):
 
     def generate_etag(self, content_parts: List[bytes]) -> str:
         """Generates a strong ETag for a list of content parts."""
-        hasher = hashlib.md5()
-        for part in content_parts:
-            hasher.update(part)
-        return f'"{hasher.hexdigest()}"'
+        return generate_strong_etag(content_parts)
 
     def get_cache_headers(self, max_age: Optional[int] = None) -> Dict[str, str]:
         """Provides default cache control headers."""
         eff_max_age = max_age if max_age is not None else self.DEFAULT_CACHE_MAX_AGE
-        return {
-            "Cache-Control": f"public, max-age={eff_max_age}, stale-while-revalidate=60",
-            "Vary": "Accept-Encoding",
-        }
+        return cache_control_headers(eff_max_age)
 
     def configure_app(self, app: FastAPI):
         """Configures global settings like middleware and CORS."""
@@ -1051,10 +1061,30 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                     standards_html_parts.append(
                         f'<div class="glass-panel p-4 rounded-xl border border-white/5 group">{card_inner}</div>'
                     )
+            # Scope-conditional entries: implemented but not active in this deployment.
+            # Shown in the same grid with amber styling so coverage is clear.
+            for entry in summary.scope_conditional:
+                card_inner = f"""
+                    <div class="flex items-center justify-between mb-1">
+                        <h4 class="text-sm font-semibold text-amber-300/80 group-hover:text-amber-200 transition-colors">{entry.name}</h4>
+                    </div>
+                    <div class="text-[10px] text-amber-700/80 uppercase tracking-wider">available</div>
+                """
+                if entry.doc_url:
+                    standards_html_parts.append(
+                        f'<a href="{entry.doc_url}" target="_blank" rel="noopener" '
+                        f'class="block glass-panel p-4 rounded-xl border border-amber-900/30 '
+                        f'hover:border-amber-600/40 transition-colors group">{card_inner}</a>'
+                    )
+                else:
+                    standards_html_parts.append(
+                        f'<div class="glass-panel p-4 rounded-xl border border-amber-900/30 group">{card_inner}</div>'
+                    )
             standards_grid = "".join(standards_html_parts) or (
                 f'<div class="text-slate-500 text-sm col-span-full">No conformance classes registered.</div>'
             )
 
+            # Roadmap pills (gray) — not yet implemented.
             not_impl_pill_parts: List[str] = []
             for entry in summary.roadmap:
                 base_cls = "px-2 py-1 rounded-full text-[11px] border border-slate-700/60 bg-slate-800/40"
@@ -1073,7 +1103,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             )
 
             ogc_total = summary.total_conformance_classes
-            ogc_families = len(summary.standards)
+            ogc_families = len(summary.standards) + len(summary.scope_conditional)
         except Exception:
             # Degrade gracefully if the conformance registry is unavailable —
             # the page must still render for anonymous visitors.
@@ -1650,6 +1680,107 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             # Fallback for older WebModule without the method
             return [{"prefix": p, "owner": "", "description": ""} for p in sorted(self.web_module.static_providers)]
 
+        @self.router.get("/search", response_class=JSONResponse)
+        async def global_search(
+            q: str = Query(..., min_length=2, description="Search query"),
+            types: str = Query("catalog,collection,item,doc,task", description="Comma-separated result types"),
+            limit: int = Query(5, ge=1, le=50, description="Max results per type"),
+        ):
+            """Federated search across catalogs, collections, items, docs, and tasks.
+
+            Anonymous-accessible endpoint that searches multiple data sources
+            and returns grouped results. Each group is limited to ``limit`` items.
+
+            Returns:
+                {
+                    "results": {
+                        "catalogs": [...],
+                        "collections": [...],
+                        "items": [...],
+                        "docs": [...],
+                        "tasks": [...]
+                    },
+                    "total": 42,
+                    "query_time_ms": 23
+                }
+            """
+            import time
+            start_time = time.time()
+            
+            results = {
+                "results": {
+                    "catalogs": [],
+                    "collections": [],
+                    "items": [],
+                    "docs": [],
+                    "tasks": [],
+                },
+                "total": 0,
+                "query_time_ms": 0,
+            }
+            
+            if not self.web_module:
+                return results
+            
+            query = q.lower().strip()
+            type_filters = [t.strip() for t in types.split(",")]
+            
+            try:
+                # Search catalogs
+                if "catalog" in type_filters:
+                    from dynastore.models.protocols.catalogs import CatalogsProtocol
+                    catalog_proto = get_protocol(CatalogsProtocol)
+                    if catalog_proto and hasattr(catalog_proto, "list"):
+                        catalogs = await catalog_proto.list()
+                        matches = [
+                            {
+                                "id": c.get("id"),
+                                "title": c.get("title", c.get("id")),
+                                "description": c.get("description", ""),
+                                "url": f"/?catalog={c.get('id')}",
+                            }
+                            for c in catalogs
+                            if query in c.get("id", "").lower()
+                            or query in c.get("title", "").lower()
+                            or query in c.get("description", "").lower()
+                        ][:limit]
+                        results["results"]["catalogs"] = matches
+                        results["total"] += len(matches)
+                
+                # Search collections (simplified - just search across known catalogs)
+                if "collection" in type_filters:
+                    # TODO: Implement collection search when we have a better approach
+                    # For now, this is a placeholder
+                    pass
+                
+                # Search docs
+                if "doc" in type_filters:
+                    matches = []
+                    for doc_id, doc_item in self.docs_registry.items():
+                        title = doc_item.get("title", "")
+                        if query in title.lower() or query in doc_id.lower():
+                            matches.append({
+                                "id": doc_id,
+                                "title": title,
+                                "category": doc_item.get("category", "root"),
+                                "url": f"/web/docs#{doc_id}",
+                            })
+                            if len(matches) >= limit:
+                                break
+                    results["results"]["docs"] = matches
+                    results["total"] += len(matches)
+                
+                # Search tasks (if available)
+                if "task" in type_filters:
+                    # TODO: Implement task search when task protocol is available
+                    pass
+                
+            except Exception as e:
+                logger.exception(f"Search error: {e}")
+            
+            results["query_time_ms"] = int((time.time() - start_time) * 1000)
+            return results
+
         @self.router.get("/admin/pages/{page_id}/providers", response_class=JSONResponse)
         async def get_page_providers(page_id: str):
             """Sysadmin endpoint: list every handler registered for a page id.
@@ -1728,8 +1859,16 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             Returns the manifest of all found documentation, grouped by category.
             Includes ID, Title, and Full Path.
             """
-            # Use raw buckets first
-            buckets = {"root": [], "modules": [], "extensions": [], "tasks": []}
+            # Initialize buckets with all expected categories (must match frontend categoryMapping)
+            buckets = {
+                "platform": [],
+                "architecture": [],
+                "components": [],
+                "modules": [],
+                "extensions": [],
+                "tasks": [],
+                "root": [],
+            }
 
             # Iterate through the registry and bucket items by category
             for doc_item in self.docs_registry.values():

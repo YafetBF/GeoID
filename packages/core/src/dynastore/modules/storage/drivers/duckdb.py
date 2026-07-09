@@ -29,7 +29,17 @@ Capabilities vary based on configuration:
 
 Connection lifecycle:
   - **Pool**: bounded pool of in-memory DuckDB connections, sized by
-    ``DUCKDB_POOL_SIZE`` (default 4).
+    ``DuckdbEngineConfig.pool_size`` (config registry, default 8) — read
+    at ``lifespan()`` startup via the central cached config getter (see
+    ``_read_live_pool_size``) and re-checked live thereafter: every call
+    through ``_get_location_async`` (the choke point every read/write/
+    delete/ensure_storage path passes through before touching the pool)
+    triggers a throttled re-read (see ``_maybe_resize_pool``, at most once
+    per ``_RESIZE_CHECK_INTERVAL_SECONDS``). Growing the pool creates and
+    enqueues new connections immediately; shrinking only lowers a target —
+    surplus connections are retired lazily by ``_borrow_conn`` as they are
+    returned, so a borrowed connection is never yanked out from under a
+    caller (see ``_apply_pool_resize``).
   - **Lazy init**: pool created on first use via ``lifespan()``, not at
     import time.
   - **Extensions loaded once**: ``spatial`` (and optionally ``sqlite``)
@@ -63,12 +73,14 @@ import logging
 import queue
 import re
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.field_definition import FieldDefinition
+    from dynastore.models.scaling import ScalingSignal
     from dynastore.modules.storage.driver_config import ItemsSchema, ItemsWritePolicy
     from dynastore.modules.storage.storage_location import StorageLocation
 
@@ -167,6 +179,49 @@ _pool_lock = threading.Lock()
 _pool_initialized: bool = False
 _loaded_extensions: Set[str] = set()
 
+# Target size for the pool, as last resolved from the live config. Equal to
+# ``_pool_size`` except mid-shrink, where it is lower than ``_pool_size``
+# until enough borrowed connections have been returned and retired to close
+# the gap (see ``_apply_pool_resize`` / ``_borrow_conn``).
+_pool_target_size: int = 0
+
+# Monotonic timestamp of the last live ``pool_size`` re-read, and the
+# minimum interval between re-reads (see ``_maybe_resize_pool``) — throttles
+# the config-service round trip so a burst of concurrent requests doesn't
+# hammer it.
+_last_resize_check: float = 0.0
+_RESIZE_CHECK_INTERVAL_SECONDS: float = 30.0
+
+# Fallback pool size used when the platform config service is unavailable
+# (sync callers reaching ``_borrow_conn`` before ``lifespan()`` has run —
+# tests, early startup). Mirrors ``DuckdbEngineConfig.pool_size``'s default
+# so behaviour matches the live path when the config service isn't reachable
+# (same pattern as the module globals in ``connection_health_config.py``).
+_DUCKDB_POOL_SIZE_FALLBACK: int = 8
+
+
+async def _read_live_pool_size() -> int:
+    """Read ``DuckdbEngineConfig.pool_size`` live from the central cached
+    config getter.
+
+    Falls back to :data:`_DUCKDB_POOL_SIZE_FALLBACK` when the platform
+    config service is unavailable (tests, early startup) — mirrors the
+    ``_read_live_*`` helpers in ``db_config/query_executor.py``.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(DuckdbEngineConfig)
+            if isinstance(cfg, DuckdbEngineConfig):
+                return cfg.pool_size
+    except Exception:
+        pass
+    return _DUCKDB_POOL_SIZE_FALLBACK
+
 
 def _duckdb_available() -> bool:
     try:
@@ -206,9 +261,15 @@ def _try_load_extension_on(conn, name: str) -> bool:
         return False
 
 
-def _init_pool():
-    """Initialize the connection pool (idempotent, thread-safe)."""
-    global _pool_initialized, _pool_size
+def _init_pool(size: Optional[int] = None):
+    """Initialize the connection pool (idempotent, thread-safe).
+
+    ``size`` — the pool size, already resolved live from
+    ``DuckdbEngineConfig`` by an async caller (``lifespan()``). If ``None``
+    (a sync caller reaching this before ``lifespan()`` ran — tests, direct
+    driver use), falls back to :data:`_DUCKDB_POOL_SIZE_FALLBACK`.
+    """
+    global _pool_initialized, _pool_size, _pool_target_size
 
     if _pool_initialized:
         return
@@ -217,22 +278,121 @@ def _init_pool():
         if _pool_initialized:
             return
 
-        size = DuckDBConfig.pool_size
-        for _ in range(size):
+        resolved_size = size if size is not None else _DUCKDB_POOL_SIZE_FALLBACK
+        for _ in range(resolved_size):
             conn = _create_connection()
             _pool.put(conn)
 
-        _pool_size = size
+        _pool_size = resolved_size
+        _pool_target_size = resolved_size
         _pool_initialized = True
-        logger.info("DuckDB: connection pool initialized (size=%d)", size)
+        logger.info("DuckDB: connection pool initialized (size=%d)", resolved_size)
+
+
+def _apply_pool_resize(new_size: int) -> None:
+    """Apply a freshly re-read live ``pool_size``.
+
+    Growing creates ``new_size - _pool_size`` connections and enqueues them.
+    Shrinking never closes a borrowed connection; it only lowers
+    ``_pool_target_size`` so ``_borrow_conn`` retires surplus connections
+    one at a time as they are returned. A surplus connection idle in the
+    queue right now is retired the next time it happens to be borrowed and
+    returned, not proactively — this is the "lazy" half of the contract.
+
+    ``_create_connection()`` is real blocking I/O (``duckdb.connect`` +
+    ``SET`` + extension install/load per connection, possibly several
+    seconds for a multi-connection grow) — deliberately done OUTSIDE
+    ``_pool_lock`` so a grow never stalls a concurrent borrow/return. The
+    size bookkeeping is claimed under the lock *before* those connections
+    are built: a grow's ``_pool_size``/``_pool_target_size`` jump to
+    ``new_size`` immediately, so a concurrent resize call sees this grow as
+    already in flight and doesn't double it. The cost is that
+    ``get_pool_saturation()`` reads slightly high (not low) for the few
+    seconds it takes the new connections to actually land in the queue —
+    never a false "cooler than reality" signal.
+
+    This function itself is synchronous and blocking — callers reached from
+    the event loop MUST offload it via ``run_in_thread``/``asyncio.to_thread``
+    (see ``_maybe_resize_pool``). A no-op before the pool has been
+    initialized or when the size hasn't changed.
+    """
+    global _pool_size, _pool_target_size
+
+    with _pool_lock:
+        if not _pool_initialized or new_size == _pool_target_size:
+            return
+        old_size = _pool_size
+        grow_by = new_size - old_size
+        _pool_target_size = new_size
+        if grow_by > 0:
+            _pool_size = new_size
+        else:
+            logger.info(
+                "DuckDB: pool shrink requested %d -> %d — retiring surplus "
+                "connections lazily as they are returned",
+                old_size, new_size,
+            )
+            return
+
+    # The blocking part — outside _pool_lock (see docstring above).
+    for _ in range(grow_by):
+        _pool.put(_create_connection())
+    logger.info("DuckDB: pool grown %d -> %d", old_size, new_size)
+
+
+async def _maybe_resize_pool() -> None:
+    """Throttled live re-check of ``DuckdbEngineConfig.pool_size``.
+
+    Called from ``_get_location_async`` — the async choke point every
+    read/write/delete/ensure_storage path passes through before it ever
+    touches the pool — so this stands in for "on every borrow" without a
+    dedicated call at each of the several borrow sites. Actually re-reads
+    the config service at most once every ``_RESIZE_CHECK_INTERVAL_SECONDS``:
+    the throttle timestamp is claimed under ``_pool_lock`` *before* the
+    async config read starts, so concurrent callers racing across the
+    interval boundary trigger at most one live read, not one each.
+
+    ``_apply_pool_resize`` is offloaded via ``run_in_thread`` — it's
+    reached from here on every request's async path, and a grow (the case
+    that actually matters: the autosize actuator only bumps ``pool_size``
+    while the pool is saturated, i.e. exactly when the pod is busiest) does
+    real blocking I/O per new connection. Running it inline on the event
+    loop would freeze every in-flight coroutine for the whole grow.
+
+    Best-effort and non-blocking for callers: a config-read failure (or the
+    pool not being initialized yet) is swallowed — the pool simply keeps its
+    current size until the next successful check.
+    """
+    global _last_resize_check
+
+    if not _pool_initialized:
+        return  # nothing to resize before lifespan() has run
+
+    now = time.monotonic()
+    with _pool_lock:
+        if now - _last_resize_check < _RESIZE_CHECK_INTERVAL_SECONDS:
+            return
+        _last_resize_check = now
+
+    try:
+        new_size = await _read_live_pool_size()
+        await run_in_thread(_apply_pool_resize, new_size)
+    except Exception:
+        logger.debug("DuckDB: live pool_size re-check failed", exc_info=True)
 
 
 @contextmanager
 def _borrow_conn(timeout: Optional[int] = None):
     """Borrow a connection from the pool; return on exit.
 
-    Thread-safe: ``queue.Queue`` handles synchronization.
+    Thread-safe: ``queue.Queue`` handles synchronization. On return, a
+    connection that is now surplus to ``_pool_target_size`` (a shrink is in
+    progress) is closed and retired instead of being put back — this is the
+    only place a shrink actually removes a connection, and it never touches
+    a connection that is still borrowed.
     """
+    global _pool_size
+
     _init_pool()
     t = timeout if timeout is not None else DuckDBConfig.read_timeout
     try:
@@ -245,7 +405,21 @@ def _borrow_conn(timeout: Optional[int] = None):
     try:
         yield conn
     finally:
-        _pool.put(conn)
+        retire = False
+        with _pool_lock:
+            if _pool_size > _pool_target_size:
+                _pool_size -= 1
+                retire = True
+        if retire:
+            try:
+                conn.close()
+            except Exception:
+                logger.warning(
+                    "DuckDB: failed to close retired pool connection", exc_info=True
+                )
+            logger.info("DuckDB: retired surplus connection (pool_size now %d)", _pool_size)
+        else:
+            _pool.put(conn)
 
 
 @contextmanager
@@ -269,7 +443,7 @@ def _attach_sqlite(conn, write_path: str):
 
 def _close_pool():
     """Close all connections in the pool and reset state."""
-    global _pool_initialized, _pool_size
+    global _pool_initialized, _pool_size, _pool_target_size, _last_resize_check
 
     with _pool_lock:
         closed = 0
@@ -283,9 +457,57 @@ def _close_pool():
 
         _pool_initialized = False
         _pool_size = 0
+        _pool_target_size = 0
+        _last_resize_check = 0.0
         _loaded_extensions.clear()
         if closed:
             logger.info("DuckDB: connection pool closed (%d connections)", closed)
+
+
+def get_pool_saturation() -> Optional[float]:
+    """Read-only connection-pool saturation for THIS instance, in [0, 1].
+
+    ``(pool_size - available) / pool_size``. Returns ``None`` when the pool
+    has not been initialized yet (no DuckDB-backed collection has run a
+    query on this process) — never touches pool state.
+    """
+    if not _pool_initialized or _pool_size <= 0:
+        return None
+    available = _pool.qsize()
+    return max(0.0, min(1.0, (_pool_size - available) / _pool_size))
+
+
+class DuckDbPoolSignalProvider:
+    """``ScalingSignalProtocol``: this pod's DuckDB connection-pool saturation.
+
+    A dedicated singleton rather than a method on ``ItemsDuckdbDriver``: the
+    driver is instantiated per-collection (multi-instance), but the
+    underlying connection pool is a single process-wide resource (see the
+    module-level ``_pool`` above) — a per-driver-instance signal would
+    double-count the same pool once per collection using DuckDB. Register
+    exactly one instance so ``get_protocols(ScalingSignalProtocol)`` reports
+    the pool's saturation once per pod.
+    """
+
+    def scaling_signals(self) -> List["ScalingSignal"]:
+        """``scope="instance"`` — only meaningful for the reporting pod. Empty
+        when the pool hasn't been initialized (no DuckDB query has run here
+        yet), so an idle/unused pod contributes nothing.
+        """
+        saturation = get_pool_saturation()
+        if saturation is None:
+            return []
+        from dynastore.models.scaling import ScalingSignal
+
+        return [
+            ScalingSignal(
+                source="duckdb_pool",
+                metric="pool_saturation",
+                value=saturation,
+                scope="instance",
+                ts=time.time(),
+            )
+        ]
 
 
 class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
@@ -355,8 +577,9 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
-        _init_pool()
-        logger.info("ItemsDuckdbDriver: started (pool_size=%d)", DuckDBConfig.pool_size)
+        size = await _read_live_pool_size()
+        _init_pool(size=size)
+        logger.info("ItemsDuckdbDriver: started (pool_size=%d)", _pool_size)
         yield
         _close_pool()
         logger.info("ItemsDuckdbDriver: stopped")
@@ -364,7 +587,14 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
     async def _get_location_async(
         self, catalog_id: str, collection_id: Optional[str] = None
     ) -> Optional[ItemsDuckdbDriverConfig]:
-        """Resolve ItemsDuckdbDriverConfig from the config waterfall."""
+        """Resolve ItemsDuckdbDriverConfig from the config waterfall.
+
+        Every read/write/delete/ensure_storage path calls this before it
+        ever touches the connection pool, so it doubles as the choke point
+        for the throttled live pool-size re-check (see
+        ``_maybe_resize_pool``).
+        """
+        await _maybe_resize_pool()
         try:
             from dynastore.tools.discovery import get_protocol
             from dynastore.models.protocols.configs import ConfigsProtocol
@@ -1289,6 +1519,15 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
         # (geoid#1643). The restore_transform_chain is wired only on
         # Elasticsearch read paths; the routing-config validator emits a WARN
         # if output_transformers are declared against a non-ES driver.
+        if request is not None and request.group_by:
+            # #2829: this driver declares Hint.GROUP_BY in supported_hints but
+            # does not implement grouping — raise rather than silently return
+            # an ungrouped page scan that looks like a valid result.
+            raise ValueError(
+                "ItemsDuckdbDriver does not support QueryRequest.group_by; "
+                "route this query to a GROUP_BY-capable driver (e.g. PostgreSQL)."
+            )
+
         loc = await self._get_location_async(catalog_id, collection_id)
         if not loc or not loc.path:
             return

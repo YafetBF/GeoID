@@ -21,7 +21,10 @@
 Serves RECORDS-type collections as OGC API - Records catalogues.
 Records are stored as ``Feature(geometry=None, properties={...})`` using
 the standard sidecar pipeline (AttributesSidecar).  The GeometrySidecar
-is skipped for RECORDS collections.
+is skipped for RECORDS collections by default, unless the collection has
+opted into the geometry capability via ``CollectionInfo.allow_geometry``
+(RFC #2550) — see ``records_generator.collection_has_geometry``. Req 55 of
+OGC API - Records Part 1 allows ``geometry`` to be a real geometry or null.
 
 Delegates to ``CatalogsProtocol`` / ``ItemsProtocol`` for all CRUD —
 no new storage layer is introduced.
@@ -41,16 +44,22 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
-from dynastore.extensions.web.decorators import expose_web_page, expose_static
-from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.web.decorators import expose_web_page
+from dynastore.extensions.tools.db import (
+    get_async_connection,
+    get_async_connection_bounded,
+    get_async_engine,
+)
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.tools.language_utils import resolve_localized_field
 from dynastore.extensions.tools.url import get_root_url
+from dynastore.extensions.tools.formatters import OutputFormatEnum
 from dynastore.extensions.tools.query import (  # noqa: E402
     parse_hints_param,
     resolve_items_read_policy,
 )
 from dynastore.modules.storage.hints import Hint  # noqa: E402
+from dynastore.models.dimensions import DIMENSIONS_CATALOG_ID
 from dynastore.models.protocols import ItemsProtocol
 from dynastore.models.shared_models import Link
 from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
@@ -92,12 +101,17 @@ def _resolve_links_titles(links: Any, language: str) -> None:
 # OGC API - Records conformance URIs (OGC 20-004)
 # ---------------------------------------------------------------------------
 
+# Only classes actually defined by OGC API - Records - Part 1: Core (20-004r1,
+# Tables 3 and 4) are advertised. The standard defines NO `conf/core`,
+# `conf/geojson`, or `conf/manage-records` class — Part 1 is discovery and
+# retrieval only (the GeoJSON encoding is covered by `conf/json`, and record
+# creation/replace/delete has no conformance class in Part 1). Advertising
+# those non-existent classes is an overclaim a CITE run keyed on the URI would
+# fail, so they are not declared here.
 OGC_API_RECORDS_URIS = [
-    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-core",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-collection",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/json",
-    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/sorting",
 ]
 
@@ -122,6 +136,11 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     prefix = "/records"
     protocol_title = "DynaStore OGC API - Records"
     protocol_description = "Access to catalog records via OGC API - Records"
+    landing_response_model = rm.LandingPage
+
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "records"
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -138,34 +157,9 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         # Policies declared via PolicyContributor; IAM forwards centrally.
         yield
 
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    # ------------------------------------------------------------------
-    # Web page contribution (WebPageContributor / StaticAssetProvider)
-    # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    @expose_static("records")
-    def provide_static_files(self) -> list[str]:
-        """Exposes the internal static directory for the Records browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="records_browser",
@@ -176,86 +170,122 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     async def provide_records_browser(self, request: Request):
         return await self._serve_page_template("records_browser.html")
 
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
-
     # ------------------------------------------------------------------
     # Route registration
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        # Landing page & conformance
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-            response_model=rm.LandingPage,
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-            response_model=rm.Conformance,
-        )
+        # Platform-tier dimension-backed collections (#2957). Dimension
+        # members are materialized into RECORDS collections under the
+        # internal ``_dimensions_`` sentinel catalog, but that is platform
+        # data, not a real per-tenant catalog — it must not appear as a
+        # catalog id in a public URL. These routes give it a genuine
+        # platform-tier shape; the legacy sentinel path
+        # (``/catalogs/_dimensions_/collections/{dim_id}/...``) keeps working
+        # unchanged for existing consumers, but every self/collection link
+        # now resolves to this canonical shape regardless of which route was
+        # used to reach it (see ``records_generator._records_collection_url``).
+        self.register_ogc_standard_routes()
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            # Catalog listing (drives the web browser's top-level navigation)
+            (
+                "/catalogs",
+                "list_catalogs",
+                ["GET"],
+                {"summary": "List catalogs available to the Records service"},
+            ),
+            # Collections (RECORDS-type only)
+            (
+                "/catalogs/{catalog_id}/collections",
+                "list_collections",
+                ["GET"],
+                {"response_model": rm.RecordsCatalogCollections},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}",
+                "get_collection",
+                ["GET"],
+                {"response_model": rm.RecordsCatalogCollection},
+            ),
+            # Record items
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items",
+                "get_records",
+                ["GET"],
+                {"response_model": rm.RecordCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items",
+                "add_records",
+                ["POST"],
+                {"status_code": status.HTTP_201_CREATED},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "get_record",
+                ["GET"],
+                {"response_model": rm.Record},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "replace_record",
+                ["PUT"],
+                {"response_model": rm.Record},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "update_record",
+                ["PATCH"],
+                {"response_model": rm.Record},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "delete_record",
+                ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+            (
+                "/dimensions",
+                "list_dimension_collections",
+                ["GET"],
+                {
+                    "response_model": rm.RecordsCatalogCollections,
+                    "summary": "List dimension-backed records collections (platform tier)",
+                },
+            ),
+            (
+                "/dimensions/{dim_id}",
+                "get_dimension_collection",
+                ["GET"],
+                {
+                    "response_model": rm.RecordsCatalogCollection,
+                    "summary": "Dimension-backed records collection metadata (platform tier)",
+                },
+            ),
+            (
+                "/dimensions/{dim_id}/items",
+                "get_dimension_records",
+                ["GET"],
+                {
+                    "response_model": rm.RecordCollection,
+                    "summary": "List dimension members as records (platform tier)",
+                },
+            ),
+            (
+                "/dimensions/{dim_id}/items/{record_id}",
+                "get_dimension_record",
+                ["GET"],
+                {
+                    "response_model": rm.Record,
+                    "summary": "Get a single dimension member as a record (platform tier)",
+                },
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
-        # Catalog listing (drives the web browser's top-level navigation)
-        self.router.add_api_route(
-            "/catalogs",
-            self.list_catalogs,
-            methods=["GET"],
-            summary="List catalogs available to the Records service",
-        )
-
-        # Collections (RECORDS-type only)
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_collections,
-            methods=["GET"],
-            response_model=rm.RecordsCatalogCollections,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_collection,
-            methods=["GET"],
-            response_model=rm.RecordsCatalogCollection,
-        )
-
-        # Record items
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.get_records,
-            methods=["GET"],
-            response_model=rm.RecordCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.add_records,
-            methods=["POST"],
-            status_code=status.HTTP_201_CREATED,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
-            self.get_record,
-            methods=["GET"],
-            response_model=rm.Record,
-        )
-
-    # ------------------------------------------------------------------
-    # Landing page & conformance (delegated to OGCServiceMixin)
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> JSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request) -> rm.Conformance:
-        return await self.ogc_conformance_handler(request)
+    # Landing page & conformance are delegated to OGCServiceMixin via
+    # register_ogc_standard_routes (see _register_routes).
 
     # ------------------------------------------------------------------
     # Collections (filtered to RECORDS type)
@@ -264,7 +294,15 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     async def list_catalogs(
         self,
         language: str = Depends(get_language),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of catalogs to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ):
         """List catalogs available to the Records service (web-browser nav).
@@ -274,32 +312,51 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         ``/stac/catalogs``) so the browser renders a label instead of the raw
         multilingual object.
         """
-        catalogs_svc = await self._get_catalogs_service()
-        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
-        return {
-            "catalogs": [
-                {
-                    "id": c.id,
-                    "title": resolve_localized_field(
-                        getattr(c, "title", None), language
-                    ),
-                }
-                for c in (catalogs or [])
-            ]
-        }
+        from .config import RecordsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        records_config = await self._get_plugin_config(RecordsPluginConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=records_config.listing_default_limit,
+            max_limit=records_config.max_limit,
+        )
+
+        return await self._ogc_list_catalogs(limit=limit, offset=offset, language=language)
 
     async def list_collections(
         self,
         catalog_id: str,
         request: Request,
         language: str = Depends(get_language),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> rm.RecordsCatalogCollections:
+        from .config import RecordsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        records_config = await self._get_plugin_config(
+            RecordsPluginConfig, catalog_id=catalog_id,
+        )
+        limit = resolve_page_limit(
+            limit,
+            default_limit=records_config.listing_default_limit,
+            max_limit=records_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
 
         all_collections = await catalogs_svc.list_collections(
-            catalog_id, lang=language, limit=limit, offset=offset,
+            catalog_id, lang=language, limit=limit, offset=offset, hints=request_hints,
         )
         if all_collections is None:
             raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
@@ -335,12 +392,11 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         collection_id: str,
         request: Request,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> rm.RecordsCatalogCollection:
-        catalogs_svc = await self._get_catalogs_service()
-
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id, lang=language)
-        if not coll:
-            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id, lang=language, hints=request_hints
+        )
 
         if not await self._is_records_collection(catalog_id, coll):
             raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' is not a records collection.")
@@ -348,6 +404,56 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         root_url = get_root_url(request)
         localized, _ = coll.localize(language) if hasattr(coll, "localize") else (coll, language)
         return gen.collection_to_records_collection(localized, catalog_id, root_url)
+
+    # ------------------------------------------------------------------
+    # Platform-tier dimension routes (#2957)
+    # ------------------------------------------------------------------
+    # Thin wrappers over the catalog-scoped handlers above, fixing
+    # catalog_id to the internal DIMENSIONS_CATALOG_ID sentinel so it never
+    # appears as a path parameter — see the route registration comment in
+    # ``_register_routes`` for the rationale.
+
+    async def list_dimension_collections(
+        self,
+        request: Request,
+        language: str = Depends(get_language),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
+        offset: int = Query(0, ge=0),
+        request_hints: FrozenSet = Depends(parse_hints_param),
+    ) -> rm.RecordsCatalogCollections:
+        """List dimension-backed records collections at the platform tier."""
+        return await self.list_collections(
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            request=request,
+            language=language,
+            limit=limit,
+            offset=offset,
+            request_hints=request_hints,
+        )
+
+    async def get_dimension_collection(
+        self,
+        dim_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
+    ) -> rm.RecordsCatalogCollection:
+        """Dimension-backed records collection metadata at the platform tier."""
+        return await self.get_collection(
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            collection_id=dim_id,
+            request=request,
+            language=language,
+            request_hints=request_hints,
+        )
 
     # ------------------------------------------------------------------
     # Record items
@@ -359,8 +465,17 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         catalog_id: str,
         collection_id: str,
         language: str = Depends(get_language),
-        conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of records to return."),
+        # Bounded, fail-fast pool acquire (#2933/#2948) — see get_record.
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of records to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Offset of the first record to return."),
         filter: Optional[str] = Query(
             None,
@@ -409,14 +524,28 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             ),
         ),
         sortby: Optional[str] = Query(None, description="Sort order (e.g., '-title,+created')."),
+        bbox: Optional[str] = Query(
+            None,
+            description="Spatial filter as comma-separated bbox (minx,miny,maxx,maxy). Records are geometry-less by default; use only on collections with spatial extent.",
+        ),
         q: Optional[str] = Query(None, description="Free-text search query."),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> Response:
         catalogs_svc = await self._get_catalogs_service()
 
-        collection_meta = await catalogs_svc.get_collection(catalog_id, collection_id, lang="en")
-        if not collection_meta:
-            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+        await self._resolve_collection_or_404(catalog_id, collection_id, lang="en")
+
+        from .config import RecordsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        records_config = await self._get_plugin_config(
+            RecordsPluginConfig, catalog_id=catalog_id, collection_id=collection_id,
+        )
+        limit = resolve_page_limit(
+            limit,
+            default_limit=records_config.default_limit,
+            max_limit=records_config.max_limit,
+        )
 
         from dynastore.extensions.tools.query import (
             parse_ogc_query_request,
@@ -424,6 +553,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             validate_filter_lang,
             resolve_geometry_flag_from_query,
             dispatch_or_stream_items,
+            stream_ogc_features,
         )
         from dynastore.tools.discovery import get_protocol
 
@@ -514,7 +644,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         skip_geom_bool = resolve_geometry_flag_from_query(skip_geometry, return_geometry)
 
         request_obj = parse_ogc_query_request(
-            bbox=None,
+            bbox=bbox,
             datetime_param=None,
             sortby=sortby,
             filter=filter,
@@ -557,6 +687,9 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
         )
         read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn,
+        )
 
         # Per-feature post-fetch projection — covers drivers that ignore
         # ``QueryRequest.select`` (e.g. ES) and the empty-properties case.
@@ -564,46 +697,154 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         if select_fields is not None:
             projection_set = set(select_fields)
 
-        records: List[rm.Record] = []
-        async for feature in query_response:
-            if projection_set is not None:
-                props = getattr(feature, "properties", None)
-                if isinstance(props, dict):
-                    for key in list(props.keys()):
-                        if key not in projection_set:
-                            props.pop(key, None)
-            # ``Record`` already emits ``geometry: null`` by construction
-            # (records_generator builds ``rm.Record(geometry=None, ...)``),
-            # so ``skip_geometry`` is mainly a hint to the driver layer here
-            # (PG drops the geom SELECT, ES adds ``geometry`` to
-            # ``_source.excludes``). The Feature-level normalisation below
-            # keeps the contract honest if the generator ever evolves to
-            # carry a geometry.
-            if skip_geom_bool and hasattr(feature, "geometry"):
-                try:
-                    feature.geometry = None
-                except Exception:
-                    pass
-            records.append(gen.db_row_to_record(feature, catalog_id, collection_id, root_url, layer_config, read_policy=read_policy))
+        # Response byte budget (#2681): once the serialized ``features``
+        # bytes cross ``max_response_bytes`` the streamed page is cut short
+        # by ``_stream_ogc_json`` — a page of large records can otherwise
+        # exceed process memory well under ``max_limit``. At least one
+        # record is always served (the check runs after each item is
+        # yielded), so the page is never empty and pagination still advances.
+        max_response_bytes = records_config.max_response_bytes
 
-        # Pagination links
+        # ── OGC post-processing wrapper (mirrors Features' streaming path) ──
+        # ``finally`` propagates an early close (the byte-budget cutoff in
+        # ``_stream_ogc_json``) down to ``items`` — the raw driver stream —
+        # so its underlying DB connection/transaction is released promptly
+        # instead of waiting on garbage collection.
+        async def _ogc_post_process(items):
+            try:
+                async for feature in items:
+                    if projection_set is not None:
+                        props = getattr(feature, "properties", None)
+                        if isinstance(props, dict):
+                            for key in list(props.keys()):
+                                if key not in projection_set:
+                                    props.pop(key, None)
+                    # For a geometry-less collection ``Record`` always emits
+                    # ``geometry: null`` regardless of what the driver
+                    # returned (``db_row_to_record`` with
+                    # ``geometry_enabled=False``); for a geometry-enabled
+                    # one, ``skipGeometry``/``returnGeometry`` is still
+                    # honoured as a per-request override.
+                    if skip_geom_bool and hasattr(feature, "geometry"):
+                        try:
+                            feature.geometry = None
+                        except Exception:
+                            pass
+                    yield gen.db_row_to_record(
+                        feature, catalog_id, collection_id, root_url, layer_config,
+                        read_policy=read_policy, geometry_enabled=geometry_enabled,
+                    )
+            finally:
+                aclose = getattr(items, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+
+        query_response.items = _ogc_post_process(query_response.items)
+
         from dynastore.extensions.tools.pagination import build_pagination_links
         links = build_pagination_links(request, offset, limit, count)
 
-        result = rm.RecordCollection(
-            type="FeatureCollection",
-            features=records,
+        return stream_ogc_features(
+            request=request,
+            query_response=query_response,
+            output_format=OutputFormatEnum.GEOJSON,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
             links=links,
-            numberMatched=count,
-            numberReturned=len(records),
+            language=language,
+            offset=offset,
+            max_response_bytes=max_response_bytes,
         )
-        content = result.model_dump(exclude_none=True)
-        _resolve_links_titles(content.get("links"), language)
-        for feat in content.get("features", []):
-            _resolve_links_titles(feat.get("links"), language)
-        return JSONResponse(
-            content=content,
-            media_type="application/geo+json",
+
+    async def get_dimension_records(
+        self,
+        request: Request,
+        dim_id: str,
+        language: str = Depends(get_language),
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of records to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
+        offset: int = Query(0, ge=0, description="Offset of the first record to return."),
+        filter: Optional[str] = Query(
+            None,
+            description=(
+                "CQL2 filter expression; encoding controlled by ``filter-lang``."
+            ),
+        ),
+        filter_lang: str = Query(
+            "cql2-text",
+            alias="filter-lang",
+            description="Filter encoding: 'cql2-text' (default) or 'cql2-json'.",
+        ),
+        filter_crs: Optional[str] = Query(
+            None,
+            alias="filter-crs",
+            description=(
+                "URI of the CRS the geometric values in ``filter=`` are "
+                "expressed in. Default = CRS84."
+            ),
+        ),
+        properties: Optional[str] = Query(
+            None,
+            description=(
+                "Comma-separated property names; unknown name → 400, empty "
+                "value strips all attribute properties. Orthogonal to "
+                "``skipGeometry``."
+            ),
+        ),
+        skip_geometry: Optional[bool] = Query(
+            None,
+            alias="skipGeometry",
+            description=(
+                "When true, returned records carry ``geometry: null`` and "
+                "the resolved driver omits the geometry from its projection. "
+                "De-facto pygeoapi convention. Mutually exclusive with "
+                "``returnGeometry`` unless both are consistent. Default: false."
+            ),
+        ),
+        return_geometry: Optional[bool] = Query(
+            None,
+            alias="returnGeometry",
+            description=(
+                "ESRI de-facto alias for ``skipGeometry``. "
+                "``returnGeometry=false`` is equivalent to ``skipGeometry=true``. "
+                "Passing both with conflicting values returns HTTP 400."
+            ),
+        ),
+        sortby: Optional[str] = Query(None, description="Sort order (e.g., '-title,+created')."),
+        bbox: Optional[str] = Query(
+            None,
+            description="Spatial filter as comma-separated bbox (minx,miny,maxx,maxy). Records are geometry-less by default; use only on collections with spatial extent.",
+        ),
+        q: Optional[str] = Query(None, description="Free-text search query."),
+        request_hints: FrozenSet = Depends(parse_hints_param),
+    ) -> Response:
+        """List dimension members as records at the platform tier."""
+        return await self.get_records(
+            request=request,
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            collection_id=dim_id,
+            language=language,
+            conn=conn,
+            limit=limit,
+            offset=offset,
+            filter=filter,
+            filter_lang=filter_lang,
+            filter_crs=filter_crs,
+            properties=properties,
+            skip_geometry=skip_geometry,
+            return_geometry=return_geometry,
+            sortby=sortby,
+            bbox=bbox,
+            q=q,
+            request_hints=request_hints,
         )
 
     async def get_record(
@@ -613,7 +854,12 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         record_id: str,
         request: Request,
         language: str = Depends(get_language),
-        conn: AsyncConnection = Depends(get_async_connection),
+        # Bounded, fail-fast pool acquire (#2933/#2948): under pool
+        # saturation this returns 503 well before the request risks
+        # riding the Cloud Run ceiling, instead of queuing for the
+        # engine's full pool_timeout — same guard as STAC's item
+        # GET-by-id / item search (#2947).
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
     ) -> rm.Record:
         catalogs_svc = await self._get_catalogs_service()
         items_protocol = cast(ItemsProtocol, catalogs_svc)
@@ -648,40 +894,66 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
         )
         read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn,
+        )
         root_url = get_root_url(request)
-        record = gen.db_row_to_record(feature, catalog_id, collection_id, root_url, layer_config, read_policy=read_policy)
+        record = gen.db_row_to_record(
+            feature, catalog_id, collection_id, root_url, layer_config,
+            read_policy=read_policy, geometry_enabled=geometry_enabled,
+        )
         content = record.model_dump(exclude_none=True)
         _resolve_links_titles(content.get("links"), language)
         return JSONResponse(
             content=content,
         )
 
+    async def get_dimension_record(
+        self,
+        dim_id: str,
+        record_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
+    ) -> rm.Record:
+        """Get a single dimension member as a record at the platform tier."""
+        return await self.get_record(
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            collection_id=dim_id,
+            record_id=record_id,
+            request=request,
+            language=language,
+            conn=conn,
+        )
+
     async def add_records(
         self,
         catalog_id: str,
         collection_id: str,
+        payload: rm.RecordOrRecordCollection,
         request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
     ) -> Response:
         """Create/upsert records into a RECORDS-type collection."""
-        body = await request.json()
-
         # Normalise to list and determine whether caller sent a single item.
-        if isinstance(body, list):
+        if isinstance(payload, rm.RecordCollection):
             was_single = False
-            items: list = body
-        elif isinstance(body, dict) and body.get("type") == "FeatureCollection":
-            was_single = False
-            items = body.get("features", [])
-        elif isinstance(body, dict):
-            was_single = True
-            items = [body]
+            items: list = [
+                r.model_dump(by_alias=True, exclude_unset=True) for r in payload.features
+            ]
         else:
-            raise HTTPException(status_code=400, detail="Invalid request body.")
+            was_single = True
+            items = [payload.model_dump(by_alias=True, exclude_unset=True)]
 
-        # Ensure geometry is null for records
-        for item in items:
-            if isinstance(item, dict):
+        # Ensure geometry is null for records, unless the collection has
+        # opted into the geometry capability (RFC #2550 / OGC API - Records
+        # Part 1 Req 55) — then the submitted geometry is preserved and
+        # written through the standard geometry sidecar, like a VECTOR item.
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn, strict=True,
+        )
+        if not geometry_enabled:
+            for item in items:
                 item["geometry"] = None
 
         from dynastore.modules.storage.driver_config import ItemsWritePolicy
@@ -714,7 +986,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         if was_single:
             record = gen.db_row_to_record(
                 accepted_rows[0], catalog_id, collection_id, root_url, layer_config,
-                read_policy=read_policy,
+                read_policy=read_policy, geometry_enabled=geometry_enabled,
             )
             return JSONResponse(
                 content=record.model_dump(exclude_none=True),
@@ -722,7 +994,10 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             )
 
         records = [
-            gen.db_row_to_record(feat, catalog_id, collection_id, root_url, layer_config, read_policy=read_policy)
+            gen.db_row_to_record(
+                feat, catalog_id, collection_id, root_url, layer_config,
+                read_policy=read_policy, geometry_enabled=geometry_enabled,
+            )
             for feat in accepted_rows
         ]
         collection = rm.RecordCollection(
@@ -734,6 +1009,142 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             content=collection.model_dump(exclude_none=True),
             status_code=status.HTTP_201_CREATED,
         )
+
+    async def replace_record(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        record_id: str,
+        payload: rm.Record,
+        request: Request,
+        conn: AsyncConnection = Depends(get_async_connection),
+    ) -> rm.Record:
+        """Replace a record (PUT)."""
+        body = payload.model_dump(by_alias=True, exclude_unset=True)
+        body["id"] = record_id
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn, strict=True,
+        )
+        if not geometry_enabled:
+            body["geometry"] = None
+
+        catalogs_svc = await self._get_catalogs_service()
+        updated_row = await catalogs_svc.upsert(
+            catalog_id,
+            collection_id,
+            items=body,
+            ctx=DriverContext(db_resource=conn),
+        )
+        if not updated_row:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update record.",
+            )
+
+        root_url = get_root_url(request)
+        layer_config = await catalogs_svc.get_collection_config(
+            catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
+        )
+        read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        record = gen.db_row_to_record(
+            updated_row, catalog_id, collection_id, root_url, layer_config,
+            read_policy=read_policy, geometry_enabled=geometry_enabled,
+        )
+        content = record.model_dump(exclude_none=True)
+        _resolve_links_titles(content.get("links"), "*")
+        return JSONResponse(content=content)
+
+    async def update_record(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        record_id: str,
+        payload: rm.Record,
+        request: Request,
+        conn: AsyncConnection = Depends(get_async_connection),
+    ) -> rm.Record:
+        """Partially update a record (PATCH)."""
+        body = payload.model_dump(by_alias=True, exclude_unset=True)
+
+        catalogs_svc = await self._get_catalogs_service()
+        items_protocol = cast(ItemsProtocol, catalogs_svc)
+        existing = await items_protocol.get_item(
+            catalog_id, collection_id, record_id,
+            ctx=DriverContext(db_resource=conn),
+        )
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Record '{record_id}' not found.",
+            )
+
+        existing_props = getattr(existing, "properties", None) or {}
+        if isinstance(existing_props, dict):
+            merged_props = {**existing_props, **body.get("properties", {})}
+        else:
+            merged_props = body.get("properties", {})
+
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn, strict=True,
+        )
+        if not geometry_enabled:
+            new_geometry = None
+        elif "geometry" in body:
+            # Client explicitly touched ``geometry`` in this PATCH.
+            new_geometry = body["geometry"]
+        else:
+            # Partial update — leave the existing geometry untouched.
+            new_geometry = getattr(existing, "geometry", None)
+
+        merged = {
+            "id": record_id,
+            "geometry": new_geometry,
+            "properties": merged_props,
+        }
+        if body.get("links"):
+            merged["links"] = body["links"]
+
+        updated_row = await catalogs_svc.upsert(
+            catalog_id,
+            collection_id,
+            items=merged,
+            ctx=DriverContext(db_resource=conn),
+        )
+        if not updated_row:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update record.",
+            )
+
+        root_url = get_root_url(request)
+        layer_config = await catalogs_svc.get_collection_config(
+            catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
+        )
+        read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        record = gen.db_row_to_record(
+            updated_row, catalog_id, collection_id, root_url, layer_config,
+            read_policy=read_policy, geometry_enabled=geometry_enabled,
+        )
+        content = record.model_dump(exclude_none=True)
+        _resolve_links_titles(content.get("links"), "*")
+        return JSONResponse(content=content)
+
+    async def delete_record(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        record_id: str,
+        request: Request,
+        engine=Depends(get_async_engine),
+    ):
+        """Delete a record (DELETE)."""
+        from dynastore.modules.db_config.query_executor import managed_transaction
+
+        async with managed_transaction(engine) as conn:
+            return await self._delete_item(
+                catalog_id, collection_id, record_id, conn,
+                caller_id=self._principal_caller_id(request),
+            )
 
     # ------------------------------------------------------------------
     # Helpers

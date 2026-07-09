@@ -94,8 +94,8 @@ async def test_full_miss_returns_none_for_caller_to_regenerate():
 
 
 @pytest.mark.asyncio
-async def test_provider_exception_swallowed_falls_through_to_miss():
-    """A flaky bucket must not break the route — caller regenerates from PG."""
+async def test_redirect_signing_failure_falls_back_to_proxy_then_miss():
+    """Signing raises in redirect mode → proxy fallback; tile absent → None."""
     provider = MagicMock()
     provider.get_tile_url = AsyncMock(side_effect=RuntimeError("GCS unavailable"))
     provider.get_tile = AsyncMock(return_value=None)
@@ -103,7 +103,63 @@ async def test_provider_exception_swallowed_falls_through_to_miss():
     resp = await TilesService._try_cached_tile(
         provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
         start_time=time.perf_counter(),
+        serve_mode="redirect",
     )
+    # Proxy was attempted (fallback), tile absent → cache miss
+    provider.get_tile.assert_called_once()
+    assert resp is None
+
+
+@pytest.mark.asyncio
+async def test_redirect_signing_failure_falls_back_to_proxy_hit():
+    """Signing raises in redirect mode → proxy fallback returns tile bytes."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(side_effect=RuntimeError("IAM signing denied"))
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x05bytes")
+
+    resp = await TilesService._try_cached_tile(
+        provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+        start_time=time.perf_counter(),
+        serve_mode="redirect",
+    )
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.headers["X-Tile-Source"] == "bucket_proxy"
+
+
+@pytest.mark.asyncio
+async def test_proxy_mode_skips_signed_url():
+    """serve_mode='proxy' never calls get_tile_url — streams bytes directly."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(
+        return_value="https://storage.googleapis.com/bkt/tile.mvt?sig=x"
+    )
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x03mvt")
+
+    resp = await TilesService._try_cached_tile(
+        provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+        start_time=time.perf_counter(),
+        serve_mode="proxy",
+    )
+    provider.get_tile_url.assert_not_called()
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.headers["X-Tile-Source"] == "bucket_proxy"
+
+
+@pytest.mark.asyncio
+async def test_proxy_mode_miss_returns_none():
+    """serve_mode='proxy' + empty bucket → None (cache miss)."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value="https://should-not-be-called")
+    provider.get_tile = AsyncMock(return_value=None)
+
+    resp = await TilesService._try_cached_tile(
+        provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+        start_time=time.perf_counter(),
+        serve_mode="proxy",
+    )
+    provider.get_tile_url.assert_not_called()
     assert resp is None
 
 
@@ -133,3 +189,152 @@ async def test_hit_log_line_uses_structured_key_value_format(caplog):
     assert "z=5 x=17 y=11" in msg
     assert "duration_ms=" in msg
     assert "bytes=2" in msg
+
+
+# ---------------------------------------------------------------------------
+# Signing-path visibility: WARNING when redirect mode falls back to proxy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_redirect_mode_url_none_then_proxy_hit_logs_warning(caplog):
+    """When serve_mode=redirect but get_tile_url returns None (no exception) AND
+    proxy finds the tile, a WARNING is logged so operators can diagnose why
+    redirect is not working (blob.exists() permission issue on the bucket)."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value=None)
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x03mvt")
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        resp = await TilesService._try_cached_tile(
+            provider, "catalog1", "coll1", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    # Proxy served the tile (fallback)
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.headers["X-Tile-Source"] == "bucket_proxy"
+
+    # WARNING must name the misconfiguration so operators know where to look
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "Expected a WARNING when proxy serves a tile in redirect mode"
+    assert any("serve_mode=redirect" in w and "proxy" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_redirect_mode_proxy_hit_warns_about_blob_exists_or_sign(caplog):
+    """Specific text check: warning mentions SA permissions so operators can act."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value=None)
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x03mvt")
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        await TilesService._try_cached_tile(
+            provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    combined = " ".join(warnings)
+    assert "roles/storage.objectViewer" in combined or "blob.exists" in combined or "signBlob" in combined, (
+        f"WARNING must guide the operator to the IAM fix; got: {combined!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_redirect_mode_url_none_no_proxy_hit_no_warning(caplog):
+    """If redirect mode → url=None AND proxy also misses, no WARNING fires
+    (it is just a normal cache miss, not a misconfiguration)."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value=None)
+    provider.get_tile = AsyncMock(return_value=None)  # genuine miss
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        resp = await TilesService._try_cached_tile(
+            provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    assert resp is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert not warnings, f"No WARNING expected on a genuine cache miss, got: {warnings}"
+
+
+@pytest.mark.asyncio
+async def test_redirect_signed_url_exception_type_in_warning(caplog):
+    """When get_tile_url raises, the exception TYPE name appears in the warning."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(side_effect=ValueError("bad SA email"))
+    provider.get_tile = AsyncMock(return_value=None)
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        await TilesService._try_cached_tile(
+            provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "Expected WARNING on signing exception"
+    assert any("ValueError" in w for w in warnings), (
+        f"Exception class name should appear in warning; got {warnings}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Raster render-cache path (`_try_render_cache`) honors per-request serve_mode.
+# Redirect-averse clients (e.g. QGIS) can force `serve=proxy` on map tiles too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_render_cache_redirect_default_uses_signed_url():
+    """Default serve_mode='redirect': signed URL → 307 (offload to bucket)."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(
+        return_value="https://storage.googleapis.com/bkt/map/c/default/WMQ/5/17/11.png?sig=…"
+    )
+    provider.get_tile = AsyncMock(return_value=None)
+    cfg = MagicMock()
+    cfg.ttl_seconds = 60
+
+    resp = await TilesService._try_render_cache(
+        provider, "cat", "map/coll/default/WMQ/5/17/11.png", "WebMercatorQuad",
+        5, 17, 11, "png", time.perf_counter(), cfg,
+    )
+
+    assert isinstance(resp, RedirectResponse)
+    assert resp.status_code == 307
+    assert resp.headers["X-Render-Source"] == "bucket_redirect"
+
+
+@pytest.mark.asyncio
+async def test_render_cache_proxy_mode_skips_signed_url():
+    """serve_mode='proxy' never resolves a signed URL — streams bytes (QGIS-safe)."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(
+        return_value="https://storage.googleapis.com/bkt/map/tile.png?sig=x"
+    )
+    provider.get_tile = AsyncMock(return_value=b"\x89PNGbytes")
+    cfg = MagicMock()
+    cfg.ttl_seconds = 60
+
+    resp = await TilesService._try_render_cache(
+        provider, "cat", "map/coll/default/WMQ/5/17/11.png", "WebMercatorQuad",
+        5, 17, 11, "png", time.perf_counter(), cfg,
+        serve_mode="proxy",
+    )
+
+    provider.get_tile_url.assert_not_called()
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.body == b"\x89PNGbytes"
+    assert resp.headers["X-Render-Source"] == "bucket_proxy"

@@ -34,9 +34,10 @@ Usage::
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, cast
+import os
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, cast
 
-from fastapi import Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from dynastore.extensions.ogc_models_shared import (
     BulkCreationResponse,
@@ -99,6 +100,15 @@ class OGCServiceMixin:
     * ``prefix: str`` — router path prefix (e.g. ``"/features"``)
     * ``protocol_title: str`` — human-readable protocol name
     * ``protocol_description: str`` — one-line description
+
+    Two opt-in feature groups, both off by default:
+
+    * Static-page / web-UI serving — set ``static_dir`` (and ``static_prefix``)
+      to get a default ``provide_static_files``/``get_static_assets`` wiring;
+      see the "Static-page / web-UI serving" section below.
+    * Standard route wiring — call :meth:`register_ogc_standard_routes` from
+      ``_register_routes()`` to register ``/`` and ``/conformance`` off the
+      existing ``ogc_landing_page_handler``/``ogc_conformance_handler``.
     """
 
     # --- Class attributes to be set by subclasses ---
@@ -106,6 +116,22 @@ class OGCServiceMixin:
     prefix: str = ""
     protocol_title: str = ""
     protocol_description: str = ""
+
+    # --- Static-page / web-UI serving (opt-in) ---
+    # ``static_dir`` must be computed in the *subclass's own module* (e.g.
+    # ``os.path.join(os.path.dirname(__file__), "static")``) — this module's
+    # ``__file__`` would point at the wrong directory. Leaving it unset opts
+    # the subclass out of the default ``provide_static_files``/
+    # ``get_static_assets`` wiring below (it can still define its own).
+    static_dir: ClassVar[Optional[str]] = None
+    static_prefix: str = ""
+    static_owner: str = ""
+    static_description: str = ""
+    static_public: bool = True
+
+    # --- Standard route response models (see register_ogc_standard_routes) ---
+    landing_response_model: ClassVar[Optional[Type[Any]]] = None
+    conformance_response_model: ClassVar[Optional[Type[Any]]] = Conformance
 
     # --- Cached protocol references (per-instance) ---
     _ogc_catalogs_protocol: Optional[CatalogsProtocol] = None
@@ -179,6 +205,91 @@ class OGCServiceMixin:
         ))
 
     # ------------------------------------------------------------------
+    # Static-page / web-UI serving (opt-in via static_dir/static_prefix)
+    # ------------------------------------------------------------------
+    # Byte-identical extraction of the static-page shell that used to be
+    # copy-pasted per extension: a static-files directory walk, an HTML
+    # template server that substitutes ``{{VERSION}}``, and the
+    # WebPageContributor/StaticAssetProvider delegators. A subclass that
+    # sets ``static_dir`` (and ``static_prefix``) gets all of this for free
+    # and keeps only its ``@expose_web_page``-decorated browser-page method.
+
+    def get_web_pages(self) -> List[Any]:
+        """Default ``WebPageContributor`` hook: collect ``@expose_web_page`` methods."""
+        from dynastore.extensions.tools.web_collect import collect_web_pages
+
+        return collect_web_pages(self)
+
+    def get_static_assets(self) -> List[Any]:
+        """Default ``StaticAssetProvider`` hook.
+
+        Collects any ``@expose_static``-decorated methods (unchanged
+        mechanism) plus, when ``static_dir``/``static_prefix`` are set, a
+        ``StaticAsset`` wired to :meth:`provide_static_files` — equivalent
+        to what ``@expose_static(static_prefix)`` on that method would have
+        produced, without needing the decorator's compile-time-fixed prefix.
+        """
+        from dynastore.extensions.tools.web_collect import collect_static_assets
+
+        assets = list(collect_static_assets(self))
+        if self.static_dir and self.static_prefix:
+            from dynastore.models.protocols.web_ui import StaticAsset
+
+            assets.append(
+                StaticAsset(
+                    prefix=self.static_prefix.strip("/"),
+                    files_provider=self.provide_static_files,
+                    owner=self.static_owner,
+                    description=self.static_description,
+                    public=self.static_public,
+                )
+            )
+        return assets
+
+    def get_notebooks(self) -> List[Any]:
+        """Default hook: delegate to the subclass's own ``.notebooks`` submodule.
+
+        Resolves ``build_contributions`` from the ``notebooks`` module living
+        alongside the concrete service class (e.g. ``dynastore.extensions.
+        coverages.notebooks`` for ``CoveragesService``), matching the
+        ``from .notebooks import build_contributions`` pattern every service
+        used to repeat inline. Returns ``[]`` when no such module exists.
+        """
+        import importlib
+
+        package_name = type(self).__module__.rsplit(".", 1)[0]
+        try:
+            notebooks_mod = importlib.import_module(f"{package_name}.notebooks")
+            build_contributions = notebooks_mod.build_contributions
+        except Exception:
+            return []
+        return build_contributions()
+
+    def provide_static_files(self) -> List[str]:
+        """Default static-files provider: walk ``self.static_dir``.
+
+        Returns the absolute path of every file under ``static_dir`` —
+        the same ``os.walk`` collector every extension used to inline.
+        """
+        files: List[str] = []
+        for root, _, filenames in os.walk(self.static_dir or ""):
+            for filename in filenames:
+                files.append(os.path.join(root, filename))
+        return files
+
+    async def _serve_page_template(self, filename: str) -> Response:
+        """Serve an HTML file from ``static_dir`` with ``{{VERSION}}`` substituted."""
+        from dynastore._version import VERSION
+
+        file_path = os.path.join(self.static_dir or "", filename)
+        if not os.path.exists(file_path):
+            return Response(content=f"Template {filename} not found", status_code=404)
+        with open(file_path, "r", encoding="utf-8") as f:
+            return Response(
+                content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html"
+            )
+
+    # ------------------------------------------------------------------
     # Protocol getters (cached, with standard error handling)
     # ------------------------------------------------------------------
 
@@ -213,6 +324,48 @@ class OGCServiceMixin:
         return self._ogc_storage_protocol
 
     # ------------------------------------------------------------------
+    # Catalog/collection lookup-or-404 (thin wrappers over extensions.tools.resolvers)
+    # ------------------------------------------------------------------
+
+    async def _resolve_catalog_or_404(
+        self,
+        catalog_id: str,
+        *,
+        detail: Optional[str] = None,
+        use_model: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Fetch a catalog model via this service's catalogs protocol or raise 404.
+
+        See :func:`dynastore.extensions.tools.resolvers.resolve_catalog_or_404`.
+        """
+        from dynastore.extensions.tools.resolvers import resolve_catalog_or_404
+
+        catalogs_svc = await self._get_catalogs_service()
+        return await resolve_catalog_or_404(
+            catalogs_svc, catalog_id, detail=detail, use_model=use_model, **kwargs
+        )
+
+    async def _resolve_collection_or_404(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        detail: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Fetch a collection model via this service's catalogs protocol or raise 404.
+
+        See :func:`dynastore.extensions.tools.resolvers.resolve_collection_or_404`.
+        """
+        from dynastore.extensions.tools.resolvers import resolve_collection_or_404
+
+        catalogs_svc = await self._get_catalogs_service()
+        return await resolve_collection_or_404(
+            catalogs_svc, catalog_id, collection_id, detail=detail, **kwargs
+        )
+
+    # ------------------------------------------------------------------
     # Shared config / item access helpers
     # ------------------------------------------------------------------
 
@@ -242,10 +395,37 @@ class OGCServiceMixin:
         """Return the first item in a collection as a plain dict, or None."""
         from dynastore.models.query_builder import QueryRequest
 
+        query = QueryRequest(limit=1)
+        try:
+            from dynastore.modules.storage.hints import Hint
+            from dynastore.modules.storage.router import get_driver
+            from dynastore.modules.storage.routing_config import Operation
+
+            driver = await get_driver(
+                Operation.READ,
+                catalog_id,
+                collection_id,
+                hints=frozenset({Hint.GEOMETRY_EXACT}),
+            )
+            async for first in driver.read_entities(
+                catalog_id, collection_id, request=query, limit=1
+            ):
+                if hasattr(first, "model_dump"):
+                    return first.model_dump(by_alias=True, exclude_none=True)
+                return dict(first)
+            return None
+        except Exception:
+            logger.debug(
+                "OGC first-item routed read failed for %s/%s; falling back to CatalogsProtocol",
+                catalog_id,
+                collection_id,
+                exc_info=True,
+            )
+
         catalogs = await self._get_catalogs_service()
         try:
             features = await catalogs.search_items(
-                catalog_id, collection_id, QueryRequest(limit=1)
+                catalog_id, collection_id, query
             )
         except Exception:
             return None
@@ -408,6 +588,122 @@ class OGCServiceMixin:
             ],
         )
         return JSONResponse(content=localize_model(landing_page, language))
+
+    def register_ogc_standard_routes(
+        self,
+        router: Optional[APIRouter] = None,
+        *,
+        include_landing: bool = True,
+        include_conformance: bool = True,
+        landing_name: Optional[str] = None,
+        conformance_name: Optional[str] = None,
+    ) -> None:
+        """Register the standard ``/`` and ``/conformance`` GET routes.
+
+        Wires ``self.ogc_landing_page_handler``/``self.ogc_conformance_handler``
+        onto *router* (or ``self.router`` when omitted) — both bound methods,
+        so a subclass override of either handler is picked up automatically
+        by normal method resolution (STAC, which returns a root catalog
+        instead of a plain landing page, does not call this method at all
+        and is unaffected).
+
+        ``response_model`` for each route comes from the ``landing_response_model``/
+        ``conformance_response_model`` class attributes, so the OpenAPI schema
+        stays protocol-specific even though the handlers are shared.
+
+        ``include_landing``/``include_conformance`` let a subclass migrate
+        only one of the two routes onto the shared handler — e.g. a service
+        that has no pre-existing landing page and doesn't want to introduce
+        one sets ``include_landing=False``. ``landing_name``/``conformance_name``
+        preserve a pre-existing FastAPI route ``name`` (relevant when other
+        handlers resolve that route via ``request.url_for(...)``); ``None``
+        (the default) leaves the name auto-derived from the handler, matching
+        prior behavior for every existing caller.
+        """
+        target_router = router if router is not None else self.router  # type: ignore[attr-defined]
+        if include_landing:
+            target_router.add_api_route(
+                "/",
+                self.ogc_landing_page_handler,
+                methods=["GET"],
+                response_model=self.landing_response_model,
+                name=landing_name,
+            )
+        if include_conformance:
+            target_router.add_api_route(
+                "/conformance",
+                self.ogc_conformance_handler,
+                methods=["GET"],
+                response_model=self.conformance_response_model,
+                name=conformance_name,
+            )
+
+    # ------------------------------------------------------------------
+    # Web-nav listing helpers (catalog/collection {id, title, description})
+    # ------------------------------------------------------------------
+
+    async def _ogc_list_catalogs(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+        language: Optional[str] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Shared ``{id, title}`` catalog nav-listing projection.
+
+        Used by the web-browser "list catalogs" endpoints (Coverages, EDR,
+        Records, Moving Features). *limit* must already be resolved (e.g. via
+        ``resolve_page_limit``) — this helper does not apply a default. When
+        *language* is given, ``title`` is resolved via
+        :func:`resolve_localized_field` to a single string (or, for
+        ``lang='*'``, a filtered ``{lang: text}`` dict with no null padding);
+        when ``None`` the raw title value is passed through unchanged.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
+        result: List[Dict[str, Any]] = []
+        for c in (catalogs or []):
+            title = getattr(c, "title", None)
+            if language is not None:
+                from dynastore.tools.language_utils import resolve_localized_field
+
+                title = resolve_localized_field(title, language)
+            result.append({"id": getattr(c, "external_id", None) or c.id, "title": title})
+        return {"catalogs": result}
+
+    async def _ogc_list_collections(
+        self,
+        catalog_id: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        language: str,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Shared ``{id, title, description}`` collection nav-listing projection.
+
+        *limit* must already be resolved (e.g. via ``resolve_page_limit``).
+        ``title``/``description`` are resolved via
+        :func:`resolve_localized_field` (single string, or a filtered
+        ``{lang: text}`` dict with no null padding for ``lang='*'``) and
+        omitted from an entry when the resolved value is ``None``.
+        """
+        from dynastore.tools.language_utils import resolve_localized_field
+
+        catalogs_svc = await self._get_catalogs_service()
+        collections = await catalogs_svc.list_collections(
+            catalog_id, limit=limit, offset=offset
+        )
+        items: List[Dict[str, Any]] = []
+        for c in (collections or []):
+            entry: Dict[str, Any] = {"id": getattr(c, "external_id", None) or c.id}
+            title = resolve_localized_field(getattr(c, "title", None), language)
+            if title is not None:
+                entry["title"] = title
+            description = resolve_localized_field(getattr(c, "description", None), language)
+            if description is not None:
+                entry["description"] = description
+            items.append(entry)
+        return {"collections": items}
 
     # ------------------------------------------------------------------
     # Shared CRUD helpers
@@ -622,6 +918,8 @@ class OGCServiceMixin:
         input_dump: Dict[str, Any],
         language: str,
         db_resource: Any,
+        *,
+        hints: Optional[FrozenSet[Any]] = None,
     ) -> Response:
         """Shared create-catalog body used by Features and STAC.
 
@@ -630,6 +928,8 @@ class OGCServiceMixin:
         solely to detect the language via ``detect_use_lang``.  *db_resource* is
         the database connection (may be ``None`` when the service omits the
         transactional context — STAC catalog creates do not pass a connection).
+        *hints* carries the request's ``?hints=`` set; ``Hint.DEFER`` defers GCP
+        storage provisioning so the catalog is created core-only.
         """
         from dynastore.extensions.tools.localization_utils import detect_use_lang
 
@@ -643,12 +943,31 @@ class OGCServiceMixin:
         create_kwargs: Dict[str, Any] = {}
         if ctx is not None:
             create_kwargs["ctx"] = ctx
+        if hints:
+            create_kwargs["hints"] = hints
         create_kwargs.update(self._make_catalog_create_kwargs())
 
         created = await catalogs_svc.create_catalog(
             catalog_data=catalog_data, lang=use_lang, **create_kwargs
         )
         localized_data, _ = self._localize_resource(created, language)
+
+        # Catalog creation is always asynchronous: the catalog row is committed
+        # but tenant-schema provisioning runs via a background task.  The service
+        # signals this by returning provisioning_status='provisioning'; we map
+        # that to 202 Accepted + Location so the client knows to poll.
+        prov_status = getattr(created, "provisioning_status", None)
+        if prov_status == "provisioning":
+            external_id = getattr(created, "external_id", None) or localized_data.get("id", "")
+            location = f"/catalog/catalogs/{external_id}"
+            import json as _json
+            return Response(
+                status_code=status.HTTP_202_ACCEPTED,
+                headers={"Location": location},
+                media_type="application/json",
+                content=_json.dumps(localized_data),
+            )
+
         return JSONResponse(content=localized_data, status_code=status.HTTP_201_CREATED)
 
     async def _ogc_replace_catalog(
@@ -657,6 +976,10 @@ class OGCServiceMixin:
         catalog_dict: Dict[str, Any],
         language: str,
         db_resource: Any,
+        *,
+        request: Optional[Request] = None,
+        body_id: Optional[str] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared replace-catalog (PUT) body used by Features and STAC.
 
@@ -664,12 +987,68 @@ class OGCServiceMixin:
         ``normalize_i18n_for_replace``; this method performs no additional
         normalization.  *db_resource* follows the same convention as
         ``_ogc_create_catalog``.
+
+        When *body_id* differs from *catalog_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: perform a MOVE (rename the
+           catalog to *body_id*); respond with 200 + ``Content-Location``,
+           ``Link: rel=canonical``, and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise
+           400 — STAC Transaction mandates that a body ``id`` not matching the
+           path ``id`` is an error.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4 Req 11): drop the body id and replace using the path id.
+
+        When *body_id* is absent or equals *catalog_id* the normal replace
+        path runs regardless of the header or the mismatch policy.
         """
         catalogs_svc = await self._get_catalogs_service()
         await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
+        # Mismatch branch: body id differs from path id.
+        if body_id is not None and body_id != catalog_id:
+            # MOVE gate: only rename when the client explicitly opts in.
+            if request is not None and self._wants_move(request):
+                internal_id, new_external_id, content_location = (
+                    await self._ogc_perform_catalog_rename(catalog_id, body_id, request=request)
+                )
+                ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
+                update_kwargs: Dict[str, Any] = {}
+                if ctx is not None:
+                    update_kwargs["ctx"] = ctx
+                catalog_dict = {**catalog_dict, "id": new_external_id}
+                updated = await catalogs_svc.update_catalog(
+                    internal_id, catalog_dict, lang="*", **update_kwargs
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Catalog not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            # No MOVE requested: apply per-surface id-mismatch policy.
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{catalog_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, replace using path id.
+            catalog_dict = {k: v for k, v in catalog_dict.items() if k != "id"}
+
+        # Normal replace branch: body id == path id (or body id dropped/absent).
         ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
-        update_kwargs: Dict[str, Any] = {}
+        update_kwargs = {}
         if ctx is not None:
             update_kwargs["ctx"] = ctx
 
@@ -690,21 +1069,79 @@ class OGCServiceMixin:
         catalog_dict: Dict[str, Any],
         language: str,
         db_resource: Any,
+        *,
+        body_id: Optional[str] = None,
+        request: Optional[Request] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared update-catalog (PATCH) body used by Features and STAC.
 
         *catalog_dict* must already be the result of
         ``model_dump(exclude_unset=True)``; this method performs no additional
         normalization.
+
+        When *body_id* differs from *catalog_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: MOVE (rename) then patch remaining
+           fields; respond with 200 + ``Content-Location``,
+           ``Link: rel=canonical``, and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise 400.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4): drop the body ``"id"`` field and patch normally.
+
+        When *body_id* is absent or equals *catalog_id* the normal partial-update
+        path runs regardless.
         """
         from dynastore.extensions.tools.localization_utils import detect_use_lang
 
-        use_lang = detect_use_lang(catalog_dict, language)
         catalogs_svc = await self._get_catalogs_service()
         await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
+        # Mismatch branch: PATCH body carries a different "id".
+        if body_id is not None and body_id != catalog_id:
+            if request is not None and self._wants_move(request):
+                internal_id, new_external_id, content_location = (
+                    await self._ogc_perform_catalog_rename(catalog_id, body_id, request=request)
+                )
+                # Strip "id" — rename already updated it.
+                patch_fields = {k: v for k, v in catalog_dict.items() if k != "id"}
+                use_lang = detect_use_lang(patch_fields, language)
+                ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
+                update_kwargs: Dict[str, Any] = {}
+                if ctx is not None:
+                    update_kwargs["ctx"] = ctx
+                updated = await catalogs_svc.update_catalog(
+                    internal_id, patch_fields, lang=use_lang, **update_kwargs
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Catalog not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{catalog_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, patch with path id.
+            catalog_dict = {k: v for k, v in catalog_dict.items() if k != "id"}
+
+        # Normal update branch: body id == path id (or body id dropped/absent).
+        use_lang = detect_use_lang(catalog_dict, language)
         ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
-        update_kwargs: Dict[str, Any] = {}
+        update_kwargs = {}
         if ctx is not None:
             update_kwargs["ctx"] = ctx
 
@@ -724,8 +1161,19 @@ class OGCServiceMixin:
         catalog_id: str,
         force: bool,
         db_resource: Any,
+        request: Optional[Request] = None,
     ) -> Response:
-        """Shared delete-catalog body used by Features and STAC."""
+        """Shared delete-catalog body used by Features and STAC.
+
+        Soft delete (force=False): synchronous tombstone; returns 204.
+        Hard delete (force=True): ``CatalogsProtocol.delete_catalog`` tombstones
+        the row and enqueues a durable ``catalog_provision`` deprovision task
+        (schema drop + external-resource teardown) rather than dropping the
+        schema inline — the request never blocks on the teardown itself. This
+        returns 202 with a Location header pointing at the polling endpoint
+        when a teardown task is in flight, or 204 when there was nothing to
+        tear down (no active provisioners for this catalog).
+        """
         catalogs_svc = await self._get_catalogs_service()
         ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
         delete_kwargs: Dict[str, Any] = {}
@@ -739,7 +1187,189 @@ class OGCServiceMixin:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Catalog '{catalog_id}' not found.",
             )
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        if not force:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        # Hard delete: report the teardown task delete_catalog() enqueued so
+        # the caller can poll instead of assuming the drop already finished.
+        task = await catalogs_svc.get_hard_delete_task(catalog_id)
+        if task is None:
+            # No active provisioners: delete_catalog() already purged inline.
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        import json as _json
+
+        from dynastore.extensions.tools.url import enforce_https
+
+        task_id_str = str(task.task_id if hasattr(task, "task_id") else task.jobID)
+        if request is not None:
+            try:
+                raw_url = request.url_for(
+                    "get_task_status_catalog",
+                    catalog_id=catalog_id,
+                    task_id=task_id_str,
+                )
+                status_url = enforce_https(str(raw_url))
+            except Exception:
+                # url_for fails when the tasks extension isn't mounted; fall
+                # back to a path-relative construction.
+                base = enforce_https(str(request.base_url).rstrip("/"))
+                root_path = request.scope.get("root_path", "").rstrip("/")
+                status_url = (
+                    f"{base}{root_path}/task/catalogs/{catalog_id}/tasks/{task_id_str}"
+                )
+        else:
+            status_url = f"/task/catalogs/{catalog_id}/tasks/{task_id_str}"
+
+        body = _json.dumps({
+            "status": task.status if hasattr(task, "status") else "PENDING",
+            "task_id": task_id_str,
+            "catalog_id": catalog_id,
+            "links": [
+                {
+                    "rel": "monitor",
+                    "href": status_url,
+                    "type": "application/json",
+                    "title": "Deletion status",
+                }
+            ],
+        })
+        return Response(
+            status_code=status.HTTP_202_ACCEPTED,
+            headers={"Location": status_url},
+            media_type="application/json",
+            content=body,
+        )
+
+    # ------------------------------------------------------------------
+    # Shared rename-if-changed helpers (used by both PUT and PATCH paths)
+    # ------------------------------------------------------------------
+
+    async def _ogc_perform_catalog_rename(
+        self,
+        catalog_id: str,
+        body_id: str,
+        *,
+        request: Optional[Request] = None,
+    ) -> Tuple[str, str, Optional[str]]:
+        """Resolve, rename, and return URL for a catalog MOVE.
+
+        Called when a PUT or PATCH body carries an ``"id"`` that differs from
+        the URL path parameter.  Handles 404/409 mapping so the calling handler
+        does not need to repeat the error logic.
+
+        Returns a 3-tuple ``(internal_id, new_external_id, content_location_url)``
+        where ``content_location_url`` is ``None`` when no ``request`` is
+        provided (i.e. the caller cannot build an absolute URL).
+
+        Raises:
+            HTTPException(404): catalog not found.
+            HTTPException(409): another live catalog already holds ``body_id``.
+        """
+        from dynastore.modules.db_config.exceptions import CatalogRenameConflictError
+
+        catalogs_svc = await self._get_catalogs_service()
+        internal_id = await catalogs_svc.resolve_catalog_id(
+            catalog_id, allow_missing=True
+        )
+        if internal_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Catalog '{catalog_id}' not found.",
+            )
+        try:
+            _old, new_external_id = await catalogs_svc.rename_catalog(
+                internal_id, body_id
+            )
+        except CatalogRenameConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        content_location: Optional[str] = None
+        if request is not None:
+            content_location = self._build_catalog_url(request, new_external_id)
+        return internal_id, new_external_id, content_location
+
+    async def _ogc_perform_collection_rename(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        body_id: str,
+        *,
+        request: Optional[Request] = None,
+    ) -> Tuple[str, str, str, Optional[str]]:
+        """Resolve, rename, and return URL for a collection MOVE.
+
+        Called when a PUT or PATCH body carries an ``"id"`` that differs from
+        the URL path parameter.
+
+        Returns a 4-tuple
+        ``(catalog_internal_id, collection_internal_id, new_external_id,
+        content_location_url)`` where ``content_location_url`` is ``None``
+        when no ``request`` is provided.
+
+        Raises:
+            HTTPException(404): catalog or collection not found.
+            HTTPException(409): another live collection already holds ``body_id``.
+        """
+        from dynastore.modules.db_config.exceptions import CollectionRenameConflictError
+
+        catalogs_svc = await self._get_catalogs_service()
+        catalog_internal_id = await catalogs_svc.resolve_catalog_id(
+            catalog_id, allow_missing=True
+        )
+        if catalog_internal_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Catalog '{catalog_id}' not found.",
+            )
+        collection_internal_id = await catalogs_svc.collections.resolve_collection_id(
+            catalog_internal_id, collection_id, allow_missing=True
+        )
+        if collection_internal_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Collection '{catalog_id}:{collection_id}' not found.",
+            )
+        try:
+            _old, new_external_id = await catalogs_svc.rename_collection(
+                catalog_internal_id, collection_internal_id, body_id
+            )
+        except CollectionRenameConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        content_location: Optional[str] = None
+        if request is not None:
+            cat_model = await catalogs_svc.get_catalog_model(catalog_internal_id)
+            cat_external_id = (
+                getattr(cat_model, "external_id", None) or catalog_id
+            ) if cat_model else catalog_id
+            content_location = self._build_collection_url(
+                request, cat_external_id, new_external_id
+            )
+        return catalog_internal_id, collection_internal_id, new_external_id, content_location
+
+    # ------------------------------------------------------------------
+    # RFC 7240 Prefer header helpers
+    # ------------------------------------------------------------------
+
+    def _wants_move(self, request: Request) -> bool:
+        """Return True iff the client sent ``Prefer: handling=move`` (RFC 7240).
+
+        Parses the ``Prefer`` header as a comma-separated list of
+        preference-tokens and checks for a ``handling=move`` token.
+        The comparison is case-insensitive; surrounding whitespace is
+        stripped; other tokens in the header are ignored.
+        """
+        prefer_header = request.headers.get("prefer", "")
+        for token in prefer_header.split(","):
+            if token.strip().lower() == "handling=move":
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Shared collection CRUD bodies (M-3)
@@ -778,12 +1408,33 @@ class OGCServiceMixin:
         localized_data, _ = self._localize_resource(created, language)
         return JSONResponse(content=localized_data, status_code=status.HTTP_201_CREATED)
 
+    def _build_catalog_url(self, request: Request, catalog_external_id: str) -> str:
+        """Build the absolute URL for a catalog's canonical PUT/GET endpoint.
+
+        Uses the incoming request's base URL and the service's path prefix.
+        """
+        root = get_root_url(request)
+        prefix = getattr(self, "prefix", "")
+        return f"{root}{prefix}/catalogs/{catalog_external_id}"
+
+    def _build_collection_url(
+        self, request: Request, catalog_external_id: str, collection_external_id: str
+    ) -> str:
+        """Build the absolute URL for a collection's canonical PUT/GET endpoint."""
+        root = get_root_url(request)
+        prefix = getattr(self, "prefix", "")
+        return f"{root}{prefix}/catalogs/{catalog_external_id}/collections/{collection_external_id}"
+
     async def _ogc_replace_collection(
         self,
         catalog_id: str,
         collection_id: str,
         updates_dict: Dict[str, Any],
         language: str,
+        *,
+        request: Optional[Request] = None,
+        body_id: Optional[str] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared replace-collection (PUT) body used by Features and STAC.
 
@@ -791,10 +1442,64 @@ class OGCServiceMixin:
         ``normalize_i18n_for_replace``; this method performs no additional
         normalization.  No ``db_resource`` / transactional context is passed
         on this path (neither Features nor STAC injects one for replace).
+
+        When *body_id* differs from *collection_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: MOVE (rename) then replace;
+           respond with 200 + ``Content-Location``, ``Link: rel=canonical``,
+           and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise 400.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4 Req 11): drop the body id and replace the path-addressed resource.
         """
         catalogs_svc = await self._get_catalogs_service()
         await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
+        # Mismatch branch: body id differs from path id.
+        if body_id is not None and body_id != collection_id:
+            if request is not None and self._wants_move(request):
+                _cat_internal, _col_internal, new_external_id, content_location = (
+                    await self._ogc_perform_collection_rename(
+                        catalog_id, collection_id, body_id, request=request
+                    )
+                )
+                updates_dict = {**updates_dict, "id": new_external_id}
+                # Logical-id contract: service queries take the LOGICAL (external)
+                # ids and resolve external->internal themselves. After the rename
+                # the collection's new logical id is ``new_external_id`` and the
+                # catalog path id is unchanged. Passing the internal surrogate here
+                # bypasses the external->internal resolver (which is external-only),
+                # so the post-rename re-read cannot find the row and raises a
+                # spurious 404 even though the rename committed.
+                updated = await catalogs_svc.update_collection(
+                    catalog_id, new_external_id, updates_dict, lang="*"
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Collection not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{collection_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, replace path-addressed resource.
+            updates_dict = {k: v for k, v in updates_dict.items() if k != "id"}
+
+        # Normal replace branch: body id == path id (or body id dropped/absent).
         updated = await catalogs_svc.update_collection(
             catalog_id, collection_id, updates_dict, lang="*"
         )
@@ -813,6 +1518,9 @@ class OGCServiceMixin:
         updates_dict: Dict[str, Any],
         language: str,
         request: Optional[Request] = None,
+        *,
+        body_id: Optional[str] = None,
+        on_id_mismatch: Literal["ignore", "reject"] = "ignore",
     ) -> Response:
         """Shared update-collection (PATCH) body used by Features and STAC.
 
@@ -820,15 +1528,75 @@ class OGCServiceMixin:
         ``model_dump(exclude_unset=True)``.  ``request`` is forwarded to
         ``_pre_update_collection_validate`` for services (STAC) that need
         to fetch the current state before merging and validating.
+
+        When *body_id* differs from *collection_id* (the path parameter) three
+        cases apply:
+
+        1. ``Prefer: handling=move`` present: MOVE (rename) then patch remaining
+           fields; respond with 200 + ``Content-Location``,
+           ``Link: rel=canonical``, and ``Preference-Applied: handling=move``.
+        2. Move NOT requested, *on_id_mismatch* == ``"reject"`` (STAC): raise 400.
+        3. Move NOT requested, *on_id_mismatch* == ``"ignore"`` (OGC Features
+           Part 4): drop the body ``"id"`` field and patch normally.
+
+        When *body_id* is absent or equals *collection_id* the normal partial-update
+        path runs regardless.
         """
         from dynastore.extensions.tools.localization_utils import detect_use_lang
 
+        catalogs_svc = await self._get_catalogs_service()
+        await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
+
+        # Mismatch branch: PATCH body carries a different "id".
+        if body_id is not None and body_id != collection_id:
+            if request is not None and self._wants_move(request):
+                _cat_internal, _col_internal, new_external_id, content_location = (
+                    await self._ogc_perform_collection_rename(
+                        catalog_id, collection_id, body_id, request=request
+                    )
+                )
+                # Strip "id" — rename already updated it.
+                patch_fields = {k: v for k, v in updates_dict.items() if k != "id"}
+                # Logical-id contract: pass the new LOGICAL ids (catalog path id
+                # unchanged; collection now addressed by ``new_external_id``) so the
+                # service resolves external->internal itself. Passing the internal
+                # surrogate bypasses that resolver and the post-rename re-read 404s.
+                await self._pre_update_collection_validate(
+                    catalog_id, new_external_id, patch_fields, request
+                )
+                use_lang = detect_use_lang(patch_fields, language)
+                updated = await catalogs_svc.update_collection(
+                    catalog_id, new_external_id, patch_fields, lang=use_lang
+                )
+                if not updated:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Collection not found after rename.",
+                    )
+                localized_data, _ = self._localize_resource(updated, language)
+                response = JSONResponse(content=localized_data)
+                if content_location is not None:
+                    response.headers["Content-Location"] = content_location
+                    response.headers["Link"] = f'<{content_location}>; rel="canonical"'
+                response.headers["Preference-Applied"] = "handling=move"
+                return response
+
+            if on_id_mismatch == "reject":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Body id '{body_id}' does not match path id '{collection_id}'."
+                        " Send 'Prefer: handling=move' to rename."
+                    ),
+                )
+            # on_id_mismatch == "ignore": drop body id, patch with path id.
+            updates_dict = {k: v for k, v in updates_dict.items() if k != "id"}
+
+        # Normal update branch: body id == path id (or body id dropped/absent).
         await self._pre_update_collection_validate(
             catalog_id, collection_id, updates_dict, request
         )
         use_lang = detect_use_lang(updates_dict, language)
-        catalogs_svc = await self._get_catalogs_service()
-        await self._require_catalog_write_ready(catalog_id, catalogs_svc=catalogs_svc)
 
         updated = await catalogs_svc.update_collection(
             catalog_id, collection_id, updates_dict, lang=use_lang
@@ -897,7 +1665,7 @@ class OGCServiceMixin:
         from dynastore.tools.protocol_helpers import get_engine
 
         # Resolve physical schema so the task lands in the catalog's namespace
-        # and is discoverable via GET /tasks/catalogs/{catalog_id}/{task_id}.
+        # and is discoverable via GET /task/catalogs/{catalog_id}/tasks/{task_id}.
         engine = get_engine()
         if engine is None:
             raise HTTPException(
@@ -927,7 +1695,7 @@ class OGCServiceMixin:
             async with managed_transaction(engine) as _conn2:
                 existing_dict = await DQLQuery(
                     f"SELECT * FROM {task_schema}.tasks"
-                    " WHERE dedup_key = :dk AND schema_name = :sn"
+                    " WHERE dedup_key = :dk AND catalog_id = :sn"
                     " AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')"
                     " ORDER BY timestamp DESC LIMIT 1;",
                     result_handler=ResultHandler.ONE_DICT,
@@ -962,10 +1730,10 @@ class OGCServiceMixin:
                 base = enforce_https(str(request.base_url).rstrip("/"))
                 root_path = request.scope.get("root_path", "").rstrip("/")
                 status_url = (
-                    f"{base}{root_path}/tasks/catalogs/{catalog_id}/{task_id_str}"
+                    f"{base}{root_path}/task/catalogs/{catalog_id}/tasks/{task_id_str}"
                 )
         else:
-            status_url = f"/tasks/catalogs/{catalog_id}/{task_id_str}"
+            status_url = f"/task/catalogs/{catalog_id}/tasks/{task_id_str}"
 
         body = _json.dumps({
             "status": task.status if hasattr(task, "status") else "PENDING",
@@ -1040,6 +1808,20 @@ class OGCTransactionMixin:
         ``(accepted_rows, rejections, was_single, batch_size)``
         where *was_single* is ``True`` when the caller sent a lone item
         (not wrapped in a collection/array).
+
+        A single item, or a multi-item payload that fits under both the
+        collection's ``sync_ingest_batch_rows`` row cap and
+        ``sync_ingest_batch_memory_mb`` byte budget (``CollectionPluginConfig``),
+        is written with ONE ``upsert()`` call, exactly as before — full
+        upserted rows land in ``accepted_rows``, which callers building a
+        protocol-specific 201 body rely on. A multi-item payload that
+        exceeds either bound is sub-batched instead, mirroring the bounded
+        batching the async ingestion task already applies (#2657 bounds the
+        remaining unbounded path — the one direct synchronous bulk POST):
+        each sub-batch is upserted, reduced to accepted ID strings, and
+        discarded before the next sub-batch is prepared, so the whole
+        FeatureCollection is never held in memory at once. In that case
+        ``accepted_rows`` holds accumulated ID strings rather than rows.
         """
         from dynastore.modules.storage.errors import ConflictError, SidecarRejectedError
 
@@ -1068,59 +1850,202 @@ class OGCTransactionMixin:
         # the driver can use any type-specific fast-paths it provides.
         catalogs_svc = await self._get_catalogs_service()  # type: ignore[attr-defined]
 
+        # A multi-item payload is sub-batched once it exceeds the row cap,
+        # or — for a payload under the row cap but with individually large
+        # geometries — once its accumulated estimated byte size exceeds the
+        # memory budget. A single item is never split.
+        needs_split = False
+        row_cap = 0
+        byte_budget = 0
+        if not was_single:
+            from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
+            from dynastore.tasks.ingestion.main_ingestion import _estimate_feature_bytes
+
+            col_config = await self._get_plugin_config(  # type: ignore[attr-defined]
+                CollectionPluginConfig, catalog_id, collection_id
+            )
+
+            # Sub-batching (above) caps every upsert() call at row_cap
+            # items, which is normally well under max_bulk_features — so
+            # the equivalent check inside item_service.upsert() never sees
+            # the full FeatureCollection once a payload is split, and a
+            # request of arbitrary size would otherwise sail through as a
+            # sequence of individually-compliant sub-batches. Enforce the
+            # documented total-count contract here, against the full list,
+            # before any splitting happens.
+            max_bulk = col_config.max_bulk_features
+            if batch_size > max_bulk:
+                raise ValueError(
+                    f"FeatureCollection contains {batch_size} features, "
+                    f"exceeding the maximum of {max_bulk}. "
+                    f"Split into smaller batches."
+                )
+
+            row_cap = col_config.sync_ingest_batch_rows
+            byte_budget = max(1, col_config.sync_ingest_batch_memory_mb) * 1024 * 1024
+
+            if batch_size > row_cap:
+                needs_split = True
+            else:
+                total_bytes = 0
+                for item in items_list:
+                    _dump = getattr(item, "model_dump", None)
+                    total_bytes += _estimate_feature_bytes(
+                        _dump() if callable(_dump) else item
+                    )
+                    if total_bytes > byte_budget:
+                        needs_split = True
+                        break
+
         rejections: list[SidecarRejection] = []
-        # Seed the typed out-list so the PG write path can record per-row
-        # SidecarRejectedError events without collapsing the whole batch.
-        # The core service reads/writes ``ctx.extensions["_rejections"]``.
-        ctx.extensions["_rejections"] = []
-        try:
-            created = await catalogs_svc.upsert(
-                catalog_id, collection_id, items=payload, ctx=ctx
-            )
-        except SidecarRejectedError as rej:
-            # Non-PG primary drivers still surface rejections as a single
-            # batch-level exception; PG now catches per-row and delivers via
-            # the out-list below, so we only reach here when the primary
-            # driver aborted the whole payload.
-            rejections.append(
-                SidecarRejection(
-                    geoid=rej.geoid,
-                    external_id=rej.external_id,
-                    sidecar_id=rej.sidecar_id,
-                    matcher=rej.matcher,
-                    reason=rej.reason,
-                    message=str(rej),
-                    policy_source=policy_source,
-                )
-            )
-            created = []
-        except ConflictError as exc:
-            # on_batch_conflict=refuse_batch: duplicate detected → abort batch → 409.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-            ) from exc
+        accepted_rows: list[Any]
 
-        # Drain per-row rejections delivered via the DriverContext out-list.
-        for entry in ctx.extensions.pop("_rejections", []) or []:
-            rejections.append(
-                SidecarRejection(
-                    geoid=entry.get("geoid"),
-                    external_id=entry.get("external_id"),
-                    sidecar_id=entry.get("sidecar_id"),
-                    matcher=entry.get("matcher"),
-                    reason=entry.get("reason") or "sidecar_rejected",
-                    message=entry.get("message") or "",
-                    policy_source=policy_source,
-                )
-            )
+        if needs_split:
+            from dynastore.models.protocols.indexer import MAX_ACCUMULATED_FAILURE_SAMPLES
+            from dynastore.modules.catalog.item_service import _merge_index_results_into
 
-        accepted_rows: list[Any] = (
-            created if isinstance(created, list) else ([created] if created else [])
-        )
+            accepted_ids: list[str] = []
+            index_results: Dict[str, Any] = {}
+            current_batch: list[Any] = []
+            current_batch_bytes = 0
+
+            async def _flush(sub_batch: "list[Any]") -> None:
+                # Seed the typed out-list so the PG write path can record
+                # per-row SidecarRejectedError events without collapsing the
+                # whole sub-batch. The core service reads/writes
+                # ``ctx.extensions["_rejections"]``.
+                ctx.extensions["_rejections"] = []
+                try:
+                    created = await catalogs_svc.upsert(
+                        catalog_id, collection_id, items=sub_batch, ctx=ctx
+                    )
+                except SidecarRejectedError as rej:
+                    # Non-PG primary drivers still surface rejections as a
+                    # single batch-level exception; PG now catches per-row
+                    # and delivers via the out-list below, so we only reach
+                    # here when the primary driver aborted the sub-batch.
+                    rejections.append(
+                        SidecarRejection(
+                            geoid=rej.geoid,
+                            external_id=rej.external_id,
+                            sidecar_id=rej.sidecar_id,
+                            matcher=rej.matcher,
+                            reason=rej.reason,
+                            message=str(rej),
+                            policy_source=policy_source,
+                        )
+                    )
+                    created = []
+                except ConflictError as exc:
+                    # on_batch_conflict=refuse_batch: duplicate detected → abort → 409.
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+                    ) from exc
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+                    ) from exc
+
+                # Drain per-row rejections delivered via the DriverContext out-list.
+                for entry in ctx.extensions.pop("_rejections", []) or []:
+                    rejections.append(
+                        SidecarRejection(
+                            geoid=entry.get("geoid"),
+                            external_id=entry.get("external_id"),
+                            sidecar_id=entry.get("sidecar_id"),
+                            matcher=entry.get("matcher"),
+                            reason=entry.get("reason") or "sidecar_rejected",
+                            message=entry.get("message") or "",
+                            policy_source=policy_source,
+                        )
+                    )
+                # Bound the accumulated rejection samples across sub-batches
+                # the same way the indexer/ingestion-task accumulators do —
+                # keep the most recent MAX_ACCUMULATED_FAILURE_SAMPLES.
+                if len(rejections) > MAX_ACCUMULATED_FAILURE_SAMPLES:
+                    rejections[:] = rejections[-MAX_ACCUMULATED_FAILURE_SAMPLES:]
+
+                # Reduce this sub-batch's accepted rows to ID strings
+                # immediately and let the full rows fall out of scope —
+                # no Feature body from this sub-batch survives past here.
+                batch_rows = (
+                    created if isinstance(created, list) else ([created] if created else [])
+                )
+                accepted_ids.extend(self._resolve_accepted_ids(batch_rows))
+                _merge_index_results_into(
+                    index_results, ctx.extensions.pop("_index_results", None) or {}
+                )
+
+            for item in items_list:
+                current_batch.append(item)
+                _dump = getattr(item, "model_dump", None)
+                current_batch_bytes += _estimate_feature_bytes(
+                    _dump() if callable(_dump) else item
+                )
+                if len(current_batch) >= row_cap or current_batch_bytes >= byte_budget:
+                    await _flush(current_batch)
+                    current_batch = []
+                    current_batch_bytes = 0
+            if current_batch:
+                await _flush(current_batch)
+
+            if index_results:
+                ctx.extensions["_index_results"] = index_results
+
+            accepted_rows = list(accepted_ids)
+        else:
+            # Seed the typed out-list so the PG write path can record per-row
+            # SidecarRejectedError events without collapsing the whole batch.
+            # The core service reads/writes ``ctx.extensions["_rejections"]``.
+            ctx.extensions["_rejections"] = []
+            try:
+                created = await catalogs_svc.upsert(
+                    catalog_id, collection_id, items=payload, ctx=ctx
+                )
+            except SidecarRejectedError as rej:
+                # Non-PG primary drivers still surface rejections as a single
+                # batch-level exception; PG now catches per-row and delivers via
+                # the out-list below, so we only reach here when the primary
+                # driver aborted the whole payload.
+                rejections.append(
+                    SidecarRejection(
+                        geoid=rej.geoid,
+                        external_id=rej.external_id,
+                        sidecar_id=rej.sidecar_id,
+                        matcher=rej.matcher,
+                        reason=rej.reason,
+                        message=str(rej),
+                        policy_source=policy_source,
+                    )
+                )
+                created = []
+            except ConflictError as exc:
+                # on_batch_conflict=refuse_batch: duplicate detected → abort batch → 409.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+                ) from exc
+
+            # Drain per-row rejections delivered via the DriverContext out-list.
+            for entry in ctx.extensions.pop("_rejections", []) or []:
+                rejections.append(
+                    SidecarRejection(
+                        geoid=entry.get("geoid"),
+                        external_id=entry.get("external_id"),
+                        sidecar_id=entry.get("sidecar_id"),
+                        matcher=entry.get("matcher"),
+                        reason=entry.get("reason") or "sidecar_rejected",
+                        message=entry.get("message") or "",
+                        policy_source=policy_source,
+                    )
+                )
+
+            accepted_rows = (
+                created if isinstance(created, list) else ([created] if created else [])
+            )
 
         if not accepted_rows and not rejections:
             raise HTTPException(
@@ -1138,6 +2063,12 @@ class OGCTransactionMixin:
         """Extract the logical string ID from each upserted row."""
         ids: list[str] = []
         for row in accepted_rows:
+            if isinstance(row, str):
+                # Sub-batched bulk ingest (#2657) already resolved each
+                # sub-batch's IDs before discarding its full rows — pass a
+                # pre-resolved ID straight through instead of re-deriving it.
+                ids.append(row)
+                continue
             props = getattr(row, "properties", None) or {}
             fid = (
                 getattr(row, "id", None)

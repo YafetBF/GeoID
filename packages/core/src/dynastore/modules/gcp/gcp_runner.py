@@ -19,8 +19,9 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from dynastore.modules.processes.models import Process, ExecuteRequest, as_process_task_payload
 from dynastore.modules.tasks import tasks_module
@@ -35,8 +36,19 @@ from dynastore.modules.tasks.models import (
 from dynastore.tools.identifiers import generate_id_hex
 from dynastore.tools.plugin import ProtocolPlugin
 
+try:
+    from google.cloud.logging_v2.types import ListLogEntriesRequest
+except ImportError:  # google-cloud-logging is optional within module_gcp
+    ListLogEntriesRequest = None
+
+try:
+    from google.logging.type.log_severity_pb2 import LogSeverity as _LogSeverity
+except ImportError:  # google-cloud-logging is optional within module_gcp
+    _LogSeverity = None
+
 if TYPE_CHECKING:
     from dynastore.modules.tasks.liveness import LivenessVerdict
+    from dynastore.models.tasks import LogPage
 
 logger = logging.getLogger(__name__)
 
@@ -234,23 +246,44 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
         execution_id = generate_id_hex()
         owner_id = f"gcp_cloud_run_{execution_id}"
-        # Lease for a freshly-launched Cloud Run Job. Picked to outlast typical
-        # job startup + run; the in-job heartbeat (main_task.py) extends it while
-        # the job runs, and the MaintenanceSupervisor task_reaper resets the row
-        # if the lease lapses.
+        # Lease for a freshly-launched Cloud Run Job.  The in-job heartbeat
+        # (main_task.py) extends it while the job runs, and the
+        # MaintenanceSupervisor task_reaper resets the row if the lease lapses.
+        #
+        # Priority: context.execution_overrides.timeout_seconds (per-execution) >
+        # per-target routing options['timeout_seconds'] (per-task-type ceiling,
+        # e.g. a longer default for heavy tile-preseed processes) >
+        # TasksPluginConfig.task_timeout_seconds (platform default) > 3600.
+        # resolve_routing_terminal already layers the routing option over the
+        # platform default, so the Cloud Run Job now honors the SAME timeout the
+        # in-process SyncRunner does — previously the per-target routing option
+        # was silently dropped here and every Job was capped at the platform
+        # default regardless of its route. Both the Cloud Run execution timeout
+        # AND the DB lease are set to the effective value so they never diverge.
         _timeout_seconds = 3600
         try:
-            from dynastore.tools.discovery import get_protocol
-            from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-            _cm = get_protocol(PlatformConfigsProtocol)
-            if _cm is not None:
-                _cfg = await _cm.get_config(TasksPluginConfig)
-                if isinstance(_cfg, TasksPluginConfig):
-                    _timeout_seconds = _cfg.task_timeout_seconds
+            from dynastore.modules.tasks.execution import resolve_routing_terminal
+            _terminal = await resolve_routing_terminal(context.task_type)
+            if _terminal.timeout_seconds:
+                _timeout_seconds = int(_terminal.timeout_seconds)
         except Exception:  # noqa: BLE001 — default lease on any read failure
             pass
-        task_lease = timedelta(seconds=_timeout_seconds)
+
+        # Per-execution override takes precedence over the routing/config ceiling.
+        _exec_overrides = context.execution_overrides
+        _override_timeout = (
+            _exec_overrides.timeout_seconds
+            if _exec_overrides and _exec_overrides.timeout_seconds
+            else None
+        )
+        _effective_timeout_seconds = _override_timeout if _override_timeout else _timeout_seconds
+        if _override_timeout:
+            logger.debug(
+                "GcpJobRunner: using per-execution timeout=%ds (routing/config=%ds) for '%s'.",
+                _effective_timeout_seconds, _timeout_seconds, context.task_type,
+            )
+
+        task_lease = timedelta(seconds=_effective_timeout_seconds)
         new_locked_until = datetime.now(timezone.utc) + task_lease
 
         existing_task: Optional[Task] = None
@@ -278,11 +311,47 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             if not claimed:
                 logger.warning(
                     "GcpJobRunner: dispatcher-path race detected — task '%s' "
-                    "already owned by a non-GcpJobRunner worker. Skipping Cloud "
-                    "Run dispatch (no double-spawn).",
+                    "already owned by a non-GcpJobRunner worker. Probing owner...",
                     task_id_uuid,
                 )
-                return DEFERRED_COMPLETION
+                existing = await tasks_module.get_task_by_id_unscoped(
+                    context.engine, task_id_uuid
+                )
+                if existing and existing.owner_id:
+                    if existing.owner_id.startswith("gcp_cloud_run_"):
+                        logger.info(
+                            "GcpJobRunner: task '%s' owned by REST-path worker '%s' "
+                            "— deferring to that execution (no double-spawn).",
+                            task_id_uuid, existing.owner_id,
+                        )
+                        try:
+                            spawn_lease = await _resolve_spawn_lease_seconds()
+                            await tasks_module.heartbeat_task_if_active(
+                                context.engine,
+                                task_id_uuid,
+                                timedelta(seconds=spawn_lease),
+                            )
+                            logger.debug(
+                                "GcpJobRunner: extended lease for racy task '%s' "
+                                "(+%ds) — liveness reconciler will probe.",
+                                task_id_uuid, spawn_lease,
+                            )
+                        except Exception as extend_err:
+                            logger.warning(
+                                "GcpJobRunner: failed to extend lease for racy task '%s': %s",
+                                task_id_uuid, extend_err,
+                            )
+                        return DEFERRED_COMPLETION
+                    else:
+                        logger.warning(
+                            "GcpJobRunner: task '%s' owned by unknown worker '%s' "
+                            "— resetting to PENDING for recovery.",
+                            task_id_uuid, existing.owner_id,
+                        )
+                await tasks_module.reset_task_to_pending(
+                    context.engine, task_id_uuid, backoff=timedelta(seconds=5)
+                )
+                return None
             task_id_for_payload = task_id_uuid
             logger.info(
                 f"GcpJobRunner: dispatcher-path reuse of task '{task_id_uuid}' for "
@@ -297,6 +366,18 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             # rather than the column default of 3) so a single misbehaving job
             # cannot loop more than once by default.
             job_max_retries = get_job_max_retries(context.task_type)
+            # per-execution override takes precedence over the job-config ceiling.
+            _rest_exec_ovr = _exec_overrides  # already resolved above
+            _override_max_retries = (
+                _rest_exec_ovr.max_retries
+                if _rest_exec_ovr and _rest_exec_ovr.max_retries is not None
+                else None
+            )
+            effective_max_retries = (
+                _override_max_retries
+                if _override_max_retries is not None
+                else (job_max_retries if job_max_retries is not None else 3)
+            )
             # Optional: caller may pre-supply a dedup_key in extra_context to
             # collapse at-least-once redeliveries (Pub/Sub push, retry storms).
             dedup_key = (
@@ -308,7 +389,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 task_type=context.task_type,
                 inputs=inputs_dict,
                 collection_id=context.collection_id,
-                max_retries=job_max_retries if job_max_retries is not None else 3,
+                max_retries=effective_max_retries,
                 dedup_key=dedup_key,
             )
             spawn_lease_seconds = await _resolve_spawn_lease_seconds()
@@ -337,7 +418,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 f"GcpJobRunner: REST-path born-claimed task '{new_task.task_id}' for "
                 f"job '{job_name}' (execution_id={execution_id}, "
                 f"spawn_lease={spawn_lease_seconds}s, "
-                f"max_retries={job_max_retries if job_max_retries is not None else 'default'})."
+                f"max_retries={effective_max_retries})."
             )
 
         process_defn = try_load_process_definition(context.task_type)
@@ -370,7 +451,10 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         for attempt in range(1, _RUNJOB_MAX_ATTEMPTS + 1):
             try:
                 runner_ref = await run_cloud_run_job_async(
-                    job_name=job_name, args=args, env_vars=env_vars,
+                    job_name=job_name,
+                    args=args,
+                    env_vars=env_vars,
+                    execution_overrides=context.execution_overrides,
                 )
                 last_exc = None
                 break
@@ -702,3 +786,223 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 "— returning False.", runner_ref, exc,
             )
             return False
+
+    # ------------------------------------------------------------------
+    # LogSourceProtocol — vendor-extension job logs (GET /jobs/{id}/logs)
+    #
+    # Not OGC Processes core: a client-facing, best-effort convenience so an
+    # operator/caller can see why a job died without shelling into Cloud
+    # Logging directly. The runner service account may not have
+    # roles/logging.viewer granted yet, so every failure mode here degrades
+    # to an empty LogPage with an explanatory note rather than raising.
+    #
+    # IAM perm needed by the runner service account:
+    #   logging.logEntries.list  (roles/logging.viewer)
+    # ------------------------------------------------------------------
+
+    _RUNNER_REF_RE = re.compile(
+        r"^projects/[^/]+/locations/[^/]+/jobs/(?P<job>[^/]+)/executions/(?P<execution>[^/]+)$"
+    )
+
+    @classmethod
+    def _parse_runner_ref(cls, runner_ref: Optional[str]) -> Optional[Tuple[str, str]]:
+        """Extract ``(job_name, execution_name)`` from a Cloud Run ``runner_ref``.
+
+        Expected shape: ``projects/{p}/locations/{l}/jobs/{JOB}/executions/{EXEC}``.
+        Returns ``None`` when ``runner_ref`` is absent or doesn't match —
+        e.g. captured before the executions segment was set, or a
+        foreign-format ref from a different runner family.
+        """
+        if not runner_ref:
+            return None
+        m = cls._RUNNER_REF_RE.match(runner_ref)
+        if not m:
+            return None
+        return m.group("job"), m.group("execution")
+
+    @staticmethod
+    def _get_logging_client_safe() -> Optional[Any]:
+        """Resolve the Cloud Logging async client without raising.
+
+        Mirrors ``_get_executions_client_safe`` — same guard pattern. Returns
+        ``None`` when the client is unavailable (GCP module not loaded,
+        google-cloud-logging not installed, early startup, or tests without
+        mocking).
+        """
+        try:
+            from dynastore.modules import get_protocol
+            from dynastore.models.protocols import JobExecutionProtocol
+
+            gcp_module = get_protocol(JobExecutionProtocol)
+            if gcp_module is None or not hasattr(gcp_module, "get_logging_client"):
+                return None
+            return gcp_module.get_logging_client()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — never raise from a log-fetch helper
+            logger.debug(
+                "GcpJobRunner._get_logging_client_safe: client unavailable (%s).", exc
+            )
+            return None
+
+    @staticmethod
+    def _severity_name(value: Any) -> Optional[str]:
+        """Map a raw Cloud Logging ``LogEntry.severity`` value to its name.
+
+        ``LogEntry.severity`` is typed as
+        ``google.logging.type.log_severity_pb2.LogSeverity`` — a legacy-style
+        protobuf enum whose values are plain ``int``s at runtime (it predates
+        the newer ``proto.Enum``/``IntEnum`` convention), so they carry no
+        ``.name`` attribute. Calling ``.name`` on that ``int`` unconditionally
+        (the pre-#2658 code did, since a proto3 enum field is never actually
+        ``None``) raised an ``AttributeError`` on every real Cloud Logging
+        response, which the caller's lenient ``except Exception`` swallowed
+        as "logs unavailable" — defeating the durable-logs read path
+        entirely. ``0`` (``DEFAULT``) means "no severity set" and is reported
+        as ``None`` to match the field's original omitted-severity intent.
+        """
+        if value is None or value == 0:
+            return None
+        if _LogSeverity is not None:
+            try:
+                return _LogSeverity.Name(value)
+            except ValueError:
+                pass
+        return str(value)
+
+    @staticmethod
+    def _extract_log_message(entry: Any) -> str:
+        """Best-effort extraction of a human-readable message from a
+        ``LogEntry``'s oneof ``payload`` (text/json/proto)."""
+        text = getattr(entry, "text_payload", None)
+        if text:
+            return text
+        json_payload = getattr(entry, "json_payload", None)
+        if json_payload:
+            try:
+                import json as _json
+                return _json.dumps(dict(json_payload))
+            except Exception:  # noqa: BLE001 — fall through to str()
+                return str(json_payload)
+        proto_payload = getattr(entry, "proto_payload", None)
+        if proto_payload:
+            return str(proto_payload)
+        return ""
+
+    async def fetch_logs(
+        self,
+        task: Any,
+        *,
+        limit: int = 200,
+        cursor: Optional[str] = None,
+        order: str = "asc",
+    ) -> "LogPage":
+        """Read one page of Cloud Logging entries for the Cloud Run execution
+        backing ``task``.
+
+        Best-effort and lenient by design: a malformed/absent ``runner_ref``,
+        an unavailable logging client, a missing project id, or any Cloud
+        Logging API error — including ``PermissionDenied`` when the runner
+        service account lacks ``roles/logging.viewer`` — all return an EMPTY
+        ``LogPage`` with a human-readable ``note`` instead of raising. This
+        method MUST NOT raise: the job-logs endpoint must still return 200
+        even when logs are unavailable.
+        """
+        from dynastore.models.tasks import LogEntry, LogPage
+
+        runner_ref = getattr(task, "runner_ref", None)
+        parsed = self._parse_runner_ref(runner_ref)
+        if parsed is None:
+            return LogPage(
+                entries=[],
+                note="no runner_ref (or unrecognized format) — logs unavailable",
+            )
+        job_name, execution_name = parsed
+
+        try:
+            client = self._get_logging_client_safe()
+            if client is None:
+                return LogPage(
+                    entries=[],
+                    note="Cloud Logging client unavailable — logs unavailable",
+                )
+
+            from dynastore.modules import get_protocol
+            from dynastore.models.protocols import CloudIdentityProtocol
+
+            identity = get_protocol(CloudIdentityProtocol)
+            project_id = identity.get_project_id() if identity else None
+            if not project_id:
+                return LogPage(
+                    entries=[],
+                    note="GCP project id unavailable — logs unavailable",
+                )
+
+            log_filter = (
+                'resource.type="cloud_run_job" '
+                f'AND resource.labels.job_name="{job_name}" '
+                f'AND labels."run.googleapis.com/execution_name"="{execution_name}"'
+            )
+            order_by = "timestamp desc" if order == "desc" else "timestamp asc"
+            request_kwargs = dict(
+                resource_names=[f"projects/{project_id}"],
+                filter=log_filter,
+                order_by=order_by,
+                page_size=limit,
+                page_token=cursor or "",
+            )
+            # ``ListLogEntriesRequest`` when google-cloud-logging is installed
+            # (the typed request the module_gcp extra declares); GAPIC async
+            # clients also accept a plain dict with the same fields, so a
+            # service running without the optional dependency (or a test
+            # double) still gets a well-formed request.
+            request = (
+                ListLogEntriesRequest(**request_kwargs)
+                if ListLogEntriesRequest is not None
+                else request_kwargs
+            )
+            pager = await client.list_log_entries(request=request)
+
+            # Take exactly ONE raw page (``.pages`` — not the flattened
+            # auto-paginating iterator) so ``limit``/``cursor`` map 1:1 onto
+            # our own LogPage/next_cursor contract instead of the pager
+            # silently issuing further RPCs to backfill a short first page.
+            entries: list = []
+            next_token: Optional[str] = None
+            async for raw_page in pager.pages:
+                for log_entry in raw_page.entries:
+                    entries.append(
+                        LogEntry(
+                            timestamp=log_entry.timestamp,
+                            severity=self._severity_name(
+                                getattr(log_entry, "severity", None)
+                            ),
+                            message=self._extract_log_message(log_entry),
+                        )
+                    )
+                next_token = raw_page.next_page_token or None
+                break
+
+            return LogPage(entries=entries, next_cursor=next_token)
+        except Exception as exc:  # noqa: BLE001 — MUST NOT raise; degrade to empty page
+            if type(exc).__name__ in ("PermissionDenied", "Forbidden"):
+                reason = (
+                    "log access not granted (roles/logging.viewer) — logs unavailable"
+                )
+                logger.warning(
+                    "GcpJobRunner.fetch_logs: read failed for runner_ref '%s' (%s) — %s.",
+                    runner_ref, exc, reason,
+                )
+            else:
+                reason = f"log read failed ({type(exc).__name__}) — logs unavailable"
+                # Anything other than the recognized "no IAM grant" condition
+                # above is unexpected — most likely a code bug in this read
+                # path (see #2658). Log it at ERROR with a full traceback
+                # server-side so a real bug surfaces in the logs instead of
+                # silently masquerading as "no logs", while this method still
+                # honors its MUST-NOT-raise contract and returns a lenient
+                # empty page to the caller.
+                logger.error(
+                    "GcpJobRunner.fetch_logs: unexpected read failure for "
+                    "runner_ref '%s' — %s.",
+                    runner_ref, reason, exc_info=True,
+                )
+            return LogPage(entries=[], note=reason)

@@ -155,6 +155,50 @@ class PolicyService:
         # or drop roles via PATCH at runtime — no subclassing.
         self._role_config = role_config or IamRolesConfig()
 
+    async def _resolve_collection_internal_id(
+        self,
+        catalog_id: Optional[str],
+        collection_id: Optional[str],
+    ) -> Optional[str]:
+        """Resolve a public collection ``external_id`` to its immutable internal id.
+
+        Returns ``collection_id`` unchanged when:
+        - ``collection_id`` is None/empty
+        - ``catalog_id`` is None (platform scope)
+        - ``CatalogsProtocol`` / ``CollectionsProtocol`` is unavailable
+        - The lookup returns None (collection not found — caller decides)
+
+        The result is the value to store in / compare against
+        ``grants.resource_ref`` so collection-scoped grants survive a
+        collection ``external_id`` rename.
+        """
+        if not collection_id or not catalog_id:
+            return collection_id
+        try:
+            from dynastore.models.protocols import CatalogsProtocol
+
+            catalogs = get_protocol(CatalogsProtocol)
+            if catalogs is None:
+                return collection_id
+            catalog_internal = await catalogs.resolve_catalog_id(
+                catalog_id, allow_missing=True
+            )
+            if catalog_internal is None:
+                return collection_id
+            internal = await catalogs.collections.resolve_collection_id(
+                catalog_internal, collection_id, allow_missing=True
+            )
+            return internal if internal is not None else collection_id
+        except Exception:
+            logger.debug(
+                "IAM: could not resolve collection external_id %r in catalog %r; "
+                "using value as-is (collection-scoped grant matching may degrade).",
+                collection_id,
+                catalog_id,
+                exc_info=True,
+            )
+            return collection_id
+
     async def _resolve_schema(
         self, catalog_id: Optional[str], conn: Optional[Any] = None, *, strict: bool = False
     ) -> str:
@@ -330,15 +374,32 @@ class PolicyService:
         if not policy.partition_key:
             policy.partition_key = "global"
 
-        async with managed_transaction(self._engine) as conn:
-            # 1. Ensure partition exists before inserting
-            from .postgres_policy_storage import PostgresPolicyStorage
+        # 1. Ensure the partition exists before inserting, provisioned on its
+        # own dedicated, short-lived transaction — NOT the write transaction
+        # below. ``CREATE TABLE ... PARTITION OF`` takes an ACCESS EXCLUSIVE
+        # lock on the shared parent ``policies`` table for the life of the
+        # enclosing transaction, not just the DDL statement; running it
+        # inline inside the same transaction as the duplicate-check + INSERT
+        # held that lock open for the whole request. This mirrors
+        # ``ensure_partitions_off_request_connection`` (ConSys/Styles/Moving
+        # Features, #2831) and the ingestion write path's pre-create-then-write
+        # phasing: the DDL commits (or is tolerated as a benign 42P07
+        # concurrent-create race) before the write transaction even opens, so
+        # a retry after any failure below is always safe — the partition is
+        # idempotently already there. IAM policy partitions are keyed
+        # directly by ``partition_key`` (not the generic hashed name
+        # ``ensure_partition_exists`` builds for data partitions), so
+        # ``ensure_policy_partition`` is called directly here rather than
+        # through that generic helper.
+        from .postgres_policy_storage import PostgresPolicyStorage
 
-            if isinstance(self.storage, PostgresPolicyStorage):
+        if isinstance(self.storage, PostgresPolicyStorage):
+            async with managed_transaction(self._engine) as ddl_conn:
                 await self.storage.ensure_policy_partition(
-                    conn, policy.partition_key, schema=schema
+                    ddl_conn, policy.partition_key, schema=schema
                 )
 
+        async with managed_transaction(self._engine) as conn:
             # 2. Check for duplicate IDs in the target partition. Filtering
             # by partition is required: the same id can exist across
             # partitions (e.g., default policies seeded into both
@@ -626,10 +687,18 @@ class PolicyService:
             and resolve_grants is not None
         ):
             try:
+                # Resolve collection external_id → internal id before querying
+                # grants, so the WHERE resource_ref comparison matches the
+                # internal id stored at write time.  Fails gracefully: on any
+                # resolution error the original value is used (no widening —
+                # the query returns fewer rows, not more).
+                collection_internal_id = await self._resolve_collection_internal_id(
+                    catalog_id, collection_id
+                )
                 grant_rows = await resolve_grants(
                     principal_id=principal_id,
                     catalog_schema=schema,
-                    collection_id=collection_id,
+                    collection_id=collection_internal_id,
                 )
                 # Build a role→grant-row lookup so the role-fanout below
                 # can stamp grant identity (id / scope / validity) on

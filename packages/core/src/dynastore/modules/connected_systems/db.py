@@ -26,12 +26,14 @@ from modules/styles/db.py.
 import json
 import logging
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
+from dateutil.parser import isoparse
 from sqlalchemy import text
 
 from dynastore.models.shared_models import Link
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 
 from .models import (
     DataStream,
@@ -77,18 +79,29 @@ _get_system_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
-_list_systems_query = DQLQuery(
-    """
-    SELECT id, catalog_id, system_id, name, description, type,
+_LIST_SYSTEMS_SQL = """
+    SELECT COUNT(*) OVER() AS total_count,
+           id, catalog_id, system_id, name, description, type,
            ST_AsGeoJSON(geometry)::jsonb AS geometry,
            properties, stac_collection_id, created_at, updated_at
     FROM consys.systems
     WHERE catalog_id = :catalog_id
     ORDER BY system_id
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+    """
+
+_LIST_SYSTEMS_BY_BBOX_SQL = """
+    SELECT COUNT(*) OVER() AS total_count,
+           id, catalog_id, system_id, name, description, type,
+           ST_AsGeoJSON(geometry)::jsonb AS geometry,
+           properties, stac_collection_id, created_at, updated_at
+    FROM consys.systems
+    WHERE catalog_id = :catalog_id
+      AND geometry IS NOT NULL
+      AND ST_Intersects(geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))
+    ORDER BY system_id
+    LIMIT :limit OFFSET :offset;
+    """
 
 _delete_system_query = DQLQuery(
     "DELETE FROM consys.systems WHERE catalog_id = :catalog_id AND id = :system_uuid;",
@@ -201,18 +214,78 @@ _create_observation_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
-_list_observations_query = DQLQuery(
+def _build_observations_sql(
+    datetime_str: Optional[str],
+    bbox: Optional[Tuple[float, float, float, float]],
+) -> Tuple[str, dict]:
+    """Build the WHERE clause and extra bind params for an observations list query.
+
+    Returns ``(sql_string, extra_params)`` where the SQL string embeds all
+    optional filter clauses so it can be passed directly to ``DQLQuery``.
+    The base params (catalog_id, datastream_id, limit, offset) are NOT included
+    in ``extra_params`` — the caller merges them before calling ``execute``.
     """
-    SELECT o.id, o.catalog_id, o.datastream_id, o.phenomenon_time, o.result_time,
-           o.result_value, o.result_quality, o.parameters
-    FROM consys.observations o
-    JOIN consys.datastreams ds ON ds.id = o.datastream_id AND ds.catalog_id = o.catalog_id
-    WHERE ds.catalog_id = :catalog_id AND ds.datastream_id = :datastream_id
-    ORDER BY o.phenomenon_time DESC
-    LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+    conditions: List[str] = [
+        "ds.catalog_id = :catalog_id",
+        "ds.datastream_id = :datastream_id",
+    ]
+    extra: dict = {}
+    needs_systems_join = False
+
+    if datetime_str:
+        if "/" in datetime_str:
+            start_str, end_str = datetime_str.split("/", 1)
+            start_dt = isoparse(start_str) if start_str != ".." else None
+            end_dt = isoparse(end_str) if end_str != ".." else None
+            if start_dt and end_dt:
+                conditions.append("o.phenomenon_time >= :start_dt")
+                conditions.append("o.phenomenon_time <= :end_dt")
+                extra["start_dt"] = start_dt
+                extra["end_dt"] = end_dt
+            elif start_dt:
+                conditions.append("o.phenomenon_time >= :start_dt")
+                extra["start_dt"] = start_dt
+            elif end_dt:
+                conditions.append("o.phenomenon_time <= :end_dt")
+                extra["end_dt"] = end_dt
+        else:
+            dt = isoparse(datetime_str)
+            conditions.append("o.phenomenon_time = :dt")
+            extra["dt"] = dt
+
+    if bbox is not None:
+        xmin, ymin, xmax, ymax = bbox
+        conditions.append("s.geometry IS NOT NULL")
+        conditions.append(
+            "ST_Intersects(s.geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))"
+        )
+        extra["xmin"] = xmin
+        extra["ymin"] = ymin
+        extra["xmax"] = xmax
+        extra["ymax"] = ymax
+        needs_systems_join = True
+
+    where_clause = " AND ".join(conditions)
+    systems_join = (
+        "JOIN consys.systems s ON s.id = ds.system_id AND s.catalog_id = ds.catalog_id"
+        if needs_systems_join
+        else ""
+    )
+
+    sql = (
+        f"""
+        SELECT o.id, o.catalog_id, o.datastream_id, o.phenomenon_time, o.result_time,
+               o.result_value, o.result_quality, o.parameters
+        FROM consys.observations o
+        JOIN consys.datastreams ds ON ds.id = o.datastream_id AND ds.catalog_id = o.catalog_id
+        {systems_join}
+        WHERE {where_clause}
+        ORDER BY o.phenomenon_time DESC
+        LIMIT :limit OFFSET :offset;
+        """
+    )
+    return sql, extra
+
 
 # ---------------------------------------------------------------------------
 # Row-to-model helpers
@@ -297,11 +370,24 @@ async def list_systems(
     catalog_id: str,
     limit: int = 100,
     offset: int = 0,
-) -> List[System]:
-    rows = await _list_systems_query.execute(
-        conn, catalog_id=catalog_id, limit=limit, offset=offset
-    )
-    return [s for r in rows if (s := _system_from_row(r)) is not None]
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> Tuple[List[System], int]:
+    """Page systems for a catalog. Returns ``(systems, total)``."""
+    if bbox is not None:
+        xmin, ymin, xmax, ymax = bbox
+        rows, total = await list_page_with_count(
+            conn,
+            _LIST_SYSTEMS_BY_BBOX_SQL,
+            {"catalog_id": catalog_id, "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax},
+            limit=limit,
+            offset=offset,
+        )
+    else:
+        rows, total = await list_page_with_count(
+            conn, _LIST_SYSTEMS_SQL, {"catalog_id": catalog_id}, limit=limit, offset=offset
+        )
+    systems = [s for r in rows if (s := _system_from_row(r)) is not None]
+    return systems, total
 
 
 async def update_system(
@@ -319,7 +405,7 @@ async def update_system(
             if k == "geometry":
                 set_parts.append("geometry = ST_GeomFromGeoJSON(:geometry)")
             elif k == "properties":
-                set_parts.append(f'"properties" = CAST(:properties AS jsonb)')
+                set_parts.append('"properties" = CAST(:properties AS jsonb)')
             else:
                 set_parts.append(f'"{k}" = :{k}')
         set_clause = ", ".join(set_parts)
@@ -477,12 +563,17 @@ async def list_observations(
     datastream_id: str,
     limit: int = 100,
     offset: int = 0,
+    datetime: Optional[str] = None,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> List[Observation]:
-    rows = await _list_observations_query.execute(
+    sql, extra_params = _build_observations_sql(datetime, bbox)
+    query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
+    rows = await query.execute(
         conn,
         catalog_id=catalog_id,
         datastream_id=datastream_id,
         limit=limit,
         offset=offset,
+        **extra_params,
     )
     return [o for r in rows if (o := _observation_from_row(r)) is not None]

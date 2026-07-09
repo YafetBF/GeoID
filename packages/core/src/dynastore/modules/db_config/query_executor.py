@@ -29,6 +29,20 @@ import os
 import time
 from abc import abstractmethod, ABC
 from contextlib import asynccontextmanager, contextmanager
+
+from dynastore.modules.db_config.connection_health_config import (
+    resolve_connection_retry_config,
+    resolve_foreground_pool_acquire_timeout,
+    resolve_lease_pool_acquire_timeout_seconds,
+    resolve_max_background_db_concurrency,
+    resolve_max_concurrent_connection_retries,
+    resolve_pool_acquire_warn_seconds,
+    resolve_pool_hygiene_reacquire_attempts,
+    resolve_pool_saturation_retry_after_seconds,
+    resolve_provisioning_retry_config,
+    resolve_read_disconnect_retry_attempts,
+    resolve_slow_pool_acquire_threshold,
+)
 from sqlalchemy import text, DDL
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.base import Connection as SAConnection
@@ -48,11 +62,13 @@ from sqlalchemy.exc import (
     OperationalError,
     PendingRollbackError,
     InvalidRequestError,
+    TimeoutError as SAPoolTimeoutError,
 )
 from geoalchemy2.shape import to_shape
 from geoalchemy2.elements import WKBElement, WKTElement
 from sqlalchemy import Table, MetaData
 from typing import (
+    AsyncIterator,
     Iterator,
     Union,
     List,
@@ -74,6 +90,7 @@ from .exceptions import (
     QueryExecutionError,
     PGCODE_EXCEPTION_MAP,
     DatabaseConnectionError,
+    PoolSaturationError,
 )
 
 # InternalClientError carries asyncpg's "cannot switch to state N" — a wire
@@ -84,10 +101,12 @@ try:
     from asyncpg.exceptions import (
         ConnectionDoesNotExistError as AsyncpgConnectionDoesNotExistError,
         InternalClientError as AsyncpgInternalClientError,
+        InterfaceError as AsyncpgInterfaceError,
     )
 except ImportError:
     AsyncpgConnectionDoesNotExistError = type("AsyncpgConnectionDoesNotExistError", (Exception,), {})
     AsyncpgInternalClientError = type("AsyncpgInternalClientError", (Exception,), {})
+    AsyncpgInterfaceError = type("AsyncpgInterfaceError", (Exception,), {})
 
 
 # Class names of asyncpg client-side errors that indicate transient connection
@@ -110,18 +129,175 @@ _TRANSIENT_ASYNCPG_MESSAGE_FRAGMENTS = (
 
 
 def _is_transient_asyncpg_error(exc: Optional[BaseException]) -> bool:
-    """Return True if ``exc`` is an asyncpg transient client-state error.
+    """Return True if ``exc`` is an asyncpg transient error safe to retry.
 
-    Detected by class name (avoids hard import dependency on asyncpg) plus
-    message-fragment fallback for nested wraps.  See exception taxonomy in
-    issues #235 / #239.
+    Covers:
+    - ``InterfaceError`` (connection factory not ready during DB warm-up)
+    - ``ConnectionDoesNotExistError`` (server terminated the connection)
+    - ``InternalClientError`` (internal asyncpg state machine error)
+    - Any exception with message containing known transient fragments.
+
+    Used by :func:`retry_on_transient_connect` to decide whether to retry
+    a failed connection acquisition, and by the cancel-drain path in
+    :func:`managed_transaction` to decide whether to invalidate a dead wire.
     """
     if exc is None:
         return False
-    if type(exc).__name__ in _TRANSIENT_ASYNCPG_ERROR_CLASS_NAMES:
+    # asyncpg raises its own exception hierarchy for transient failures.
+    # SQLAlchemy wraps these inside DBAPIError with .orig set to the asyncpg exc.
+    if isinstance(
+        exc,
+        (
+            AsyncpgInterfaceError,
+            AsyncpgConnectionDoesNotExistError,
+            AsyncpgInternalClientError,
+        ),
+    ):
         return True
+    # Check wrapped exceptions (SQLAlchemy DBAPIError.orig)
+    if isinstance(
+        getattr(exc, "orig", None),
+        (
+            AsyncpgInterfaceError,
+            AsyncpgConnectionDoesNotExistError,
+            AsyncpgInternalClientError,
+        ),
+    ):
+        return True
+    # Fallback: message matching for cases where the exception class is not
+    # directly importable or is wrapped in an unexpected way.
     msg = str(exc)
     return any(fragment in msg for fragment in _TRANSIENT_ASYNCPG_MESSAGE_FRAGMENTS)
+
+
+def _is_autocommit_connection(conn: Any) -> bool:
+    """Detect if connection has AUTOCOMMIT isolation level.
+
+    AUTOCOMMIT connections have no active PostgreSQL transaction, so
+    attempting begin_nested() (SAVEPOINT) raises NoActiveSQLTransactionError.
+
+    This function checks SQLAlchemy's execution_options for isolation_level.
+    Works for both async (AsyncConnection) and sync (Connection) paths.
+
+    Args:
+        conn: SQLAlchemy connection (async or sync)
+
+    Returns:
+        True if connection is in AUTOCOMMIT mode, False otherwise.
+    """
+    # Check async connection's execution_options
+    exec_opts = getattr(conn, "_execution_options", None)
+    if exec_opts and exec_opts.get("isolation_level") == "AUTOCOMMIT":
+        return True
+
+    # For sync connections, check the underlying connection
+    sync_conn = getattr(conn, "sync_connection", None) or getattr(conn, "connection", None)
+    if sync_conn:
+        exec_opts = getattr(sync_conn, "_execution_options", None)
+        if exec_opts and exec_opts.get("isolation_level") == "AUTOCOMMIT":
+            return True
+
+    return False
+
+
+# --- Lock-not-available detection (pgcode 55P03) ----------------------------
+# Covers both the async asyncpg path (LockNotAvailableError class) and the
+# sync psycopg2 path (OperationalError wrapping pgcode 55P03 in its .orig).
+# Used by ``is_transient_db_error`` for the provisioning retry wrapper.
+
+_LOCK_NOT_AVAILABLE_PGCODE = "55P03"
+_LOCK_NOT_AVAILABLE_CLASS_NAMES = frozenset({"LockNotAvailableError"})
+_LOCK_TIMEOUT_MESSAGE_FRAGMENTS = (
+    "canceling statement due to lock timeout",
+    "lock timeout",
+)
+
+
+def _is_lock_not_available_error(exc: Optional[BaseException]) -> bool:
+    """Return True if ``exc`` is a PG lock-not-available / lock-timeout error (55P03).
+
+    Walks the ``.orig`` / ``__cause__`` chain so asyncpg errors wrapped inside
+    SQLAlchemy ``DBAPIError`` are still detected.
+    """
+    if exc is None:
+        return False
+    if type(exc).__name__ in _LOCK_NOT_AVAILABLE_CLASS_NAMES:
+        return True
+    seen: set[int] = set()
+    candidate: Optional[BaseException] = exc
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        pgcode = getattr(candidate, "pgcode", None) or getattr(candidate, "sqlstate", None)
+        if pgcode == _LOCK_NOT_AVAILABLE_PGCODE:
+            return True
+        candidate = getattr(candidate, "orig", None) or getattr(candidate, "__cause__", None)
+    msg = str(exc)
+    return any(fragment in msg for fragment in _LOCK_TIMEOUT_MESSAGE_FRAGMENTS)
+
+
+def is_lock_not_available_error(exc: Optional[BaseException]) -> bool:
+    """Public alias of :func:`_is_lock_not_available_error`.
+
+    Exposed for callers outside this module that need to special-case a PG
+    lock-timeout (55P03) -- e.g. a foundational module's startup DDL deciding
+    whether losing an ``acquire_startup_lock`` race is safe to tolerate.
+    """
+    return _is_lock_not_available_error(exc)
+
+
+# --- Sync (psycopg2 / SQLAlchemy) closed-connection detection ----------------
+
+_SYNC_CLOSED_CONN_MESSAGE_FRAGMENTS = (
+    "server closed the connection",
+    "connection already closed",
+)
+
+
+def _is_sync_closed_connection_error(exc: Optional[BaseException]) -> bool:
+    """Return True for sync SQLAlchemy/psycopg2 connection-closed errors.
+
+    Matches only ``OperationalError`` with ``connection_invalidated=True`` (the
+    flag SQLAlchemy's pool sets on a detected disconnect) or one of the known
+    server-closed message fragments from psycopg2.  Generic ``OperationalError``
+    without these markers is NOT matched — it must surface as a real bug.
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, OperationalError):
+        if getattr(exc, "connection_invalidated", False):
+            return True
+        msg = str(exc)
+        return any(f in msg for f in _SYNC_CLOSED_CONN_MESSAGE_FRAGMENTS)
+    return False
+
+
+def is_transient_db_error(exc: Optional[BaseException]) -> bool:
+    """Return True if ``exc`` is a transient DB error safe to retry on a fresh connection.
+
+    Covers:
+    - Async asyncpg: ``InterfaceError``, ``ConnectionDoesNotExistError``,
+      ``InternalClientError``, "connection was closed" (via ``_is_transient_asyncpg_error``).
+    - Async asyncpg: ``LockNotAvailableError`` (pgcode 55P03 / lock timeout).
+    - Sync SQLAlchemy/psycopg2: ``OperationalError.connection_invalidated``,
+      "server closed the connection" / "connection already closed".
+    - Sync: lock timeout via pgcode 55P03 in the ``.orig`` chain.
+
+    Conservative by design: does NOT match a bare ``OperationalError`` without
+    the above markers, or any ``IntegrityError`` / ``ProgrammingError``.
+
+    Used exclusively by :func:`provisioning_write_with_retry`.  Existing callers
+    of ``_is_transient_asyncpg_error`` are unaffected.
+    """
+    if exc is None:
+        return False
+    orig = getattr(exc, "orig", None)
+    return (
+        _is_transient_asyncpg_error(exc)
+        or (orig is not None and _is_transient_asyncpg_error(orig))
+        or _is_lock_not_available_error(exc)
+        or (orig is not None and _is_lock_not_available_error(orig))
+        or _is_sync_closed_connection_error(exc)
+    )
 
 
 # PG SQLSTATEs that signal "object already exists" — fired when a concurrent
@@ -471,6 +647,13 @@ class FunctionQueryBuilder(QueryBuilderStrategy):
 class BaseExecutor:
     """Core executor logic with wire serialization and post-processing."""
 
+    # Subclasses that are safe to retry on a mid-flight connection disconnect
+    # should override this to True. DQLExecutor (read-only SELECT queries) sets
+    # it True; DDLExecutor (schema mutations) leaves it False. Writes that go
+    # through DQLExecutor are always passed a caller-managed connection (not an
+    # engine), so they never reach the engine-path retry branch.
+    _retry_read_on_disconnect: bool = False
+
     def __init__(
         self,
         query_builder_strategy: QueryBuilderStrategy,
@@ -502,8 +685,56 @@ class BaseExecutor:
 
     def _execute_sync_workflow(self, db_resource, raw_params):
         if isinstance(db_resource, Engine):
-            with db_resource.connect() as conn:
-                return self._build_and_execute_sync(conn, raw_params)
+            # Read the attempt budget from ConnectionHealthConfig (hot-reloadable).
+            # The sync path uses the module-global fallback resolver (no async
+            # config service to await); writes/DDL never retry so they skip the
+            # lookup entirely and run exactly once.
+            attempts = (
+                resolve_read_disconnect_retry_attempts()
+                if self._retry_read_on_disconnect
+                else 1
+            )
+            for attempt in range(attempts):
+                conn = db_resource.connect()
+                try:
+                    result = self._build_and_execute_sync(conn, raw_params)
+                    conn.close()
+                    return result
+                except DatabaseConnectionError as exc:
+                    # Dead wire — invalidate so the pool evicts it, then close.
+                    try:
+                        conn.invalidate()
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception as close_exc:
+                        logger.warning(
+                            "query_executor: conn.close() (sync) failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    if self._retry_read_on_disconnect and attempt < attempts - 1:
+                        logger.warning(
+                            "db_config: read connection died mid-flight (%s); "
+                            "retrying on fresh connection (attempt %d/%d)",
+                            exc,
+                            attempt + 1,
+                            attempts,
+                        )
+                        continue
+                    raise
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception as close_exc:
+                        logger.warning(
+                            "query_executor: conn.close() (sync) failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    raise
+            raise AssertionError(  # pragma: no cover
+                "Unexpected exit from _execute_sync_workflow retry loop"
+            )
         return self._build_and_execute_sync(db_resource, raw_params)
 
     async def _execute_async_workflow(self, db_resource: DbAsyncResource, raw_params):
@@ -513,28 +744,70 @@ class BaseExecutor:
             # so transient pool/connect failures (DB warming, OperationalError,
             # asyncio.TimeoutError, OSError) trigger bounded retry instead of
             # crashing the caller's lifespan / request.
-            conn = await _acquire_async_engine_connection(db_resource)
-            try:
-                async with _connection_lock_scope(conn):
-                    result = await self._build_and_execute_async(conn, raw_params)
-                    # Paranoid cleanup: ensure no transaction lingers before return to pool
-                    # This helps with StaticPool where the wire is reused immediately
-                    if conn.in_transaction():
-                        await conn.rollback()
-                    await conn.close()
-                    return result
-            except Exception:
-                # Ensure closed if something failed
+            #
+            # Additionally, DQLExecutor sets _retry_read_on_disconnect=True so
+            # that a TOCTOU kill (connection passes pool_pre_ping at checkout,
+            # then dies before the execute reaches PG) is recovered by acquiring
+            # a fresh wire and re-running the read — safe because a read has no
+            # side-effects. Writes and DDL leave the flag False and do not retry.
+            #
+            # The attempt budget is read live from ConnectionHealthConfig via the
+            # central cached getter, so operators can raise/lower it without a pod
+            # restart. Writes skip the lookup and run exactly once.
+            attempts = (
+                await _read_live_read_disconnect_retry_attempts()
+                if self._retry_read_on_disconnect
+                else 1
+            )
+            for attempt in range(attempts):
+                conn = await _acquire_async_engine_connection(db_resource)
                 try:
-                    await conn.close()
-                except Exception as close_exc:
-                    # Connection is likely dead; log so operators can correlate
-                    # pool-slot leaks with the originating error.
-                    logger.warning(
-                        "query_executor: conn.close() failed during error cleanup: %s",
-                        close_exc,
-                    )
-                raise
+                    async with _connection_lock_scope(conn):
+                        result = await self._build_and_execute_async(conn, raw_params)
+                        # Paranoid cleanup: ensure no transaction lingers before return to pool
+                        # This helps with StaticPool where the wire is reused immediately
+                        if conn.in_transaction():
+                            await conn.rollback()
+                        await conn.close()
+                        return result
+                except DatabaseConnectionError as exc:
+                    # Dead wire — invalidate so the pool evicts it, then close.
+                    try:
+                        await conn.invalidate()
+                    except Exception:
+                        pass
+                    try:
+                        await conn.close()
+                    except Exception as close_exc:
+                        logger.warning(
+                            "query_executor: conn.close() failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    if self._retry_read_on_disconnect and attempt < attempts - 1:
+                        logger.warning(
+                            "db_config: read connection died mid-flight (%s); "
+                            "retrying on fresh connection (attempt %d/%d)",
+                            exc,
+                            attempt + 1,
+                            attempts,
+                        )
+                        continue
+                    raise
+                except Exception:
+                    # Ensure closed if something else failed (not a retryable disconnect)
+                    try:
+                        await conn.close()
+                    except Exception as close_exc:
+                        # Connection is likely dead; log so operators can correlate
+                        # pool-slot leaks with the originating error.
+                        logger.warning(
+                            "query_executor: conn.close() failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    raise
+            raise AssertionError(  # pragma: no cover
+                "Unexpected exit from _execute_async_workflow retry loop"
+            )
         return await self._build_and_execute_async(db_resource, raw_params)
 
     async def stream_async_workflow(self, db_resource, raw_params):
@@ -599,6 +872,16 @@ class BaseExecutor:
                 "Transient asyncpg client error",
                 original_exception=original_exc,
             ) from e
+        # Sync psycopg2 mid-flight disconnect: SQLAlchemy wraps it as an
+        # OperationalError with connection_invalidated=True (or a known
+        # server-closed message). It carries no pgcode, so it reaches here.
+        # Surface it as DatabaseConnectionError too, so the sync engine-path
+        # read-disconnect retry can recover it — symmetric with the async path.
+        if _is_sync_closed_connection_error(e) or _is_sync_closed_connection_error(original_exc):
+            raise DatabaseConnectionError(
+                "Sync connection closed mid-operation",
+                original_exception=original_exc,
+            ) from e
         raise QueryExecutionError(
             "Database query failed.", original_exception=original_exc
         ) from e
@@ -632,6 +915,13 @@ class BaseExecutor:
 
 
 class DQLExecutor(BaseExecutor):
+    # DQL = SELECT queries are pure reads: safe to re-run on a fresh connection
+    # if the previous wire died between pool checkout and execute (TOCTOU).
+    # Writes that incidentally go through DQLExecutor always pass a caller-
+    # managed connection (not an AsyncEngine), so they never reach the retry
+    # branch in _execute_async_workflow.
+    _retry_read_on_disconnect = True
+
     def __init__(self, query_builder_strategy, result_handler, **kwargs):
         super().__init__(query_builder_strategy, **kwargs)
         self.result_handler = result_handler
@@ -1148,11 +1438,390 @@ _TRANSIENT_CONNECT_EXCEPTIONS: tuple = (
 )
 
 
+# --- Pool-pressure semaphore (issue #2509) ------------------------------------
+#
+# Bounds the number of *concurrent* connection-acquisition retries so a pool
+# wedge cannot be amplified by a thundering herd of simultaneous retriers.
+#
+# Design:
+# - The semaphore is created lazily on the first retry attempt so asyncio's
+#   event loop is guaranteed to exist at construction time.
+# - The limit is read **per-call** from ``ConnectionHealthConfig`` via the
+#   central ``PlatformConfigsProtocol`` L1-cached getter so operators can
+#   change the cap without restarting pods.  Falls back to the module-global
+#   ``_max_concurrent_connection_retries`` when the config service is
+#   unavailable (tests, early startup).
+# - A resize-on-change holder tracks the limit the current semaphore was
+#   sized with.  When the configured limit differs, a fresh semaphore is
+#   built.  In-flight holders of the old semaphore are unaffected and
+#   release normally; new retriers get the updated gate.
+# - Only retries (attempt >= 1) are gated; the first attempt is never gated so
+#   the happy path retains zero overhead.
+# - Deadlock safety: the semaphore is acquired only when the previous connection
+#   attempt has already failed (i.e., no pool connection is held by the caller).
+#   Therefore a coroutine can never hold a DB connection and simultaneously block
+#   on the retry semaphore — the two resources are mutually exclusive in time.
+# - Tests may replace ``_retry_semaphore`` / ``_retry_semaphore_limit`` with
+#   None / 0 to reset state between runs; the module-global
+#   ``_max_concurrent_connection_retries`` may also be overridden directly
+#   (same pattern as other infra globals in ``connection_health_config``).
+_retry_semaphore: Optional[asyncio.Semaphore] = None
+_retry_semaphore_limit: int = 0  # limit the current semaphore was sized with
+
+
+async def _get_retry_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide connection-retry concurrency semaphore.
+
+    Reads the configured limit live from ``ConnectionHealthConfig`` via the
+    central cached config getter (L1 in-memory, cheap per call).  Rebuilds
+    the semaphore when the limit changes so operators can adjust the cap
+    without a pod restart.  Falls back to
+    :func:`resolve_max_concurrent_connection_retries` (module-global default)
+    when the config service is unavailable.
+    """
+    global _retry_semaphore, _retry_semaphore_limit
+    limit = await _read_live_retry_limit()
+    if _retry_semaphore is None or _retry_semaphore_limit != limit:
+        _retry_semaphore = asyncio.Semaphore(limit)
+        _retry_semaphore_limit = limit
+    return _retry_semaphore
+
+
+async def _read_live_retry_limit() -> int:
+    """Read ``ConnectionHealthConfig.max_concurrent_connection_retries`` live."""
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.max_concurrent_connection_retries
+    except Exception:
+        pass
+    return resolve_max_concurrent_connection_retries()
+
+
+async def _read_live_read_disconnect_retry_attempts() -> int:
+    """Read ``ConnectionHealthConfig.read_disconnect_retry_attempts`` live.
+
+    Mirrors :func:`_read_live_retry_limit`: per-call read from the central
+    cached config getter so operators can change the read-disconnect retry
+    budget without a pod restart. Falls back to
+    :func:`resolve_read_disconnect_retry_attempts` (module-global default) when
+    the config service is unavailable (tests, early startup).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.read_disconnect_retry_attempts
+    except Exception:
+        pass
+    return resolve_read_disconnect_retry_attempts()
+
+
+async def _read_live_pool_hygiene_reacquire_attempts() -> int:
+    """Read ``ConnectionHealthConfig.pool_hygiene_reacquire_attempts`` live.
+
+    Per-call read from the central cached config getter so operators can adjust
+    the poison-storm self-heal budget without a pod restart. Falls back to
+    :func:`resolve_pool_hygiene_reacquire_attempts` (module-global default)
+    when the config service is unavailable (tests, early startup).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.pool_hygiene_reacquire_attempts
+    except Exception:
+        pass
+    return resolve_pool_hygiene_reacquire_attempts()
+
+
+# --- Background maintenance concurrency semaphore (#2582) ---------------------
+#
+# Bounds the number of *concurrent* DB connection checkouts made by background
+# maintenance tasks (proactive sweep, stuck-pending warner, maintenance
+# supervisor, wedged-provisioning sweep).  Under a burst of concurrent catalog
+# provisions the shared pool (default 10 connections) was saturated by
+# background tasks, starving foreground tile requests for the full 30 s pool
+# timeout.
+#
+# Design mirrors the retry semaphore above:
+# - Lazy creation; sized from ConnectionHealthConfig.max_background_db_concurrency
+#   (default 2) read live per call so operators can adjust without a pod restart.
+# - Rebuild-on-change: a fresh semaphore replaces the old one when the limit
+#   changes; in-flight holders of the old semaphore release normally.
+# - Semaphore-acquisition timeout (_BG_SEMAPHORE_WAIT_S): a background task
+#   that cannot get a slot within this window degrades (raises, caught by
+#   callers' except-and-skip handlers) rather than queuing for the full pool
+#   timeout.  2 s is enough for an in-flight background checkout to finish a
+#   typical fast query (< 100 ms) while being much shorter than pool_acquire_
+#   timeout (30 s).
+# - Only background_managed_transaction callers are gated; foreground
+#   managed_transaction callers are unaffected.
+_bg_semaphore: Optional[asyncio.Semaphore] = None
+_bg_semaphore_limit: int = 0
+_BG_SEMAPHORE_WAIT_S: float = 2.0
+
+
+async def _get_bg_semaphore() -> asyncio.Semaphore:
+    """Return the background maintenance concurrency semaphore.
+
+    Reads the configured limit live from ``ConnectionHealthConfig`` via the
+    central cached config getter (L1 in-memory, cheap per call).  Rebuilds
+    the semaphore when the limit changes so operators can adjust the cap
+    without a pod restart.  Falls back to
+    :func:`resolve_max_background_db_concurrency` (module-global default)
+    when the config service is unavailable.
+    """
+    global _bg_semaphore, _bg_semaphore_limit
+    limit = await _read_live_bg_concurrency_limit()
+    if _bg_semaphore is None or _bg_semaphore_limit != limit:
+        _bg_semaphore = asyncio.Semaphore(limit)
+        _bg_semaphore_limit = limit
+    return _bg_semaphore
+
+
+async def _read_live_bg_concurrency_limit() -> int:
+    """Read ``ConnectionHealthConfig.max_background_db_concurrency`` live."""
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.max_background_db_concurrency
+    except Exception:
+        pass
+    return resolve_max_background_db_concurrency()
+
+
+async def _read_live_fg_acquire_timeout() -> float:
+    """Read ``ConnectionHealthConfig.foreground_pool_acquire_timeout_s`` live.
+
+    Per-call read from the central cached config getter so operators can change
+    the tile-request fail-fast timeout without a pod restart.  Falls back to
+    :func:`resolve_foreground_pool_acquire_timeout` when the config service is
+    unavailable.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.foreground_pool_acquire_timeout_s
+    except Exception:
+        pass
+    return resolve_foreground_pool_acquire_timeout()
+
+
+async def _read_live_lease_pool_acquire_timeout() -> float:
+    """Read ``ConnectionHealthConfig.lease_pool_acquire_timeout_s`` live.
+
+    Per-call read from the central cached config getter so operators can tune
+    the lease CAS pool-acquire fail-fast bound without a pod restart. Falls
+    back to :func:`resolve_lease_pool_acquire_timeout_seconds` when the config
+    service is unavailable.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.lease_pool_acquire_timeout_s
+    except Exception:
+        pass
+    return resolve_lease_pool_acquire_timeout_seconds()
+
+
+async def _read_live_pool_saturation_retry_after() -> int:
+    """Read ``ConnectionHealthConfig.pool_saturation_retry_after_seconds`` live.
+
+    Per-call read from the central cached config getter (#1894) so operators
+    can tune the Retry-After hint returned on a saturated DB pool without a
+    pod restart. Falls back to
+    :func:`resolve_pool_saturation_retry_after_seconds` when the config
+    service is unavailable.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.pool_saturation_retry_after_seconds
+    except Exception:
+        pass
+    return resolve_pool_saturation_retry_after_seconds()
+
+
+@asynccontextmanager
+async def background_managed_transaction(db_resource: Optional[DbResource]):
+    """Like :func:`managed_transaction` but gated by the background semaphore.
+
+    Limits concurrent DB connection checkouts from background maintenance tasks
+    to ``max_background_db_concurrency`` (default 2), structurally reserving
+    the remaining pool slots for foreground requests.
+
+    On semaphore-acquisition timeout (``_BG_SEMAPHORE_WAIT_S`` = 2 s), raises
+    ``asyncio.TimeoutError`` so the caller's ``except Exception`` handler can
+    log a degradation warning and skip this maintenance pass.  The task never
+    blocks the event loop for the full pool_acquire_timeout (30 s).
+
+    Usage: a drop-in replacement for ``managed_transaction`` in background
+    maintenance loops.  Foreground handlers must keep using
+    ``managed_transaction`` (or the engine-begin path in dependencies) directly
+    so they are unaffected by the background semaphore.
+
+    Deadlock safety: the semaphore is acquired BEFORE touching the pool, so no
+    coroutine can simultaneously hold a DB connection and block on the semaphore.
+    Sequential checkouts within one tick each acquire-and-release independently
+    so one tick does not pin a slot for its full duration.
+
+    Tests may replace ``_bg_semaphore`` / ``_bg_semaphore_limit`` with
+    ``None`` / ``0`` to reset state between runs; ``_max_background_db_concurrency``
+    in ``connection_health_config`` may also be overridden directly to control the
+    fallback limit.
+    """
+    sem = await _get_bg_semaphore()
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=_BG_SEMAPHORE_WAIT_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "background_managed_transaction: background semaphore saturated "
+            "(max_background_db_concurrency=%d) — skipping this checkout.",
+            _bg_semaphore_limit,
+        )
+        raise
+    try:
+        async with managed_transaction(db_resource) as conn:
+            yield conn
+    finally:
+        sem.release()
+
+
+def _err_repr(exc: BaseException) -> str:
+    """One-line representation of an exception for structured log lines."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+async def _run_with_retry_policy(
+    call: "Callable[[], Awaitable[Any]]",
+    *,
+    classify: "Callable[[BaseException], bool]",
+    kind: str,
+    max_attempts: int,
+    compute_delay: "Callable[[int, BaseException], float]",
+    level: int = logging.WARNING,
+    log_exhaustion: bool = False,
+) -> Any:
+    """Private async retry core shared by all retry wrappers in this module.
+
+    Not part of the public API — use :func:`retry_on_transient_connect` or
+    :func:`provisioning_write_with_retry`.
+
+    Emits one unified per-attempt log line at ``level`` (default WARNING):
+
+        retry attempt=N/M kind=<domain> backoff_s=F err=<Type>: <msg>
+
+    A single GCP log-based metric expression on the TEXT covers all retry
+    sites regardless of per-site severity. Callers choose the level to
+    preserve their existing log-flood characteristics.
+
+    When ``log_exhaustion`` is True, emits an additional WARNING on the
+    final failed attempt before re-raising so operators can identify
+    exhausted retry budgets independently of exception tracing.
+
+    :param call: Zero-arg async thunk to attempt on each iteration.
+    :param classify: Return True for exceptions safe to retry; non-matching
+        exceptions propagate immediately without consuming retry budget.
+    :param kind: Domain tag for the log line (e.g. ``"db_connect"``).
+    :param max_attempts: Total attempts (1 = no retry).
+    :param compute_delay: ``(attempt, exc) -> float`` backoff in seconds,
+        called only for non-final attempts.
+    :param level: Log level for per-attempt retry lines (default WARNING).
+    :param log_exhaustion: If True, emit an extra WARNING when all attempts
+        are consumed before re-raising the final exception.
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            return await call()
+        except BaseException as exc:
+            if not classify(exc):
+                raise
+            last = exc
+            if attempt == max_attempts - 1:
+                if log_exhaustion:
+                    logger.warning(
+                        "retry exhausted attempts=%d kind=%s err=%s",
+                        max_attempts,
+                        kind,
+                        _err_repr(exc),
+                    )
+                raise
+            delay = compute_delay(attempt, exc)
+            logger.log(
+                level,
+                "retry attempt=%d/%d kind=%s backoff_s=%.2f err=%s",
+                attempt + 1,
+                max_attempts,
+                kind,
+                delay,
+                _err_repr(exc),
+            )
+            await asyncio.sleep(delay)
+    assert last is not None
+    raise last
+
+
 def retry_on_transient_connect(
-    max_retries: int = 5,
-    base_delay: float = 0.5,
-    max_delay: float = 8.0,
-    jitter: float = 0.25,
+    max_retries: int | None = None,
+    base_delay: float | None = None,
+    max_delay: float | None = None,
+    jitter: float | None = None,
 ):
     """Retry a coroutine on transient connection-acquisition / DDL infra errors.
 
@@ -1169,49 +1838,74 @@ def retry_on_transient_connect(
 
     Only retries the exception types in :data:`_TRANSIENT_CONNECT_EXCEPTIONS`.
     Anything else propagates immediately so genuine bugs are not masked.
+
+    Configuration: Values are resolved from (1) explicit function parameters,
+    else (2) the module-global ``ConnectionRetryConfig`` defaults.
+    Resolved at CALL TIME. See :mod:`connection_health_config` for details.
     """
 
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            last_err: Optional[BaseException] = None
-            for attempt in range(max_retries):
-                try:
+            # Resolve config at call time so live config edits are picked up.
+            cfg_max_retries, cfg_base_delay, cfg_max_delay, cfg_jitter = resolve_connection_retry_config()
+            _max_retries = max_retries if max_retries is not None else cfg_max_retries
+            _base_delay = base_delay if base_delay is not None else cfg_base_delay
+            _max_delay = max_delay if max_delay is not None else cfg_max_delay
+            _jitter = jitter if jitter is not None else cfg_jitter
+
+            def _compute_delay(attempt: int, exc: BaseException) -> float:
+                delay = min(_base_delay * (2 ** attempt), _max_delay)
+                if _jitter:
+                    delay *= random.uniform(1.0 - _jitter, 1.0 + _jitter)
+                return delay
+
+            # Pool-pressure gate (issue #2509): bound the number of concurrent
+            # connection-acquisition retries so a pool wedge is not amplified by
+            # simultaneous retriers hammering the pool.
+            #
+            # The call counter lets the thunk distinguish the first attempt
+            # (ungated, preserving happy-path latency) from all retries (gated
+            # through the process-wide semaphore).  The semaphore is released
+            # after each attempt — including failed ones — so the slot becomes
+            # available to the next waiting coroutine while this one sleeps
+            # through its backoff delay.
+            #
+            # Deadlock safety: the semaphore is acquired only after a connection
+            # attempt has already failed (no pool connection is held at that
+            # point). A coroutine cannot simultaneously hold a DB connection and
+            # block on this semaphore, so no deadlock cycle is possible.
+            _call_n: list[int] = [0]
+
+            async def _gated_call() -> Any:
+                n = _call_n[0]
+                _call_n[0] += 1
+                if n == 0:
+                    # First attempt: ungated.  Happy path is zero-overhead.
                     return await func(*args, **kwargs)
-                except _TRANSIENT_CONNECT_EXCEPTIONS as exc:
-                    last_err = exc
-                    fn_mod = getattr(func, "__module__", "<unknown>")
-                    fn_name = getattr(func, "__qualname__", getattr(func, "__name__", "<fn>"))
-                    if attempt == max_retries - 1:
-                        # Terminal failure after exhausting retries — keep as WARNING
-                        # so real exhaustion remains visible in Cloud Logging.
-                        logger.warning(
-                            "retry_on_transient_connect: %s.%s exhausted %d attempts "
-                            "(%s: %s)",
-                            fn_mod, fn_name, max_retries,
-                            type(exc).__name__, exc,
-                        )
-                        raise
-                    delay = min(base_delay * (2 ** attempt), max_delay)
-                    if jitter:
-                        delay *= random.uniform(1.0 - jitter, 1.0 + jitter)
-                    # Demoted from WARNING → DEBUG (issue #486): per-attempt retries
-                    # under transient pool pressure flood Cloud Logging and mask the
-                    # actual root-cause signal. Terminal exhaustion above is the
-                    # WARNING that operators need to see.
-                    logger.debug(
-                        "retry_on_transient_connect: %s.%s attempt %d/%d failed "
-                        "(%s: %s); retrying in %.2fs",
-                        fn_mod, fn_name,
-                        attempt + 1,
-                        max_retries,
-                        type(exc).__name__,
-                        exc,
-                        delay,
+                # Retry attempt: acquire the pool-pressure gate before touching
+                # the pool again.  Check for saturation *before* awaiting so
+                # the log line appears at queue time, not after the wait.
+                sem = await _get_retry_semaphore()
+                if sem._value == 0:  # all permits taken — callers will queue
+                    logger.info(
+                        "retry_on_transient_connect_semaphore_saturated "
+                        "service=%s retry_n=%d",
+                        _SERVICE_NAME_FOR_METRICS,
+                        n,
                     )
-                    await asyncio.sleep(delay)
-            assert last_err is not None
-            raise last_err
+                async with sem:
+                    return await func(*args, **kwargs)
+
+            return await _run_with_retry_policy(
+                _gated_call,
+                classify=lambda e: isinstance(e, _TRANSIENT_CONNECT_EXCEPTIONS),
+                kind="db_connect",
+                max_attempts=_max_retries,
+                compute_delay=_compute_delay,
+                level=logging.DEBUG,
+                log_exhaustion=True,
+            )
 
         return wrapper
 
@@ -1221,8 +1915,9 @@ def retry_on_transient_connect(
 # M3 (issue #486): emit a structured log line on every async pool acquire so a
 # GCP log-based metric can compute db_pool_wait_seconds histograms per service
 # without needing a prometheus_client dep + scrape endpoint. INFO when slow,
-# DEBUG otherwise.
-_SLOW_POOL_ACQUIRE_THRESHOLD_S = 0.5
+# DEBUG otherwise. The threshold is read at call time via
+# ``resolve_slow_pool_acquire_threshold()`` so tests that override the module
+# global see the updated value immediately.
 
 
 def _resolve_service_name() -> str:
@@ -1279,20 +1974,56 @@ def _acquire_scope_suffix() -> str:
     return f" {s}" if s else ""
 
 
-async def _drain_rollback_exit(txn_cm: Any, exc: BaseException) -> None:
+async def _drain_rollback_exit(txn_cm: Any, exc: BaseException) -> bool:
     """Best-effort ROLLBACK drain used by :func:`managed_transaction` on
     the cancelled / exception exit path. Invokes the transaction context
     manager's ``__aexit__`` so SQLAlchemy emits the wire-level ROLLBACK,
     then swallows any error — the caller is already re-raising the
     original exception; a failed rollback must not mask it. See #628 for
     the IN_QUERY state-15 cascade this drain prevents.
+
+    Returns ``True`` if the drain completed cleanly, ``False`` if it
+    raised. The caller uses this to decide whether the connection's state
+    is verified enough to return to the pool, or must be invalidated
+    instead (#2900).
     """
     try:
         await txn_cm.__aexit__(type(exc), exc, exc.__traceback__)
+        return True
     except Exception as drain_exc:  # noqa: BLE001
         logger.debug(
             "managed_transaction: rollback drain failed: %s", drain_exc,
         )
+        return False
+
+
+def _format_pool_stats(engine: AsyncEngine) -> str:
+    """Best-effort pool occupancy snapshot for pool-acquire log lines (#2898).
+
+    A wedged/saturating pool otherwise produces log lines with no indication
+    of *how* saturated the pool was, making the outage invisible until a
+    request fails outright. Every attribute access is guarded -- some pool
+    implementations exercised in tests (``NullPool``, ``StaticPool``) do not
+    implement ``size()``/``checkedin()``/``checkedout()``/``overflow()``, and
+    a failure here must never break connection acquisition. Returns ``""``
+    when stats are unavailable.
+    """
+    try:
+        pool = getattr(engine, "pool", None)
+        if pool is None:
+            return ""
+        size = getattr(pool, "size", None)
+        checkedin = getattr(pool, "checkedin", None)
+        checkedout = getattr(pool, "checkedout", None)
+        overflow = getattr(pool, "overflow", None)
+        if not all(callable(f) for f in (size, checkedin, checkedout, overflow)):
+            return ""
+        return (
+            f" pool_size={size()} checkedin={checkedin()} "
+            f"checkedout={checkedout()} overflow={overflow()}"
+        )
+    except Exception:
+        return ""
 
 
 @retry_on_transient_connect()
@@ -1316,6 +2047,26 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
     t0 = time.monotonic()
     try:
         conn = await engine.connect()
+    except SAPoolTimeoutError as exc:
+        # The pool's bounded acquire wait (DBConfig.pool_acquire_timeout,
+        # #1894) elapsed with no free connection. Not in
+        # _TRANSIENT_CONNECT_EXCEPTIONS, so retry_on_transient_connect does
+        # not retry it — a saturated pool must fail fast, not wedge. Wrap in
+        # PoolSaturationError (carrying a live-config Retry-After hint) so
+        # the HTTP boundary maps it to a clean 503 instead of an opaque 500.
+        wait_s = time.monotonic() - t0
+        logger.warning(
+            "db_pool_acquire failed service=%s wait_seconds=%.4f saturated=true%s%s",
+            _SERVICE_NAME_FOR_METRICS, wait_s, _acquire_scope_suffix(),
+            _format_pool_stats(engine),
+        )
+        retry_after = await _read_live_pool_saturation_retry_after()
+        raise PoolSaturationError(
+            f"Database connection pool saturated after waiting {wait_s:.1f}s "
+            "for a free connection.",
+            original_exception=exc,
+            retry_after=retry_after,
+        ) from exc
     except BaseException:
         wait_s = time.monotonic() - t0
         logger.info(
@@ -1324,17 +2075,37 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         )
         raise
     wait_s = time.monotonic() - t0
-    if wait_s >= _SLOW_POOL_ACQUIRE_THRESHOLD_S:
+    slow_threshold_s = resolve_slow_pool_acquire_threshold()
+    # Deliberately the static resolver, not a live config read (#2908). This
+    # runs on EVERY successful acquire, including the very first one at cold
+    # boot. A live read here calls the central cached config getter, which
+    # on a cold cache queries the DB through this same acquire function --
+    # the outer call is still holding the central @cached wrapper's per-key
+    # asyncio.Lock, so the inner config-getter call awaits that same key's
+    # lock and the boot deadlocks silently right after the pool is
+    # established. Operators tune this threshold via a pod restart, not a
+    # live config write.
+    warn_threshold_s = resolve_pool_acquire_warn_seconds()
+    if wait_s >= warn_threshold_s:
+        # A successful-but-slow acquire crossing this threshold means the
+        # pool is sliding towards saturation -- surface it at WARNING with
+        # occupancy stats instead of letting it blend into the routine
+        # INFO line below.
+        logger.warning(
+            "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f%s%s",
+            _SERVICE_NAME_FOR_METRICS, wait_s, warn_threshold_s,
+            _acquire_scope_suffix(), _format_pool_stats(engine),
+        )
+    elif wait_s >= slow_threshold_s:
         logger.info(
             "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f%s",
-            _SERVICE_NAME_FOR_METRICS, wait_s, _SLOW_POOL_ACQUIRE_THRESHOLD_S,
+            _SERVICE_NAME_FOR_METRICS, wait_s, slow_threshold_s,
             _acquire_scope_suffix(),
         )
-    else:
-        logger.debug(
-            "db_pool_acquire service=%s wait_seconds=%.4f%s",
-            _SERVICE_NAME_FOR_METRICS, wait_s, _acquire_scope_suffix(),
-        )
+    # A fast acquire (below slow_threshold_s) is the overwhelmingly common
+    # case and carries no signal -- one line per successful checkout drowns
+    # the log. We deliberately emit nothing here; only slow (INFO) and
+    # saturating (WARNING) acquires are logged.
     try:
         try:
             await conn.rollback()
@@ -1349,16 +2120,36 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
             AsyncpgConnectionDoesNotExistError,
             AsyncpgInternalClientError,
         ) as exc:
-            wire_id = id(_get_wire_identity(conn))
-            logger.warning(
-                "managed_transaction pool-hygiene: invalidating poisoned "
-                "pooled connection wire_id=%s (%s)",
-                wire_id, exc.__class__.__name__,
-            )
-            await conn.invalidate()
-            await conn.close()
-            conn = await engine.connect()
-            await conn.rollback()
+            # A poisoned slot was returned from the pool. On a DB failover or
+            # restart, many pooled wires may be stale simultaneously (poison
+            # storm). Evict up to `budget` slots before giving up; each
+            # poisoned slot is invalidated+closed before the next is acquired.
+            budget = await _read_live_pool_hygiene_reacquire_attempts()
+            for attempt in range(1, budget + 1):
+                wire_id = id(_get_wire_identity(conn))
+                logger.warning(
+                    "managed_transaction pool-hygiene: invalidating poisoned "
+                    "pooled connection wire_id=%s (%s) attempt=%d/%d",
+                    wire_id, exc.__class__.__name__, attempt, budget,
+                )
+                await conn.invalidate()
+                await conn.close()
+                conn = await engine.connect()
+                try:
+                    await conn.rollback()
+                    break  # Clean slot acquired; proceed to return
+                except (
+                    PendingRollbackError,
+                    InvalidRequestError,
+                    AsyncpgConnectionDoesNotExistError,
+                    AsyncpgInternalClientError,
+                ) as next_exc:
+                    exc = next_exc
+                    # continue to next attempt
+            else:
+                # All budget slots were poisoned; let the outer handler
+                # invalidate+close the last acquired slot and propagate.
+                raise exc
         return conn
     except BaseException:
         # Invalidate before close so a wire that raised an asyncpg state-machine
@@ -1379,6 +2170,74 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
                 close_exc,
             )
         raise
+
+
+async def acquire_engine_connection_bounded(
+    engine: AsyncEngine, timeout_s: float
+) -> AsyncConnection:
+    """Pool-hygienized async connection, bounded by a fail-fast ``timeout_s``
+    shorter than the engine's own ``pool_timeout`` (#2933).
+
+    Delegates the actual checkout to :func:`_acquire_async_engine_connection`
+    so callers get the identical hygiene :func:`managed_transaction` gives
+    every other consumer (transient-connect retry, poisoned-slot eviction,
+    rollback-on-checkout). What this adds is a live-configurable deadline
+    shorter than the shared engine's ``pool_timeout`` -- useful for a
+    request path that wants to fail fast (and fall back, or return 503)
+    well before the global pool-acquire ceiling.
+
+    Deliberately a bare ``asyncio.wait_for`` -- NOT wrapped in
+    ``asyncio.shield``. An earlier version of this function shielded the
+    whole checkout to close a real but narrow leak: cancelling
+    ``engine.connect()`` while a *brand new* physical connection's asyncpg
+    handshake / dialect post-connect codec setup is in flight abandons an
+    already-open backend session rather than closing it (that window sits
+    outside SQLAlchemy's own connection-creation bookkeeping). That leak
+    is real, but only possible when the pool is BELOW its
+    ``pool_size + max_overflow`` ceiling, i.e. a new connection is actually
+    being created -- rare, and self-bounded by that ceiling.
+
+    Under genuine sustained saturation (every slot checked out, the actual
+    scenario this fail-fast guard exists for), a checkout never creates a
+    new connection at all -- it just waits on the pool's internal FIFO
+    queue (``AsyncAdaptedQueue.get()``, itself an
+    ``asyncio.wait_for(queue.get(), pool_timeout)``). A bare cancellation
+    there is clean: ``asyncio.Queue.get()`` removes its own waiter from the
+    FIFO on cancellation, so an abandoned attempt stops competing
+    immediately. Shielding the whole checkout traded the narrow handshake
+    leak for a worse failure mode here: every one of these (the common
+    case under real saturation) would instead leave a zombie checkout
+    registered in the FIFO for up to the full ``pool_timeout`` (tens of
+    seconds) -- far longer than this function's own ``timeout_s`` --
+    accumulating ahead of genuinely new requests and stealing connections
+    out from under them as they free up (priority inversion that
+    self-reinforces under sustained load, extending rather than relieving
+    an outage).
+
+    Net: a bare bounded wait accepts the rare, self-bounded handshake-
+    window leak in exchange for zero zombie accumulation in the case that
+    actually matters. See the accompanying integration tests for both
+    properties (single-timeout handshake-leak repro kept as a documented,
+    known tradeoff; sustained-saturation repeated-timeout test asserting no
+    pileup).
+    """
+    try:
+        return await asyncio.wait_for(
+            _acquire_async_engine_connection(engine), timeout=timeout_s
+        )
+    except TimeoutError:
+        logger.warning(
+            "db_pool_acquire failed service=%s wait_seconds=%.1f "
+            "fail_fast=true%s%s",
+            _SERVICE_NAME_FOR_METRICS, timeout_s, _acquire_scope_suffix(),
+            _format_pool_stats(engine),
+        )
+        retry_after = await _read_live_pool_saturation_retry_after()
+        raise PoolSaturationError(
+            f"Database connection pool saturated after waiting {timeout_s:.1f}s "
+            "for a free connection (fail-fast bound).",
+            retry_after=retry_after,
+        ) from None
 
 
 @contextmanager
@@ -1406,18 +2265,79 @@ def sync_managed_transaction(db_resource: DbSyncResource) -> Iterator[Any]:
 
 
 @asynccontextmanager
-async def managed_transaction(db_resource: Optional[DbResource]):
-    """Async-native re-entrant transaction manager."""
+async def managed_transaction(
+    db_resource: Optional[DbResource],
+    *,
+    acquire_timeout: Optional[float] = None,
+    read_only: bool = False,
+):
+    """Async-native re-entrant transaction manager.
+
+    Handles three connection scenarios:
+
+    1. **Engine input**: Acquires a connection from the pool and starts a
+       transaction with ``conn.begin()``.
+
+    2. **Regular connection input**: If the connection is already in a
+       transaction, starts a nested SAVEPOINT. Otherwise starts a new
+       transaction with ``conn.begin()``.
+
+    3. **AUTOCOMMIT connection input**: Connections with isolation_level
+       AUTOCOMMIT are yielded as-is without opening any explicit transaction.
+       Autocommit semantics mean each statement commits individually; calling
+       ``begin()`` on a connection that already autobegan raises a SQLAlchemy
+       double-begin error. This function detects AUTOCOMMIT mode and skips
+       ``begin()``/``begin_nested()`` entirely.
+
+    The AUTOCOMMIT handling exists for LEADER_ONLY background services that
+    reuse a leader-election connection for database work during their tick
+    cycle. See :class:`~dynastore.tools.background_service.ServiceContext`
+    for details on ``lock_connection`` usage.
+
+    Args:
+        db_resource: AsyncEngine, Engine, AsyncConnection, Connection,
+            AsyncSession, or Session.
+        acquire_timeout: Engine input only. When given, bounds the pool
+            checkout with :func:`acquire_engine_connection_bounded` instead
+            of the plain (engine-``pool_timeout``-bounded) acquire, raising
+            ``PoolSaturationError`` fast on a shorter, live-configurable
+            deadline (#2933). ``None`` (the default) preserves prior
+            behaviour for every existing caller.
+        read_only: Engine input only. When ``True``, the connection is put
+            into ``postgresql_readonly`` execution mode before ``begin()``,
+            so PostgreSQL opens the transaction with ``SET TRANSACTION READ
+            ONLY`` — any write attempted through it fails at the database
+            instead of silently succeeding (#2753). ``False`` (the default)
+            preserves prior behaviour for every existing caller.
+
+    Yields:
+        The connection/session ready for transactional work.
+
+    Raises:
+        ValueError: If ``db_resource`` is ``None``.
+        DatabaseConnectionError: If the connection is closed or in a poisoned
+            transaction state.
+    """
     if db_resource is None:
         raise ValueError("Cannot start managed_transaction: db_resource is None.")
     if isinstance(db_resource, (AsyncEngine, Engine)):
         if isinstance(db_resource, AsyncEngine):
             # Connection acquisition (with pool-hygiene + transient-connect
-            # retry) is delegated to :func:`_acquire_async_engine_connection`.
-            # Once we hold a healthy connection, the user body runs inside
-            # a regular ``conn.begin()`` block — body errors propagate without
-            # retry, since DML/DQL idempotency is the caller's responsibility.
-            conn = await _acquire_async_engine_connection(db_resource)
+            # retry) is delegated to :func:`_acquire_async_engine_connection`,
+            # or to :func:`acquire_engine_connection_bounded` for the same
+            # hygiene plus a fail-fast deadline when the caller passed
+            # ``acquire_timeout``. Once we hold a healthy connection, the
+            # user body runs inside a regular ``conn.begin()`` block — body
+            # errors propagate without retry, since DML/DQL idempotency is
+            # the caller's responsibility.
+            if acquire_timeout is not None:
+                conn = await acquire_engine_connection_bounded(
+                    db_resource, acquire_timeout
+                )
+            else:
+                conn = await _acquire_async_engine_connection(db_resource)
+            if read_only:
+                conn = await conn.execution_options(postgresql_readonly=True)
             try:
                 txn_cm = conn.begin()
                 await txn_cm.__aenter__()
@@ -1461,9 +2381,11 @@ async def managed_transaction(db_resource: Optional[DbResource]):
                     # Detecting by cause-chain: SA wraps asyncpg errors
                     # inside DBAPIError with .orig set to the asyncpg exc.
                     _orig = getattr(exc, "orig", exc)
+                    _invalidated = False
                     if _is_transient_asyncpg_error(_orig) or _is_transient_asyncpg_error(exc):
                         try:
                             await conn.invalidate()
+                            _invalidated = True
                         except Exception:
                             # Best-effort eviction on a dead wire during cancel
                             # drain; conn.close() below still removes the slot.
@@ -1471,13 +2393,16 @@ async def managed_transaction(db_resource: Optional[DbResource]):
                     drain_fut = asyncio.ensure_future(
                         _drain_rollback_exit(txn_cm, exc),
                     )
+                    drain_ok = True
                     try:
-                        await asyncio.shield(drain_fut)
+                        drain_ok = await asyncio.shield(drain_fut)
                     except asyncio.CancelledError:
                         # Re-fired cancellation during drain. Let the
                         # rollback task continue; ``conn.close()`` below
                         # will block on the same wire lock so the protocol
-                        # finishes draining before the pool sees it.
+                        # finishes draining before the pool sees it. The
+                        # drain's outcome is unknown from here, so treat it
+                        # as failed below and invalidate rather than guess.
                         #
                         # Edge case (#640): if a *third* cancellation
                         # arrives while the shield itself is awaiting,
@@ -1487,7 +2412,19 @@ async def managed_transaction(db_resource: Optional[DbResource]):
                         # lock serialises them but the rollback may be
                         # abandoned. Acceptable: pool-hygiene at next
                         # acquire (#619) catches the orphaned wire.
-                        pass
+                        drain_ok = False
+                    if not _invalidated and (
+                        isinstance(exc, asyncio.CancelledError) or not drain_ok
+                    ):
+                        # A cancellation mid-transaction (the ROLLBACK may
+                        # never have reached the wire) or a rollback drain
+                        # that itself raised leaves the connection's state
+                        # unverified — invalidate it instead of returning it
+                        # to the pool unmarked (#2900).
+                        try:
+                            await conn.invalidate()
+                        except Exception:
+                            pass
                     raise
                 else:
                     await txn_cm.__aexit__(None, None, None)
@@ -1545,6 +2482,22 @@ async def managed_transaction(db_resource: Optional[DbResource]):
         # leave its context manager open, causing subsequent InvalidRequestErrors.
         if isinstance(conn, (AsyncConnection, AsyncSession)):
             if conn.in_transaction():
+                # SPECIAL CASE: AUTOCOMMIT connections
+                # AUTOCOMMIT connections have no active PostgreSQL transaction.
+                # SQLAlchemy's in_transaction() may return True due to
+                # autobegin, but begin_nested() (SAVEPOINT) fails with
+                # NoActiveSQLTransactionError. Use begin() instead.
+                if _is_autocommit_connection(conn):
+                    logger.debug(
+                        "managed_transaction_autocommit_detected wire_id=%s",
+                        wire_id,
+                    )
+                    # AUTOCOMMIT: no explicit transaction — yielding as-is avoids the
+                    # double-begin error when the connection already autobegan, and
+                    # matches autocommit semantics (each statement commits individually).
+                    yield conn
+                    return
+
                 # Check for poisoned state (SQLAlchemy 2.0)
                 if not getattr(conn, "is_active", True):
                     raise DatabaseConnectionError(
@@ -1618,6 +2571,17 @@ async def managed_transaction(db_resource: Optional[DbResource]):
         else:
             assert isinstance(conn, (SAConnection, SASession))
             if conn.in_transaction():
+                # SPECIAL CASE: AUTOCOMMIT connections (sync path)
+                if _is_autocommit_connection(conn):
+                    logger.debug(
+                        "managed_transaction_autocommit_detected wire_id=%s (sync)",
+                        wire_id,
+                    )
+                    # AUTOCOMMIT: no explicit transaction — yielding as-is avoids the
+                    # double-begin error when the connection already autobegan.
+                    yield conn
+                    return
+
                 # Check for poisoned state
                 if not getattr(conn, "is_active", True):
                     raise DatabaseConnectionError(
@@ -1661,6 +2625,168 @@ async def managed_nested_transaction(conn: DbResource):
     """
     async with managed_transaction(conn) as active_conn:
         yield active_conn
+
+
+class SavepointOutcome:
+    """Readable after a :func:`best_effort_savepoint` block exits.
+
+    ``error`` is the exception the block raised and ``tolerate`` accepted
+    (``None`` on success). Callers that need a pass/fail signal — rather than
+    just letting an intolerable exception propagate — check this instead of
+    threading their own flag through the ``async with`` body.
+    """
+
+    __slots__ = ("error",)
+
+    def __init__(self) -> None:
+        self.error: Optional[BaseException] = None
+
+
+@asynccontextmanager
+async def best_effort_savepoint(
+    conn: DbResource,
+    *,
+    tolerate: Callable[[BaseException], bool] = lambda exc: True,
+) -> AsyncIterator[SavepointOutcome]:
+    """Run a body that may fail without poisoning the caller's transaction.
+
+    Wraps the body in a SAVEPOINT via ``conn.begin_nested()`` when the
+    connection supports one, so a tolerated failure rolls back only the
+    body's own statements and the outer transaction stays healthy. Works for
+    both async (``AsyncConnection``/``AsyncSession``) and sync connections:
+    the SAVEPOINT is driven manually, like :func:`managed_transaction` above,
+    because ``async with begin_nested()`` on a sync connection raises before
+    the body ever runs (job images use sync engines). When ``conn`` has no
+    ``begin_nested`` (e.g. a raw driver connection), or entering the
+    SAVEPOINT itself fails, the body still runs — and failures are still
+    classified by ``tolerate`` — but without SAVEPOINT isolation, matching
+    every call site's existing defensive fallback for connection types that
+    don't support nesting.
+
+    ``tolerate`` classifies the exception: return ``True`` to swallow it (the
+    yielded :class:`SavepointOutcome` records it in ``.error``), or ``False``
+    to re-raise after the SAVEPOINT has rolled back. Defaults to tolerating
+    everything.
+
+    This is deliberately independent of :func:`managed_nested_transaction`:
+    that helper always propagates the body's exception (it has no
+    swallow-and-continue mode), and its poisoned-connection/autocommit
+    detection targets a different set of callers than the five best-effort
+    sites this consolidates. Driving ``begin_nested()`` directly here keeps
+    the behavior identical to what those sites already relied on.
+    """
+    outcome = SavepointOutcome()
+    begin_nested = getattr(conn, "begin_nested", None)
+
+    savepoint = None
+    if begin_nested is not None:
+        try:
+            candidate = begin_nested()
+            # Async connections/sessions return a startable awaitable
+            # (awaiting it emits the SAVEPOINT); sync ones emit it eagerly
+            # and return the transaction object directly.
+            savepoint = await candidate if inspect.isawaitable(candidate) else candidate
+        except Exception:
+            # Best-effort: a SAVEPOINT we cannot open (aborted outer tx,
+            # driver quirk) must not prevent the body from running — the
+            # body's own failure, if any, is what `tolerate` classifies.
+            logger.warning(
+                "best_effort_savepoint: begin_nested() failed; running body "
+                "without SAVEPOINT isolation",
+                exc_info=True,
+            )
+            savepoint = None
+    try:
+        yield outcome
+    except BaseException as exc:  # noqa: BLE001 - classification delegated to `tolerate`
+        if savepoint is not None:
+            try:
+                rolled_back = savepoint.rollback()
+                if inspect.isawaitable(rolled_back):
+                    await rolled_back
+            except Exception:
+                # Outer tx already aborted or wire-level error state — the
+                # caller's managed_transaction issues the real ROLLBACK.
+                pass
+        if tolerate(exc):
+            outcome.error = exc
+            return
+        raise
+    else:
+        if savepoint is not None:
+            try:
+                committed = savepoint.commit()
+                if inspect.isawaitable(committed):
+                    await committed
+            except BaseException as exc:  # noqa: BLE001 - same classification as the body
+                # Matches the old ``async with``'s __aexit__-commit behavior:
+                # a RELEASE failure is classified by `tolerate` like any body
+                # failure.
+                if tolerate(exc):
+                    outcome.error = exc
+                    return
+                raise
+
+
+_T = TypeVar("_T")
+
+
+async def provisioning_write_with_retry(
+    engine: DbResource,
+    fn: Callable[[Any], Awaitable["_T"]],
+    *,
+    attempts: int | None = None,
+    lock_backoff: float | None = None,
+) -> "_T":
+    """Run ``fn(conn)`` in a short committed transaction, retrying on transient errors.
+
+    Designed for idempotent provisioning operations that follow a long GCP API
+    call window, during which the pooled connection may have been closed by
+    ``idle_in_transaction_session_timeout`` or a lock-wait may have fired.
+
+    Each retry acquires a FRESH connection from the pool — the stale or
+    lock-blocked one is never reused.  Works with both async (``AsyncEngine`` /
+    asyncpg) and sync (``Engine`` / psycopg2) engines via
+    :func:`managed_transaction`.
+
+    ``lock_backoff`` controls the sleep before retrying a
+    ``LockNotAvailableError``: ``lock_backoff * attempt`` seconds, giving PG
+    time to release the conflicting locks.  Transient connection-closed errors
+    use a zero-length yield (``asyncio.sleep(0)``) — the connection is simply
+    dead and a fresh one is available immediately from the pool.
+
+    Must NOT be used for non-idempotent writes.  The caller is responsible for
+    ON CONFLICT / upsert semantics.
+
+    Configuration: Values are resolved from (1) explicit function parameters,
+    else (2) the module-global ``ProvisioningRetryConfig`` defaults.
+    Resolved at CALL TIME. See :mod:`connection_health_config` for details.
+    """
+    # Resolve config at call time so live config edits are picked up.
+    cfg_attempts, cfg_lock_backoff = resolve_provisioning_retry_config()
+    _attempts = attempts if attempts is not None else cfg_attempts
+    _lock_backoff = lock_backoff if lock_backoff is not None else cfg_lock_backoff
+
+    def _compute_delay(attempt: int, exc: BaseException) -> float:
+        orig = getattr(exc, "orig", None)
+        is_lock = _is_lock_not_available_error(exc) or (
+            orig is not None and _is_lock_not_available_error(orig)
+        )
+        return _lock_backoff * (attempt + 1) if is_lock else 0.0
+
+    async def _call() -> "_T":
+        async with managed_transaction(engine) as conn:
+            return await fn(conn)
+
+    return await _run_with_retry_policy(
+        _call,
+        classify=is_transient_db_error,
+        kind="provisioning_write",
+        max_attempts=_attempts,
+        compute_delay=_compute_delay,
+        level=logging.WARNING,
+        log_exhaustion=False,
+    )
 
 
 def run_in_event_loop(awaitable: Awaitable[R]) -> R:

@@ -41,15 +41,17 @@ The extension declares OGC API - Dimensions conformance as a
 """
 
 import logging
-import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, Query, Request
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.models.driver_context import DriverContext
+
+if TYPE_CHECKING:
+    from dynastore.extensions.dimensions.config import DimensionsPluginConfig
 
 # ``ogc_dimensions`` is an optional extra (extension_dimensions).
 # Imported at module top so a missing dep is caught at entry-point load time
@@ -371,6 +373,11 @@ async def materialize_dimension(
                 "Dimension '%s' unchanged (cube:dimensions match) — skipping.",
                 dim_name,
             )
+            # Still (re-)ensure the similarity index even on the skip path:
+            # a dimension materialized before this provisioning point
+            # existed would otherwise never get one, since the GET search
+            # endpoint no longer builds it on demand (#2831).
+            await _ensure_dimension_similarity_index(catalogs, dim_name, db_resource)
             return {"materialized": 0, "skipped": True, "reason": "unchanged"}
 
     desired_extra: Dict[str, Any] = {
@@ -431,7 +438,47 @@ async def materialize_dimension(
             catalogs, dim_name, desired_extra, extent, db_resource,
         )
 
+    # Provision the pg_trgm GIN index here, at materialization time, so the
+    # public GET similarity search endpoint never runs DDL (#2831).
+    await _ensure_dimension_similarity_index(catalogs, dim_name, db_resource)
+
     return {"materialized": total, "skipped": False, "reason": "materialized"}
+
+
+async def _ensure_dimension_similarity_index(
+    catalogs: Any,
+    dim_name: str,
+    db_resource: Any,
+) -> None:
+    """Provision the Similarity search GIN trigram index for ``dim_name``.
+
+    Best-effort: a failure here is non-fatal to materialization. Without
+    the index, ``similarity.search_similar`` still returns correct results
+    via an unindexed sequential scan.
+    """
+    from dynastore.extensions.dimensions.similarity import (
+        _resolve_member_table,
+        ensure_similarity_index,
+    )
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.tools.db import validate_sql_identifier
+
+    try:
+        ctx = DriverContext(db_resource=db_resource)
+        schema = await catalogs.resolve_physical_schema(DIMENSIONS_CATALOG_ID, ctx=ctx)
+        table = await _resolve_member_table(dim_name, db_resource=db_resource)
+        if not schema or not table:
+            return
+        schema = validate_sql_identifier(schema)
+        table = validate_sql_identifier(table)
+        async with managed_transaction(db_resource) as conn:
+            await ensure_similarity_index(conn, schema, table)
+    except Exception as exc:
+        logger.warning(
+            "Could not ensure similarity index for dimension '%s' "
+            "(non-fatal — similarity search falls back to an unindexed "
+            "scan): %s", dim_name, exc,
+        )
 
 
 async def _update_collection_cube_dims(
@@ -683,6 +730,27 @@ async def materialize_all_dimensions(
 # ---------------------------------------------------------------------------
 
 
+async def _get_dimensions_config() -> "DimensionsPluginConfig":
+    """Fetch ``DimensionsPluginConfig`` via the platform configs service.
+
+    ``search_route`` is a module-level ``@router`` function (not a
+    ``DimensionsExtension`` method), so ``OGCServiceMixin._get_plugin_config``
+    isn't reachable via ``self``. Falls back to a default-constructed config
+    when the configs service is unavailable, mirroring that helper.
+    """
+    from dynastore.extensions.dimensions.config import DimensionsPluginConfig
+    from dynastore.models.protocols import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    try:
+        configs_svc = get_protocol(ConfigsProtocol)
+        if configs_svc is not None:
+            return await configs_svc.get_config(DimensionsPluginConfig)
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+    return DimensionsPluginConfig()
+
+
 def _similarity_feature(row: Dict[str, Any]) -> Dict[str, Any]:
     """Wrap one ``{id, name, score}`` ranked member as a GeoJSON Feature."""
     return {
@@ -713,7 +781,15 @@ async def search_route(
     like: Optional[str] = Query(None, description="Pattern match (fnmatch)"),
     extent_min: Optional[str] = Query(None, description="Extent minimum"),
     extent_max: Optional[str] = Query(None, description="Extent maximum"),
-    limit: int = Query(100, ge=1, le=10000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of dimension members to return. Omitted falls "
+            "back to the configured default; a value above the configured "
+            "maximum is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     language: Optional[str] = Query(None, description="RFC 5646 Language-Tag."),
 ):
     """Search dimension members.
@@ -725,6 +801,13 @@ async def search_route(
     are delegated unchanged to the upstream ogc-dimensions in-memory search,
     keeping a single source of truth for those protocols.
     """
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    dims_config = await _get_dimensions_config()
+    limit = resolve_page_limit(
+        limit, default_limit=dims_config.default_limit, max_limit=dims_config.max_limit,
+    )
+
     if similar is not None:
         rows = await search_similar(dimension_id, similar, limit=limit)
         features = [_similarity_feature(r) for r in rows]
@@ -803,28 +886,32 @@ class DimensionsExtension(ExtensionProtocol, OGCServiceMixin):
             len(DIMENSIONS),
         )
 
+        # Register the cold-boot contributor that applies the
+        # ``common_dimensions`` default preset exactly once per DB (first-run
+        # initialisation). This replaces the deprecated
+        # ``DIMENSIONS_MATERIALIZE_ON_BOOT`` env flag: dimensions are now
+        # provisioned through the standard preset/cold-boot machinery instead
+        # of a bespoke in-lifespan materialisation toggle. Guarded against the
+        # duplicate-name ValueError so re-instantiation (tests, multi-app
+        # construction) is a no-op rather than a hard error.
+        from dynastore.modules.presets.cold_boot import register_cold_boot_contributor
+        from .cold_boot_contributor import DimensionsColdBootContributor
+        try:
+            register_cold_boot_contributor(DimensionsColdBootContributor())
+        except ValueError:
+            logger.debug(
+                "DimensionsColdBootContributor already registered; "
+                "skipping duplicate.",
+            )
+
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        # Heavy dimension materialisation used to run on every pod boot.
-        # On Cloud Run that blocked readiness and stormed the DB at scale.
-        # The work now lives in the `dimensions_materialize` OGC Process
-        # task — trigger it explicitly once per deploy (manually or via a
-        # deploy hook). The lifespan only keeps the fallback for local/dev
-        # convenience, gated by an env flag (default off).
-        on_boot = os.getenv("DIMENSIONS_MATERIALIZE_ON_BOOT", "").lower() in (
-            "1", "true", "yes", "on",
-        )
-        if on_boot:
-            logger.info(
-                "DIMENSIONS_MATERIALIZE_ON_BOOT=1 — running in-lifespan "
-                "materialisation. Prefer the dimensions_materialize task "
-                "for production.",
-            )
-            await materialize_all_dimensions(self._dimensions)
-        else:
-            logger.info(
-                "DimensionsExtension: lifespan materialisation skipped "
-                "(set DIMENSIONS_MATERIALIZE_ON_BOOT=1 to enable). Trigger "
-                "the 'dimensions_materialize' OGC Process to populate.",
-            )
+        # Dimension members are provisioned by the ``common_dimensions``
+        # default preset, applied once per DB on cold-boot by
+        # ``DimensionsColdBootContributor`` (registered in ``__init__``). The
+        # preset registers the RECORDS skeletons and triggers the idempotent
+        # ``dimensions_materialize`` OGC Process to fill members — so the
+        # extension no longer materialises anything directly in its lifespan.
+        # The deprecated ``DIMENSIONS_MATERIALIZE_ON_BOOT`` env flag has been
+        # removed; nothing here gates on the environment any more.
         yield

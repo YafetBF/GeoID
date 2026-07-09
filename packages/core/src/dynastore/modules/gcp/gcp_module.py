@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     from google.api_core import exceptions as google_exceptions
     from google.api_core.exceptions import Aborted
     from google.cloud import storage, pubsub_v1, run_v2
+    from google.cloud.logging_v2.services.logging_service_v2 import (
+        LoggingServiceV2AsyncClient,
+    )
 else:
     try:
         from google.api_core import exceptions as google_exceptions
@@ -50,6 +53,7 @@ from dynastore.models.protocols import (
     CloudIdentityProtocol,
     EventingProtocol,
     AssetUploadProtocol,
+    PlatformScalingProtocol,
 )
 from dynastore.modules.gcp.tools.service_account import get_credentials
 from dynastore.modules.gcp.gcp_config import (
@@ -70,6 +74,12 @@ if not TYPE_CHECKING:
         from google.cloud import run_v2
     except ImportError:
         run_v2 = None
+    try:
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2AsyncClient,
+        )
+    except ImportError:
+        LoggingServiceV2AsyncClient = None
 from dynastore.modules.gcp.bucket_service import BucketService
 from .gcp_catalog_ops import GcpCatalogOpsMixin
 from .gcp_eventing_ops import GcpEventingOpsMixin
@@ -113,6 +123,16 @@ _CATALOG_EXISTS_QUERY = DQLQuery(
     "SELECT 1 FROM catalog.catalogs WHERE id = :catalog_id AND deleted_at IS NULL",
     result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
 )
+
+# ---------------------------------------------------------------------------
+# GCS retry and per-bucket circuit-breaker tunables
+# ---------------------------------------------------------------------------
+# Updated from GcpModuleConfig during lifespan startup (hot-reload on restart).
+# Read at call time via gcs_retry._get_gcs_retry_tunables().
+_GCS_RETRY_MAX_ATTEMPTS: int = 3
+_GCS_BREAKER_FAILURE_THRESHOLD: int = 5
+_GCS_BREAKER_COOLDOWN_SECONDS: float = 30.0
+
 class GCPModule(
     GcpCatalogOpsMixin,
     GcpEventingOpsMixin,
@@ -125,12 +145,17 @@ class GCPModule(
     EventingProtocol,
     AssetUploadProtocol,
     ProcessRegistryProtocol,
+    PlatformScalingProtocol,
 ):
     _credentials: Optional[Any] = None
     _identity: Optional[Dict[str, Any]] = None
     _engine: Optional[DbResource] = None
     _config_service: Optional[ConfigsProtocol] = None
     _module_config: Optional[GcpModuleConfig] = None
+    # Per-bucket circuit breaker for GCS operations.  Created in lifespan with
+    # thresholds from GcpModuleConfig; None until lifespan runs (e.g. in tests
+    # that instantiate GCPModule without running lifespan).
+    _gcs_breaker: Optional[Any] = None
     # In-memory upload ticket store: ticket_id → {asset_id, catalog_id, collection_id, expires_at}
     _upload_tickets: ClassVar[Dict[str, Dict[str, Any]]] = {}
 
@@ -168,6 +193,7 @@ class GCPModule(
     _jobs_client: Optional["run_v2.JobsAsyncClient"] = None
     _run_client: Optional["run_v2.ServicesAsyncClient"] = None
     _executions_client: Optional["run_v2.ExecutionsAsyncClient"] = None
+    _logging_client: Optional["LoggingServiceV2AsyncClient"] = None
     _async_clients_loop: Optional[asyncio.AbstractEventLoop] = None
     _bucket_service: Optional[BucketService] = None
     # Background reconciler that probes lapsed-lease Cloud Run task rows for
@@ -258,6 +284,7 @@ class GCPModule(
             self._jobs_client = None
             self._run_client = None
             self._executions_client = None
+            self._logging_client = None
             self._async_clients_loop = None
 
             # Update BucketService if it exists
@@ -290,6 +317,16 @@ class GCPModule(
                 global _CATALOG_VISIBILITY_MAX_RETRIES, _CATALOG_VISIBILITY_RETRY_INTERVAL
                 _CATALOG_VISIBILITY_MAX_RETRIES = self._module_config.catalog_visibility_max_retries
                 _CATALOG_VISIBILITY_RETRY_INTERVAL = self._module_config.catalog_visibility_retry_interval
+                # Sync GCS retry tunables and rebuild the per-bucket circuit breaker.
+                global _GCS_RETRY_MAX_ATTEMPTS, _GCS_BREAKER_FAILURE_THRESHOLD, _GCS_BREAKER_COOLDOWN_SECONDS
+                _GCS_RETRY_MAX_ATTEMPTS = self._module_config.gcs_retry_max_attempts
+                _GCS_BREAKER_FAILURE_THRESHOLD = self._module_config.gcs_breaker_failure_threshold
+                _GCS_BREAKER_COOLDOWN_SECONDS = self._module_config.gcs_breaker_cooldown_seconds
+                from dynastore.modules.storage.circuit_breaker import CircuitBreaker as _GcsCB
+                self._gcs_breaker = _GcsCB(
+                    failure_threshold=_GCS_BREAKER_FAILURE_THRESHOLD,
+                    cooldown_seconds=_GCS_BREAKER_COOLDOWN_SECONDS,
+                )
         else:
             logger.warning(
                 "GCP Module: ConfigsProtocol not available. Global settings will use defaults/env."
@@ -306,6 +343,19 @@ class GCPModule(
                 "GCP Module: ConfigsProtocol not available. Configuration management disabled."
             )
 
+        from dynastore.tools.background_service import (
+            BackgroundSupervisor,
+            ServiceContext as _GcpServiceContext,
+        )
+        from dynastore.modules.db_config.instance import (
+            get_service_name as _gcp_get_service_name,
+        )
+        _gcp_bg_shutdown = asyncio.Event()
+        _gcp_supervisor = BackgroundSupervisor()
+        # Initialised inside the try block; kept here so the finally block can
+        # always reference it without a NameError if the try body fails early.
+        _gcp_breaker_config_handler = None
+
         try:
             # Async clients (_jobs_client/_run_client) are built lazily by
             # get_jobs_client/get_run_client on first use, bound to the current
@@ -319,7 +369,37 @@ class GCPModule(
                 storage_client=self._storage_client,  # type: ignore[arg-type]
                 project_id=self.get_project_id() or "",
                 region=self.get_region() or "",
+                breaker=self._gcs_breaker,
             )
+
+            # Register an apply-handler so a PUT /configs?plugin_id=gcp_module
+            # hot-reloads the circuit-breaker thresholds without a pod restart.
+            # Per-bucket state (OPEN/HALF_OPEN, failure counts, opened_at) is
+            # preserved — only _threshold and _cooldown are mutated in place.
+            async def _on_gcp_breaker_config_change(
+                cfg, _catalog_id, _collection_id, _conn
+            ) -> None:
+                if not isinstance(cfg, GcpModuleConfig):
+                    return
+                breaker = self._gcs_breaker
+                if breaker is None:
+                    return
+                try:
+                    breaker.update_thresholds(
+                        cfg.gcs_breaker_failure_threshold,
+                        cfg.gcs_breaker_cooldown_seconds,
+                    )
+                    logger.info(
+                        "gcs_breaker thresholds hot-reloaded: "
+                        "failure_threshold=%d cooldown=%.1fs",
+                        cfg.gcs_breaker_failure_threshold,
+                        cfg.gcs_breaker_cooldown_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never fail config persistence
+                    logger.warning("gcs_breaker apply-handler failed: %s", exc)
+
+            _gcp_breaker_config_handler = _on_gcp_breaker_config_change
+            GcpModuleConfig.register_apply_handler(_on_gcp_breaker_config_change)
 
             # The GCP module no longer owns any database schema: the catalog →
             # bucket-name link lives on ``GcpCatalogBucketConfig.bucket_name``
@@ -327,12 +407,11 @@ class GCPModule(
             # has been retired. There is no ``gcp`` schema to initialize.
 
             # --- Register Lifecycle Hooks ---
-            from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
-
-            # Post-INSERT phase: GCP's provision_enabled=False work (mark-ready +
-            # bucket link) and the provision task enqueue must run after the
-            # catalog.catalogs row exists (#1131).
-            lifecycle_registry.sync_catalog_post_create()(self._on_post_create_catalog)
+            # (No post-create lifecycle hook: both provisioning paths are now
+            # registered as provisioner checklist steps — gcp_config for
+            # provision_enabled=False and gcp_bucket/gcp_eventing for
+            # provision_enabled=True.  The old _on_post_create_catalog hook is
+            # removed to eliminate the double-provision trap it created.)
 
             # #1175: register GCP as a catalog provisioner so bucket setup is a
             # checklist step the catalog waits on, instead of GCP directly owning
@@ -340,14 +419,297 @@ class GCPModule(
             # (soft/best-effort) steps are contributed only when provisioning is
             # enabled (see ``provisioner_is_active``). The provision task marks each
             # terminal: bucket → complete/skipped/failed; eventing → complete/degraded.
+            #
+            # All three GCP steps are registered ``deferrable=True``: by default
+            # they still run at catalog creation (no behaviour change), but a
+            # create with ``?hints=defer`` holds them back so the catalog is
+            # created (tenant schema only, via catalog_core) and can be
+            # configured — e.g. GcpCatalogBucketConfig.provision_enabled set to
+            # false for a records-only catalog — before any GCS bucket is created.
+            # On a deferred create the catalog reaches ``ready`` on catalog_core
+            # alone, bucket-free; an explicit ``catalog_provision`` task (spawned
+            # via POST /task/catalogs/{id}) then runs these steps, each still
+            # gated by ``provisioner_is_active``/``provision_enabled``.
             # A 'degraded' eventing step does NOT block readiness — see
             # ``evaluate_checklist`` and the fail-soft eventing path in
             # tasks/gcp_provision/task.py.
+            #
+            # 'gcp_config' (priority 1) runs whenever GCP is installed AND
+            # provision_enabled=False.  It persists the deterministic bucket name
+            # onto GcpCatalogBucketConfig so uploads can resolve it without a real
+            # GCS bucket.  When provision_enabled=True this step is skipped (not in
+            # the checklist) because gcp_bucket's ensure_storage_for_catalog already
+            # writes bucket_name in its Phase 3 _write_bucket_name call.
             from dynastore.modules.catalog.provisioning_registry import (
                 provisioning_registry,
+                SCOPE_CATALOG,
             )
-            provisioning_registry.register("gcp_bucket", self.provisioner_is_active)
-            provisioning_registry.register("gcp_eventing", self.provisioner_is_active)
+
+            async def _gcp_config_is_active(catalog_id: str, conn=None) -> bool:
+                """Active when GCP is installed AND provision_enabled=False.
+
+                This is the logical complement of provisioner_is_active: the
+                gcp_config step runs exactly when the real bucket/eventing steps
+                do NOT, ensuring bucket_name is always persisted on the async path
+                regardless of whether provisioning is enabled.
+                """
+                return not await self.provisioner_is_active(catalog_id, conn)
+
+            async def _gcp_config_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Persist the deterministic bucket name when provision_enabled=False.
+
+                Writes GcpCatalogBucketConfig.bucket_name via the provisioner
+                path so that the value is recorded even when full GCS bucket
+                provisioning is disabled.
+
+                The catalog schema already exists when this hook runs because
+                catalog_core (priority 0) completes before this group (priority 1).
+                """
+                from dynastore.models.protocols.configs import ConfigsProtocol
+                from dynastore.modules.db_config.query_executor import managed_transaction
+                from dynastore.modules.gcp.gcp_config import GcpCatalogBucketConfig
+                from dynastore.models.driver_context import DriverContext
+
+                config_mgr = get_protocol(ConfigsProtocol)
+                if config_mgr is None:
+                    logger.warning(
+                        "gcp_config provisioner: ConfigsProtocol not available for catalog '%s'; "
+                        "skipping bucket-name persistence.",
+                        catalog_id,
+                    )
+                    return
+
+                engine = self._engine
+                if engine is None:
+                    raise RuntimeError(
+                        f"gcp_config provisioner: DB engine not available for catalog '{catalog_id}'"
+                    )
+
+                async with managed_transaction(engine) as conn:
+                    bucket_config = await config_mgr.get_config(
+                        GcpCatalogBucketConfig,
+                        catalog_id=catalog_id,
+                        ctx=DriverContext(db_resource=conn),
+                    )
+                    bucket_name = self.get_bucket_service().generate_bucket_name(
+                        catalog_id, physical_schema=catalog_id
+                    )
+                    bucket_config.bucket_name = bucket_name
+                    await config_mgr.set_config(
+                        GcpCatalogBucketConfig,
+                        bucket_config,
+                        catalog_id=catalog_id,
+                        check_immutability=False,
+                        ctx=DriverContext(db_resource=conn),
+                    )
+                logger.info(
+                    "gcp_config provisioner: bucket name '%s' persisted for catalog '%s'.",
+                    bucket_name, catalog_id,
+                )
+
+            provisioning_registry.register(
+                "gcp_config",
+                _gcp_config_is_active,
+                priority=1,
+                scope=SCOPE_CATALOG,
+                deferrable=True,
+                name="GCP bucket config link",
+                description=(
+                    "Persists the deterministic GCS bucket name onto GcpCatalogBucketConfig "
+                    "when provision_enabled=False, so uploads can resolve the bucket without "
+                    "a real GCS provisioning step."
+                ),
+                provision=_gcp_config_provision,
+            )
+
+            async def _gcp_bucket_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Provision the GCS bucket for a catalog.
+
+                Called by CatalogProvisionTask via call_hook(**ctx).  Delegates
+                to the same _provision_bucket_hard helper used by the standalone
+                gcp_provision_catalog task so the idempotency and error-handling
+                contract is identical.  CatalogProvisionTask marks the
+                gcp_bucket checklist step after this hook returns successfully.
+                """
+                from dynastore.tasks.gcp_provision.task import _provision_bucket_hard, _get_storage_protocol
+
+                storage = _get_storage_protocol()
+                await _provision_bucket_hard(storage, catalog_id)
+
+            async def _gcp_eventing_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Set up managed eventing for a catalog.
+
+                Called by CatalogProvisionTask via call_hook(**ctx) after
+                gcp_bucket completes.  Delegates to _provision_eventing which
+                encodes the skip (managed_eventing disabled) / permanent-fail
+                (IAM) / transient-fail contract.
+
+                When managed_eventing is disabled, _provision_eventing returns
+                'skipped'.  Both 'complete' and 'skipped' are terminal-good per
+                evaluate_checklist, so the executor marking this step 'complete'
+                (its default on a successful hook) is acceptable — the catalog
+                still reaches 'ready'.  Operator visibility of the 'skipped'
+                distinction is a follow-up concern; the correctness invariant
+                (catalog becomes ready, no step left pending) holds either way.
+                """
+                from dynastore.tasks.gcp_provision.task import _provision_eventing, _get_storage_protocol
+
+                storage = _get_storage_protocol()
+                await _provision_eventing(storage, catalog_id)
+                # executor marks gcp_eventing 'complete' after this returns
+
+            async def _gcp_bucket_deprovision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "deprovision_hard",
+                collection_id=None,
+                config_snapshot=None,
+                **_kw,
+            ) -> None:
+                """Deprovision the GCS bucket for a catalog (#2340).
+
+                Called by CatalogProvisionTask with operation='deprovision_hard'.
+                Deletes the bucket using the pre-captured config snapshot
+                (passed via task inputs) so cleanup works even though
+                catalog_core already dropped the schema.
+
+                For the PostgreSQL driver, catalog_id IS the physical schema name.
+
+                Idempotent: drop_storage is NotFound-safe.
+                """
+                from dynastore.modules.gcp.gcp_config import GcpCatalogBucketConfig
+
+                bucket_manager = self.get_bucket_service()
+                old_bucket_name: Optional[str] = None
+
+                if isinstance(config_snapshot, dict):
+                    bucket_snapshot = config_snapshot.get(GcpCatalogBucketConfig.class_key())
+                    if isinstance(bucket_snapshot, dict):
+                        old_bucket_name = bucket_snapshot.get("bucket_name")
+
+                if not old_bucket_name:
+                    try:
+                        # For PG driver, catalog_id IS the physical schema
+                        old_bucket_name = bucket_manager.generate_bucket_name(
+                            catalog_id, physical_schema=catalog_id
+                        )
+                    except Exception:
+                        old_bucket_name = None
+
+                logger.info(
+                    "gcp_bucket deprovision: deleting bucket '%s' for catalog '%s'",
+                    old_bucket_name, catalog_id,
+                )
+                await bucket_manager.drop_storage(
+                    catalog_id,
+                    physical_schema=catalog_id,
+                    bucket_name=old_bucket_name,
+                )
+
+            async def _gcp_eventing_deprovision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "deprovision_hard",
+                collection_id=None,
+                config_snapshot=None,
+                **_kw,
+            ) -> None:
+                """Deprovision managed eventing for a catalog (#2340).
+
+                Called by CatalogProvisionTask with operation='deprovision_hard'.
+                Tears down Pub/Sub topic and subscription using the pre-captured
+                config snapshot.
+
+                Idempotent: teardown methods are NotFound-safe.
+                """
+                from dynastore.modules.gcp.gcp_config import GcpEventingConfig
+
+                if not isinstance(config_snapshot, dict):
+                    logger.debug(
+                        "gcp_eventing deprovision: no config snapshot for catalog '%s'; skipping",
+                        catalog_id,
+                    )
+                    return
+
+                eventing_data = config_snapshot.get(GcpEventingConfig.class_key())
+                if not eventing_data:
+                    logger.debug(
+                        "gcp_eventing deprovision: no eventing config for catalog '%s'; skipping",
+                        catalog_id,
+                    )
+                    return
+
+                try:
+                    eventing_config = GcpEventingConfig.model_validate(eventing_data)
+
+                    if (
+                        isinstance(eventing_config, GcpEventingConfig)
+                        and eventing_config.managed_eventing
+                    ):
+                        logger.info(
+                            "gcp_eventing deprovision: tearing down managed eventing for catalog '%s'",
+                            catalog_id,
+                        )
+                        await self.teardown_managed_eventing_channel(
+                            catalog_id, eventing_config.managed_eventing
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        "gcp_eventing deprovision: failed for catalog '%s': %s",
+                        catalog_id, e, exc_info=True,
+                    )
+                    raise
+
+                # Belt-and-braces: force-clean the deterministic default topic/subscription.
+                # This is NotFound-safe and guarantees no Pub/Sub resource survives.
+                try:
+                    await self.teardown_catalog_eventing(catalog_id, config=None)
+                except Exception as e:
+                    logger.warning(
+                        "gcp_eventing deprovision: best-effort default cleanup failed for '%s' (non-fatal): %s",
+                        catalog_id, e,
+                    )
+
+            provisioning_registry.register(
+                "gcp_bucket",
+                self.provisioner_is_active,
+                deferrable=True,
+                provision=_gcp_bucket_provision,
+                deprovision=_gcp_bucket_deprovision,
+            )
+            provisioning_registry.register(
+                "gcp_eventing",
+                self.provisioner_is_active,
+                deferrable=True,
+                provision=_gcp_eventing_provision,
+                deprovision=_gcp_eventing_deprovision,
+            )
+            from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
+
             # We keep these as async because they don't block the core creation flow
             # and don't cause race conditions in tests as easily as the creation one.
             lifecycle_registry.async_catalog_destroyer()(self._on_async_destroy_catalog)
@@ -381,15 +743,20 @@ class GCPModule(
             )
             register_plugin(self._asset_download_process)
 
-            # Register GCS-backed tile storage providers
-            from dynastore.modules.gcp.tiles_storage import (
-                TileBucketPreseedStorage,
-                StorageBackedTileArchive,
-            )
-            self._tile_bucket_storage = TileBucketPreseedStorage()
+            # Register the GCS PMTiles archive store and the signed-URL
+            # provider for the 307-redirect serve mode. The per-tile cache
+            # writer itself is NOT registered here: importing
+            # gcp.tiles_storage (below) registers 'gcs_tile_writer' into the
+            # tile-writer registry (tiles_writers.register_tile_writer_factory),
+            # which the unconditionally-registered CompositeTileStorage
+            # (TilesModule) selects among live, per catalog — no
+            # TileStorageProtocol plugin registration needed from this module.
+            from dynastore.modules.tiles.tile_blob_storage import StorageBackedTileArchive
+            from dynastore.modules.gcp.tiles_storage import GcsTileUrlSigner
             self._tile_archive_storage = StorageBackedTileArchive()
-            register_plugin(self._tile_bucket_storage)
+            self._tile_url_signer = GcsTileUrlSigner()
             register_plugin(self._tile_archive_storage)
+            register_plugin(self._tile_url_signer)
 
             from dynastore.modules.gcp.asset_sync import (
                 register_bucket_annotation_patcher,
@@ -412,7 +779,6 @@ class GCPModule(
             # forever and the gate silently False'd on every Cloud Run service
             # since #735 shipped. The schema-init right above already uses the
             # property; the reconciler must too.
-            self._liveness_reconciler = None
             try:
                 reconciler_engine = self.engine
             except AssertionError:
@@ -426,40 +792,138 @@ class GCPModule(
                         GcpLivenessReconciler,
                     )
                     cfg = self._module_config
-                    self._liveness_reconciler = GcpLivenessReconciler(
-                        engine=reconciler_engine,
-                        interval_seconds=getattr(
-                            cfg, "liveness_reconciler_interval_seconds", 20
-                        ),
-                        extend_visibility_seconds=getattr(
-                            cfg, "liveness_extend_visibility_seconds", 300
-                        ),
-                        unknown_grace_seconds=getattr(
-                            cfg, "liveness_unknown_grace_seconds", 180
-                        ),
+                    _gcp_supervisor.register(
+                        GcpLivenessReconciler(
+                            interval_seconds=getattr(
+                                cfg, "liveness_reconciler_interval_seconds", 20
+                            ),
+                            extend_visibility_seconds=getattr(
+                                cfg, "liveness_extend_visibility_seconds", 300
+                            ),
+                            unknown_grace_seconds=getattr(
+                                cfg, "liveness_unknown_grace_seconds", 180
+                            ),
+                            staleness_grace_seconds=getattr(
+                                cfg, "liveness_staleness_grace_seconds", 60
+                            ),
+                            staleness_max_passes=getattr(
+                                cfg, "liveness_staleness_max_passes", 2
+                            ),
+                        )
                     )
-                    self._liveness_reconciler.start()
-                    logger.info("GCP Module: liveness reconciler started.")
+                    logger.info("GCP Module: liveness reconciler registered.")
                 except Exception as e:
                     logger.error(
-                        "GCP Module: failed to start liveness reconciler "
+                        "GCP Module: failed to register liveness reconciler "
                         "(%s). MaintenanceSupervisor task_reaper remains the backstop.", e,
                         exc_info=True,
                     )
-                    self._liveness_reconciler = None
+
+                # --- Liveness backstop (#2771) ---
+                # RUN_EVERYWHERE watchdog for the LEADER_ONLY reconciler above:
+                # heals lapsed-lease rows the reconciler failed to reach because
+                # the leader loop never elected (e.g. #2333 DB-pool churn).
+                # Registered under the same job-runner gate as the reconciler —
+                # a service that never owns gcp_cloud_run_ rows has nothing to
+                # back up.
+                try:
+                    from dynastore.modules.gcp.liveness_reconciler import (
+                        GcpLivenessBackstop,
+                    )
+                    _gcp_supervisor.register(
+                        GcpLivenessBackstop(
+                            cadence_seconds=getattr(
+                                cfg, "liveness_backstop_interval_seconds", None
+                            ),
+                            stale_multiplier=getattr(
+                                cfg, "liveness_backstop_stale_multiplier", None
+                            ),
+                            extend_visibility_seconds=getattr(
+                                cfg, "liveness_extend_visibility_seconds", 300
+                            ),
+                            unknown_grace_seconds=getattr(
+                                cfg, "liveness_unknown_grace_seconds", 180
+                            ),
+                        )
+                    )
+                    logger.info("GCP Module: liveness backstop registered.")
+                except Exception as e:
+                    logger.error(
+                        "GCP Module: failed to register liveness backstop "
+                        "(%s). A starved leader loop will leave lapsed rows "
+                        "un-probed until MaintenanceSupervisor task_reaper reaps "
+                        "them blindly.", e,
+                        exc_info=True,
+                    )
+            # --- Autoscaling reconciler (scaling P0 control loop) ---
+            # Always registered (cheap no-op tick): ScalingPolicyConfig.enabled
+            # defaults to False, so the tick returns immediately until an
+            # operator opts in via the configs API. Runs regardless of the
+            # job-runner gate above — it actuates the Cloud Run *service*
+            # min-instance-count, unrelated to Cloud Run Job dispatch.
+            try:
+                from dynastore.modules.gcp.scaling_reconciler import GcpScalingReconciler
+
+                _gcp_supervisor.register(
+                    GcpScalingReconciler(platform=self, configs=self._config_service)
+                )
+                logger.info("GCP Module: scaling reconciler registered.")
+            except Exception as e:
+                logger.error(
+                    "GCP Module: failed to register scaling reconciler (%s).", e,
+                    exc_info=True,
+                )
+
+            # --- Monitoring signal provider (slow, corroborating CPU/memory
+            # tier for the scaling control loop) ---
+            # Cloud-neutral MonitoringSignalProvider (modules/scaling) fed by
+            # GCPMonitoringBackend, the only place a Cloud Monitoring metric
+            # type or REST shape appears. Off by default
+            # (MonitoringSignalConfig.enabled=False) — it costs Monitoring
+            # API calls and requires monitoring-viewer on the service
+            # account, so it stays opt-in even once the pool-only loop is on.
+            try:
+                from dynastore.modules.gcp.gcp_monitoring_backend import (
+                    GCPMonitoringBackend,
+                )
+                from dynastore.modules.scaling.monitoring_signal_provider import (
+                    MonitoringSignalProvider,
+                )
+
+                self._monitoring_signal_provider = MonitoringSignalProvider(
+                    backend=GCPMonitoringBackend(self),
+                    configs=self._config_service,
+                )
+                _gcp_supervisor.register(self._monitoring_signal_provider)
+                register_plugin(self._monitoring_signal_provider)
+                logger.info("GCP Module: monitoring signal provider registered.")
+            except Exception as e:
+                logger.error(
+                    "GCP Module: failed to register monitoring signal provider (%s).", e,
+                    exc_info=True,
+                )
+
+            _gcp_bg_ctx = _GcpServiceContext(
+                engine=reconciler_engine,
+                shutdown=_gcp_bg_shutdown,
+                is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                name=_gcp_get_service_name() or "unknown",
+            )
+            _gcp_supervisor.start(_gcp_bg_ctx)
 
             yield
         finally:
             logger.info("GCP Module: Exiting lifespan - closing all clients.")
-            # Stop the liveness reconciler before tearing down clients it uses.
-            if self._liveness_reconciler is not None:
+            # Unregister the breaker config apply-handler so a disabled / restarted
+            # GCP module doesn't leave a dangling reference in the config service.
+            if _gcp_breaker_config_handler is not None:
                 try:
-                    await self._liveness_reconciler.stop()
-                except Exception as e:  # noqa: BLE001 — best-effort teardown
-                    logger.warning(
-                        "GCP Module: error stopping liveness reconciler: %s", e
-                    )
-                self._liveness_reconciler = None
+                    GcpModuleConfig.unregister_apply_handler(_gcp_breaker_config_handler)
+                except Exception:
+                    pass
+            # Stop the liveness reconciler supervisor before tearing down clients it uses.
+            _gcp_bg_shutdown.set()
+            await _gcp_supervisor.stop()
             # Unregister BigQuery plugins
             from dynastore.tools.discovery import unregister_plugin
 
@@ -467,8 +931,9 @@ class GCPModule(
                 "_bq_service",
                 "_bq_collection_enricher",
                 "_asset_download_process",
-                "_tile_bucket_storage",
                 "_tile_archive_storage",
+                "_tile_url_signer",
+                "_monitoring_signal_provider",
             ):
                 obj = getattr(self, attr, None)
                 if obj:
@@ -489,6 +954,7 @@ class GCPModule(
             ("_jobs_client", self._jobs_client),
             ("_run_client", self._run_client),
             ("_executions_client", self._executions_client),
+            ("_logging_client", self._logging_client),
         ]
 
         for attr, client in clients_to_close:
@@ -581,10 +1047,18 @@ class GCPModule(
             # caller is already sync, and no await will happen.
             return
 
+        # ``_logging_client`` only gates the cache-hit check when the
+        # google-cloud-logging client class is actually importable; a
+        # service without that optional dependency must not rebuild the
+        # jobs/run/executions clients on every call.
+        _logging_ready = (
+            self._logging_client is not None or LoggingServiceV2AsyncClient is None
+        )
         if (
             self._jobs_client is not None
             and self._run_client is not None
             and self._executions_client is not None
+            and _logging_ready
             and self._async_clients_loop is loop
         ):
             return
@@ -598,6 +1072,10 @@ class GCPModule(
         self._executions_client = run_v2.ExecutionsAsyncClient(
             credentials=self._credentials
         )
+        if LoggingServiceV2AsyncClient is not None:
+            self._logging_client = LoggingServiceV2AsyncClient(
+                credentials=self._credentials
+            )
         self._async_clients_loop = loop
         logger.info("GCP async clients built on event loop %r.", loop)
 
@@ -635,6 +1113,26 @@ class GCPModule(
             )
         return self._executions_client
 
+    def get_logging_client(self) -> "LoggingServiceV2AsyncClient":
+        """
+        Returns the async Cloud Logging client, bound to the current loop.
+
+        Used by :meth:`GcpJobRunner.fetch_logs` (vendor-extension job-logs
+        endpoint) to read log entries for a Cloud Run Job execution. Built
+        lazily and rebound on loop change for the same reason as
+        ``get_executions_client`` — see
+        :meth:`_ensure_async_clients_for_current_loop`. Raises when
+        ``google-cloud-logging`` is not installed (not part of the base
+        ``module_gcp`` extra's hard requirements) or credentials are missing.
+        """
+        self._ensure_async_clients_for_current_loop()
+        if not self._logging_client:
+            raise RuntimeError(
+                "GCPModule logging client unavailable: "
+                + ("credentials missing" if not self._credentials else "google-cloud-logging not installed or no running event loop")
+            )
+        return self._logging_client
+
     # --- JobExecutionProtocol Implementation ---
 
     async def run_job(
@@ -642,9 +1140,20 @@ class GCPModule(
         job_name: str,
         args: Optional[List[str]] = None,
         env_vars: Optional[Dict[str, str]] = None,
+        execution_overrides: Optional[Any] = None,
     ) -> Any:
         """
         JobExecutionProtocol: Triggers a serverless job (Cloud Run job) asynchronously.
+
+        ``execution_overrides`` is a ``TaskExecutionOverrides`` instance (imported
+        lazily to avoid a hard dependency cycle).  Supported fields applied to
+        ``RunJobRequest.Overrides``:
+
+        - ``timeout_seconds`` → ``overrides.timeout`` (google.protobuf.duration_pb2.Duration).
+          Replaces the job-level ``timeout_seconds`` for this execution only.
+        - ``cpu`` / ``memory`` — NOT applied: the installed google-cloud-run client's
+          ``RunJobRequest.Overrides.ContainerOverride`` has no ``resources`` field.
+          Stored on the task model for future client upgrades; logged at DEBUG here.
         """
         project_id = self.get_project_id()
         region = self.get_region()
@@ -661,6 +1170,31 @@ class GCPModule(
                 for key, value in env_vars.items():
                     container_overrides.env.append(run_v2.EnvVar(name=key, value=value))
             request.overrides.container_overrides.append(container_overrides)
+
+        if execution_overrides is not None:
+            timeout_s = getattr(execution_overrides, "timeout_seconds", None)
+            if timeout_s:
+                try:
+                    from google.protobuf import duration_pb2
+                    request.overrides.timeout = duration_pb2.Duration(seconds=int(timeout_s))  # type: ignore[attr-defined]
+                    logger.debug(
+                        "GCPModule.run_job: applying per-execution timeout=%ds to job '%s'.",
+                        timeout_s, job_name,
+                    )
+                except ImportError:  # pragma: no cover — protobuf always present with run_v2
+                    logger.warning(
+                        "GCPModule.run_job: google.protobuf not available; "
+                        "timeout_seconds=%d override skipped for job '%s'.",
+                        timeout_s, job_name,
+                    )
+            cpu = getattr(execution_overrides, "cpu", None)
+            memory = getattr(execution_overrides, "memory", None)
+            if cpu or memory:
+                logger.debug(
+                    "GCPModule.run_job: cpu=%r / memory=%r overrides not applied for job '%s' "
+                    "(ContainerOverride has no resources field in this client version).",
+                    cpu, memory, job_name,
+                )
 
         try:
             operation = await client.run_job(request=request)
@@ -736,20 +1270,28 @@ class GCPModule(
                         )
                         continue
 
-                # Strategy 1 (explicit): TASK_TYPE env var — canonical task name
-                task_type = env_map.get("TASK_TYPE", "").strip() or None
+                # Strategy 1 (explicit): TASK_TYPE env var — comma-separated list
+                # of canonical task names this job advertises. A single value
+                # (the common case) works exactly as before; a list lets one
+                # job image host several task types — e.g. the generalized
+                # async_writer job (#2622), which drains storage_drain +
+                # event_drain alongside the elasticsearch_indexer bulk-reindex
+                # backstop, all from the same container.
+                task_types = [
+                    t.strip() for t in env_map.get("TASK_TYPE", "").split(",") if t.strip()
+                ]
 
                 # Strategy 2 (fallback): derive task type from SCOPE env var
-                if not task_type:
+                if not task_types:
                     for token in (
                         s.strip() for s in env_map.get("SCOPE", "").split(",") if s.strip()
                     ):
-                        task_type = _task_type_from_scope_token(token)
-                        if task_type:
+                        derived = _task_type_from_scope_token(token)
+                        if derived:
+                            task_types = [derived]
                             break
 
-                if task_type:
-                    job_map[task_type] = job_name
+                if task_types:
                     # Side-channel: capture per-job MAX_RETRIES env so
                     # GcpJobRunner can stamp it on the task row at create-time
                     # (caps long-running expensive jobs at deploy-time intent
@@ -763,11 +1305,13 @@ class GCPModule(
                             logger.warning(
                                 f"Job '{job_name}' has non-integer MAX_RETRIES='{max_retries_raw}'; ignoring."
                             )
-                    if extras:
-                        from dynastore.modules.gcp.tools.jobs import set_job_extras
-                        set_job_extras(task_type, extras)
+                    for task_type in task_types:
+                        job_map[task_type] = job_name
+                        if extras:
+                            from dynastore.modules.gcp.tools.jobs import set_job_extras
+                            set_job_extras(task_type, extras)
                     logger.info(
-                        f"Discovered GCP job: task '{task_type}' -> job '{job_name}' "
+                        f"Discovered GCP job: task(s) {task_types} -> job '{job_name}' "
                         f"(extras={extras or '{}'})"
                     )
         except Exception as e:
@@ -804,18 +1348,24 @@ class GCPModule(
                 # No definition found; use task_type (already in hyphenated form) as process id
                 process_id = task_type
                 if process_id not in seen_ids:
-                    synthetic = Process(
-                        id=process_id,
-                        title=f"Cloud Run Job: {job_name}",
-                        description=f"External Cloud Run job deployed as {job_name}",
-                        version="1.0.0",
-                        scopes=[ProcessScope.PLATFORM],
-                        jobControlOptions=[JobControlOptions.ASYNC_EXECUTE],
-                        outputTransmission=[TransmissionMode.VALUE],
-                        inputs={},
-                        outputs={},
-                        links=[],
-                    )
+                    # title/description are plain f-strings; Process.title/
+                    # .description are typed CoercibleLocalizedText (accepts str
+                    # at runtime via a BeforeValidator, but not statically as a
+                    # `Process(title=...)` kwarg). model_validate() runs the same
+                    # validators against an untyped mapping — same pattern as
+                    # tasks/dwh_join/definition.py.
+                    synthetic = Process.model_validate({
+                        "id": process_id,
+                        "title": f"Cloud Run Job: {job_name}",
+                        "description": f"External Cloud Run job deployed as {job_name}",
+                        "version": "1.0.0",
+                        "scopes": [ProcessScope.PLATFORM],
+                        "jobControlOptions": [JobControlOptions.ASYNC_EXECUTE],
+                        "outputTransmission": [TransmissionMode.VALUE],
+                        "inputs": {},
+                        "outputs": {},
+                        "links": [],
+                    })
                     result.append(synthetic)
                     seen_ids.add(process_id)
                     logger.info(
@@ -841,6 +1391,86 @@ class GCPModule(
                 + ("credentials missing" if not self._credentials else "no running event loop")
             )
         return self._run_client
+
+    # --- PlatformScalingProtocol Implementation ---
+
+    async def set_min_instances(self, n: int) -> None:
+        """Set Cloud Run's ``scaling.min_instance_count`` for this service.
+
+        Builds a MINIMAL ``Service`` patch touching only
+        ``scaling.min_instance_count`` via the update mask — never
+        ``template.scaling.*``, which rolls a new revision (cold start).
+        The patch object is constructed fresh, never round-tripped from a
+        fetched ``Service`` (a known client bug returns HTTP 409
+        "Revision ... already exists" when a fetched object is fed back
+        into an update: googleapis/google-cloud-python#14259).
+
+        No-ops (logs at DEBUG) when credentials are missing or this isn't
+        running as a named Cloud Run service. Never raises — transient API
+        errors are logged and swallowed so a reconciler tick is never lost
+        to a single failed actuation.
+        """
+        if self._credentials is None:
+            logger.debug(
+                "GCPModule.set_min_instances(%d): no GCP credentials — no-op.", n
+            )
+            return
+        project_id = self.get_project_id()
+        region = self.get_region()
+        service_name = self.get_service_name()
+        if not (project_id and region and service_name):
+            logger.debug(
+                "GCPModule.set_min_instances(%d): not a named Cloud Run service "
+                "(project_id=%s region=%s service_name=%s) — no-op.",
+                n, project_id, region, service_name,
+            )
+            return
+        try:
+            from google.protobuf import field_mask_pb2
+
+            client = self.get_run_client()
+            service_path = client.service_path(project_id, region, service_name)
+            patch = run_v2.Service(
+                name=service_path,
+                scaling=run_v2.ServiceScaling(min_instance_count=n),
+            )
+            request = run_v2.UpdateServiceRequest(
+                service=patch,
+                update_mask=field_mask_pb2.FieldMask(paths=["scaling.min_instance_count"]),
+            )
+            await client.update_service(request=request)
+            logger.info(
+                "GCPModule.set_min_instances: min_instance_count=%d for %s",
+                n, service_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — actuation must never crash the reconciler
+            logger.warning(
+                "GCPModule.set_min_instances(%d): update_service failed: %s",
+                n, exc, exc_info=True,
+            )
+
+    async def get_min_instances(self) -> Optional[int]:
+        """Read Cloud Run's current ``scaling.min_instance_count``.
+
+        Returns ``None`` when it cannot be determined (no credentials, not
+        a named Cloud Run service, transient API error).
+        """
+        if self._credentials is None:
+            return None
+        project_id = self.get_project_id()
+        region = self.get_region()
+        service_name = self.get_service_name()
+        if not (project_id and region and service_name):
+            return None
+        try:
+            client = self.get_run_client()
+            service_path = client.service_path(project_id, region, service_name)
+            service = await client.get_service(name=service_path)
+            scaling = getattr(service, "scaling", None)
+            return int(scaling.min_instance_count) if scaling is not None else None
+        except Exception as exc:
+            logger.debug("GCPModule.get_min_instances: get_service failed: %s", exc)
+            return None
 
     def _refresh_credentials(self) -> bool:
         """
@@ -943,44 +1573,68 @@ class GCPModule(
     @cached(maxsize=1, distributed=False)
     async def get_self_url(self) -> str:
         """
-        Dynamically discovers and returns the public URL of the running Cloud Run service.
-        The result is cached for subsequent calls.
-        This requires the service account to have the 'run.services.get' permission.
-        """
-        # Allow manual override via environment variable (useful for testing or non-Cloud Run envs)
-        service_url_override = os.getenv("SERVICE_URL")
-        if service_url_override:
-            return service_url_override
+        Returns the public URL of the running Cloud Run service, used as the
+        Pub/Sub push-subscription endpoint base.
 
+        Resolution order:
+        1. If K_SERVICE is set (i.e. we are inside Cloud Run), query the Cloud Run
+           Admin API for the canonical ``uri`` of this specific service revision.
+           SERVICE_URL is intentionally NOT consulted in this path — a misconfigured
+           SERVICE_URL pointing at a different environment (e.g. prod) would wire new
+           push subscriptions to the wrong service, causing GCS finalize events to be
+           lost on the service that actually owns the catalog.
+        2. If K_SERVICE is absent (local dev / test), fall back to SERVICE_URL, then
+           raise if neither is set.
+
+        The result is cached per process instance (maxsize=1, no distributed backend).
+        """
         service_name = self.get_service_name()
         if not service_name:
-            # Fallback for local development or testing via SERVICE_URL environment variable
+            # Not running inside Cloud Run — accept SERVICE_URL override for local dev/test.
             service_url = os.getenv("SERVICE_URL")
             if service_url:
+                logger.info(
+                    f"K_SERVICE not set; using SERVICE_URL override: {service_url}"
+                )
                 return service_url
             raise RuntimeError(
-                "Cannot determine self URL: K_SERVICE environment variable is not set and SERVICE_URL is missing. "
-                "This is not a Cloud Run environment."
+                "Cannot determine self URL: K_SERVICE environment variable is not set "
+                "and SERVICE_URL is missing. This is not a Cloud Run environment."
             )
+
+        # Running inside Cloud Run: discover the canonical URI via the Admin API.
+        # SERVICE_URL is explicitly skipped here — if it were accepted it could
+        # silently route push subscriptions to a different service (e.g. prod),
+        # causing GCS finalize events to be delivered there instead of this instance.
+        project_id = self.get_project_id()
+        region = self.get_region()
+        logger.info(
+            f"Discovering public URL for Cloud Run service '{service_name}' "
+            f"in project '{project_id}' region '{region}'."
+        )
+        # Resolve the client outside the try: a credentials failure raises its own
+        # RuntimeError ("run client unavailable: credentials missing"), which must
+        # propagate undecorated rather than being re-wrapped below as a
+        # run.services.get permission problem.
+        client = self.get_run_client()
         try:
-            project_id = self.get_project_id()
-            region = self.get_region()
-            logger.info(
-                f"Discovering public URL for Cloud Run service '{service_name}' in region '{region}'."
-            )
-            client = self.get_run_client()
             service_path = client.service_path(project_id or "", region or "", service_name)
             service_details = await client.get_service(name=service_path)
-            logger.info(f"Discovered and cached self URL: {service_details.uri}")
-            return service_details.uri
+            discovered_url = service_details.uri
+            logger.info(f"Discovered and cached self URL: {discovered_url}")
+            return discovered_url
         except Exception as e:
-            # Fallback for local development or testing where Cloud Run Admin API might not be accessible
-            # or permissions are missing, but we still need a URL for push subscriptions (even if it's localhost)
-            service_url = os.getenv("SERVICE_URL", "http://localhost")
-            logger.warning(
-                f"Failed to discover Cloud Run service URL: {e}. Falling back to default: {service_url}"
-            )
-            return service_url
+            # The Admin API call failed (missing run.services.get permission, network
+            # issue, etc.).  We cannot safely fall back to SERVICE_URL here — it might
+            # point at a different environment and silently misroute push subscriptions.
+            # Raise so the provisioning task retries rather than wiring a bad endpoint.
+            raise RuntimeError(
+                f"Failed to discover Cloud Run service URL for '{service_name}' "
+                f"(project={project_id}, region={region}). "
+                f"Grant the service account 'run.services.get' or set the correct "
+                f"PROJECT_ID / REGION environment variables. "
+                f"Original error: {e}"
+            ) from e
 
 
 def _should_register_gcp_job_runner() -> bool:

@@ -17,9 +17,14 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import os
 import socket
+import time
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, List, Optional, Any, Protocol, runtime_checkable
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from dynastore.models.scaling import ScalingSignal
 
 # Hard-import the async PG driver at module load.  When SCOPE excludes
 # ``module_db`` (e.g. Cloud Run jobs that use ``db_sync`` + DatastoreModule
@@ -35,12 +40,17 @@ from contextlib import asynccontextmanager
 import asyncpg  # noqa: F401  — gate the entry-point on the async driver
 
 from sqlalchemy import event
-from sqlalchemy.ext.asyncio import create_async_engine
-from typing import Optional, Any, Protocol, runtime_checkable
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy.engine import Engine
 from dynastore.modules import ModuleProtocol
 from dynastore.modules.db_config.db_config import DBConfig
+from dynastore.modules.db_config.db_timeout_config import (
+    build_connection_server_settings,
+    clamp_serving_statement_timeout,
+    pooler_timeout_set_local_sql,
+    register_pooler_timeout_guard,
+    resolve_timeout_settings,
+)
 from dynastore.modules.db_config.tools import (
     get_config,
     normalize_db_url,
@@ -116,6 +126,58 @@ class DBServiceAppState(Protocol):
     sync_engine: Optional[Engine]
 
 
+class PgPoolSignalProvider:
+    """``ScalingSignalProtocol``: this pod's PostgreSQL connection-pool saturation.
+
+    Reports ``checkedout() / (pool_min_size + pool_max_overflow)`` on the
+    SQLAlchemy async engine this module builds — the same pool whose
+    acquire waits ``query_executor._acquire_async_engine_connection`` logs
+    as ``db_pool_acquire slow``. Before this provider existed, the only
+    instance-scope signal feeding the autoscaling control loop
+    (``modules/scaling``) was ``DuckDbPoolSignalProvider``'s DuckDB
+    saturation — a real, CPU/memory-bound pool, but not the one Postgres
+    reads/writes actually contend on. A fleet whose hot path is PG-backed
+    (the common case) could stay fully saturated on this pool while
+    reporting near-zero DuckDB saturation, so the control loop would never
+    see a reason to scale out. Registering this alongside the DuckDB
+    provider closes that blind spot.
+
+    ``pool_max_overflow`` is read from the same ``DBConfig`` used to build
+    the engine rather than introspected off the live ``Pool`` object —
+    SQLAlchemy does not expose the configured ``max_overflow`` ceiling
+    (only the *current* ``overflow()`` count, which can be negative).
+    """
+
+    def __init__(self, engine: AsyncEngine, db_config: DBConfig) -> None:
+        self._engine = engine
+        self._db_config = db_config
+
+    def scaling_signals(self) -> List["ScalingSignal"]:
+        from dynastore.models.scaling import ScalingSignal
+
+        pool = self._engine.pool
+        checkedout = getattr(pool, "checkedout", None)
+        if checkedout is None:
+            return []
+        try:
+            in_use = checkedout()
+        except Exception:
+            return []
+        capacity = self._db_config.pool_min_size + self._db_config.pool_max_overflow
+        if capacity <= 0:
+            return []
+        saturation = max(0.0, min(1.0, in_use / capacity))
+        return [
+            ScalingSignal(
+                source="pg_pool",
+                metric="pool_saturation",
+                value=saturation,
+                scope="instance",
+                ts=time.time(),
+            )
+        ]
+
+
 class DBService(ModuleProtocol, DatabaseProtocol):
     priority: int = 10
     app_state: DBServiceAppState
@@ -178,6 +240,7 @@ class DBService(ModuleProtocol, DatabaseProtocol):
         # Check if engine is already injected (e.g. by tests)
         existing_engine = getattr(app_state, "engine", None)
         engine_created_by_service = False
+        pg_pool_signal_provider: Optional[PgPoolSignalProvider] = None
 
         if existing_engine:
             logger.info("DBService: Using existing engine from app_state.")
@@ -185,123 +248,209 @@ class DBService(ModuleProtocol, DatabaseProtocol):
             app_state.engine = None
 
         try:
-            if not existing_engine:
-                logger.info(
-                    f"DBService: Using DB configuration: {db_config.database_url}"
-                )
+            try:
+                if not existing_engine:
+                    logger.info(
+                        f"DBService: Using DB configuration: {db_config.database_url}"
+                    )
 
-                # Tag every wire-level connection with the logical service
-                # name so DB-side ``pg_stat_activity.application_name`` is
-                # populated. Without this every connection shows as the empty
-                # string and per-service contention cannot be diagnosed from
-                # the DB side. See #699 / #655.
-                from dynastore.modules.db_config.instance import (
-                    get_service_name,
-                )
-                app_name = get_service_name() or os.getenv(
-                    "SERVICE_NAME"
-                ) or "dynastore"
+                    # Tag every wire-level connection with the logical service
+                    # name so DB-side ``pg_stat_activity.application_name`` is
+                    # populated. Without this every connection shows as the empty
+                    # string and per-service contention cannot be diagnosed from
+                    # the DB side. See #699 / #655.
+                    #
+                    # ``application_name`` additionally carries this process's
+                    # stable instance id (geoid#2924) so a monitoring/reaper
+                    # query can tell individual replicas of the same service
+                    # apart — needed to recognize a session left behind by a
+                    # specific dead Cloud Run instance rather than the whole
+                    # service.
+                    from dynastore.modules.db_config.instance import (
+                        get_stamped_application_name,
+                    )
+                    app_name = get_stamped_application_name()
 
-                # 1. Create Engine
-                app_state.engine = create_async_engine(
-                    normalize_db_url(db_config.database_url, is_async=True),
-                    pool_size=db_config.pool_min_size,
-                    max_overflow=db_config.pool_max_overflow,
-                    # pool_timeout = max seconds to wait for a free slot from
-                    # QueuePool before raising sqlalchemy.exc.TimeoutError
-                    # (fail-fast; not the statement/command execution budget).
-                    # Previously this was fed pool_command_timeout (60s) which
-                    # is the wrong semantic — see DBConfig.pool_acquire_timeout
-                    # and #1894.
-                    pool_timeout=db_config.pool_acquire_timeout,
-                    pool_pre_ping=True,
-                    pool_recycle=db_config.pool_recycle,
-                    connect_args={
-                        "timeout": db_config.connect_timeout,
-                        # asyncpg has no libpq client-side keepalive params;
-                        # the equivalent server-side GUCs must be passed as
-                        # strings via server_settings so Cloud NAT never
-                        # silently drops the idle mapping. See #655.
-                        "server_settings": {
-                            "application_name": app_name,
-                            "tcp_keepalives_idle": str(
-                                db_config.tcp_keepalives_idle
+                    # Resolve timeout settings from PluginConfig, env, or DBConfig
+                    (
+                        lock_timeout,
+                        statement_timeout,
+                        idle_in_transaction_session_timeout,
+                    ) = resolve_timeout_settings(db_config)
+
+                    # Cap the shared serving engine's session statement_timeout
+                    # below the load-balancer/Cloud Run deadline (#2898).
+                    # DB_STATEMENT_TIMEOUT resolves to "0" (disabled, dev) or
+                    # values like "90s" (prod) that sit ABOVE the 60s LB
+                    # timeout, so a stuck query holds its connection to that
+                    # ceiling instead of being cancelled and reclaimed
+                    # server-side. This only affects the shared serving
+                    # engine -- task-side engines never apply statement_timeout,
+                    # and SET LOCAL overrides within a transaction still win.
+                    statement_timeout = clamp_serving_statement_timeout(
+                        statement_timeout,
+                        db_config.serving_statement_timeout_ceiling_seconds,
+                    )
+
+                    # 1. Create Engine
+                    app_state.engine = create_async_engine(
+                        normalize_db_url(db_config.database_url, is_async=True),
+                        pool_size=db_config.pool_min_size,
+                        max_overflow=db_config.pool_max_overflow,
+                        # pool_timeout = max seconds to wait for a free slot from
+                        # QueuePool before raising sqlalchemy.exc.TimeoutError
+                        # (fail-fast; not the statement/command execution budget).
+                        # Previously this was fed pool_command_timeout (60s) which
+                        # is the wrong semantic — see DBConfig.pool_acquire_timeout
+                        # and #1894.
+                        pool_timeout=db_config.pool_acquire_timeout,
+                        pool_pre_ping=True,
+                        pool_recycle=db_config.pool_recycle,
+                        connect_args={
+                            "timeout": db_config.connect_timeout,
+                            # Transaction-mode connection poolers (AlloyDB Managed
+                            # Connection Pooling / PgBouncer) multiplex one server
+                            # backend across many client sessions, so a prepared
+                            # statement cached against one backend may be absent —
+                            # or its numeric name already taken — on the next one
+                            # the pooler hands out. Disabling the driver's prepared
+                            # statement cache and giving every prepared statement a
+                            # unique name makes the asyncpg engine safe behind such
+                            # a pooler. It also avoids InvalidCachedStatementError
+                            # when ANOTHER instance emits DDL against shared objects
+                            # (per-catalog schema provisioning, CREATE EXTENSION) and
+                            # invalidates a cached statement's OIDs fleet-wide. See
+                            # SQLAlchemy asyncpg dialect "Prepared Statement Name
+                            # with PGBouncer" + asyncpg #837 / sqlalchemy #6467.
+                            # Deployment invariant: because each query now PREPAREs a
+                            # uniquely-named statement and never DEALLOCATEs it, the
+                            # pooler in front of us must reset the backend on release
+                            # (AlloyDB Managed Connection Pooling and PgBouncer both
+                            # run DISCARD ALL by default). Do NOT set server_reset_query
+                            # empty, or orphaned prepared statements accumulate per
+                            # backend for the life of the SQLAlchemy pool.
+                            "prepared_statement_cache_size": 0,
+                            "statement_cache_size": 0,
+                            "prepared_statement_name_func": (
+                                lambda: f"__asyncpg_{uuid4()}__"
                             ),
-                            "tcp_keepalives_interval": str(
-                                db_config.tcp_keepalives_interval
+                            # asyncpg has no libpq client-side keepalive params;
+                            # in DIRECT mode the equivalent server-side GUCs are
+                            # passed as strings via server_settings so Cloud NAT
+                            # never silently drops the idle mapping (#655), and
+                            # the lock-safety pair + clamped statement_timeout
+                            # ride the startup packet too. Behind a transaction
+                            # pooler (db_pooling_mode="transaction_pooler", #3081)
+                            # the builder returns application_name only — the
+                            # pooler rejects the rest as startup params — and
+                            # those timeouts are re-applied per transaction by
+                            # the begin-listener registered below. See
+                            # build_connection_server_settings() and
+                            # DBConfig.db_pooling_mode.
+                            "server_settings": build_connection_server_settings(
+                                db_config,
+                                application_name=app_name,
+                                lock_timeout=lock_timeout,
+                                idle_in_transaction_session_timeout=(
+                                    idle_in_transaction_session_timeout
+                                ),
+                                statement_timeout=statement_timeout,
                             ),
-                            "tcp_keepalives_count": str(
-                                db_config.tcp_keepalives_count
-                            ),
-                            # Bounded lock windows on every connection so a
-                            # stuck DDL or a leaked / interrupted transaction
-                            # can never block the whole application. lock_timeout
-                            # caps how long any statement waits to acquire a
-                            # lock; idle_in_transaction_session_timeout makes
-                            # PostgreSQL release a held lock server-side when a
-                            # transaction is left open idle — even if the client
-                            # was interrupted and never rolled back. See
-                            # DBConfig.lock_timeout.
-                            "lock_timeout": db_config.lock_timeout,
-                            "idle_in_transaction_session_timeout": (
-                                db_config.idle_in_transaction_session_timeout
-                            ),
-                            # statement_timeout bounds total statement EXECUTION
-                            # (not just the lock wait). "0" = disabled (default,
-                            # historical behaviour). Set DB_STATEMENT_TIMEOUT just
-                            # under pool_command_timeout to turn a silent 60s
-                            # client-side cancel into a logged 57014 naming the
-                            # slow query. SET LOCAL in long jobs overrides it.
-                            "statement_timeout": db_config.statement_timeout,
                         },
-                    },
-                )
-                # Arm client-side TCP keepalive on every asyncpg socket so a
-                # silently-dropped idle connection is detected fast instead of
-                # hanging the next pool_pre_ping for connect_timeout (#710).
-                _arm_client_socket_keepalive(app_state.engine, db_config)
-                engine_created_by_service = True
-                logger.info(
-                    "DBService: ASYNC Database connection pool established successfully."
-                )
-
-            # Self-heal the base Postgres extensions (postgis et al.) on the
-            # async engine before serving traffic. #1748 gated the sync-engine
-            # DatastoreModule — the historical owner of this bootstrap — off the
-            # API/catalog SCOPE, so on a freshly-provisioned database the catalog
-            # service would otherwise have NO path to ``CREATE EXTENSION postgis``
-            # and every geometry-typed write fails with "type geometry does not
-            # exist". Runs on the asyncpg engine, so it does NOT re-introduce the
-            # sync psycopg2 engine #1748 removed from API services. The call is
-            # guarded (DB-backed presence check, Valkey-cached positive keyed by
-            # database identity), so across the multi-Cloud-Run fleet the steady
-            # state is a single cache read, not repeated DDL on every pod boot.
-            # Best-effort: a failure here must never abort foundational startup.
-            _async_engine = getattr(app_state, "engine", None)
-            if _async_engine is not None:
-                try:
-                    from dynastore.modules.db_config.tools import (
-                        ensure_base_extensions,
+                    )
+                    # Arm client-side TCP keepalive on every asyncpg socket so a
+                    # silently-dropped idle connection is detected fast instead of
+                    # hanging the next pool_pre_ping for connect_timeout (#710).
+                    # Client-side, so it is kept in both modes — a transaction
+                    # pooler accepts client→pooler socket keepalives even though
+                    # it rejects the server-side keepalive GUCs (#3081).
+                    _arm_client_socket_keepalive(app_state.engine, db_config)
+                    # Behind a transaction pooler the lock-safety timeouts could
+                    # not ride the startup packet (stripped above), so re-apply
+                    # them per transaction via a begin-listener (#3081). No-op in
+                    # direct mode.
+                    register_pooler_timeout_guard(
+                        app_state.engine,
+                        pooler_timeout_set_local_sql(
+                            db_config,
+                            lock_timeout=lock_timeout,
+                            idle_in_transaction_session_timeout=(
+                                idle_in_transaction_session_timeout
+                            ),
+                            statement_timeout=statement_timeout,
+                        ),
+                    )
+                    engine_created_by_service = True
+                    logger.info(
+                        "DBService: ASYNC Database connection pool established successfully."
                     )
 
-                    await ensure_base_extensions(_async_engine)
-                except Exception:
-                    logger.warning(
-                        "DBService: base-extension ensure failed (best-effort) — "
-                        "continuing startup; geometry-typed writes may fail until "
-                        "the extensions exist.",
-                        exc_info=True,
-                    )
+                # Self-heal the base Postgres extensions (postgis et al.) on the
+                # async engine before serving traffic. #1748 gated the sync-engine
+                # DatastoreModule — the historical owner of this bootstrap — off the
+                # API/catalog SCOPE, so on a freshly-provisioned database the catalog
+                # service would otherwise have NO path to ``CREATE EXTENSION postgis``
+                # and every geometry-typed write fails with "type geometry does not
+                # exist". Runs on the asyncpg engine, so it does NOT re-introduce the
+                # sync psycopg2 engine #1748 removed from API services. The call is
+                # guarded (DB-backed presence check, Valkey-cached positive keyed by
+                # database identity), so across the multi-Cloud-Run fleet the steady
+                # state is a single cache read, not repeated DDL on every pod boot.
+                # Best-effort: a failure here must never abort foundational startup.
+                _async_engine = getattr(app_state, "engine", None)
+                if _async_engine is not None:
+                    try:
+                        from dynastore.modules.db_config.tools import (
+                            ensure_base_extensions,
+                        )
 
-            yield
+                        await ensure_base_extensions(_async_engine)
+                    except Exception:
+                        logger.warning(
+                            "DBService: base-extension ensure failed (best-effort) — "
+                            "continuing startup; geometry-typed writes may fail until "
+                            "the extensions exist.",
+                            exc_info=True,
+                        )
 
-        except Exception as e:
-            logger.critical(
-                f"DBService: FATAL: Failed to create database connection pool: {e}",
-                exc_info=True,
-            )
-            raise
+                if _async_engine is not None:
+                    try:
+                        from dynastore.tools.discovery import register_plugin
+
+                        pg_pool_signal_provider = PgPoolSignalProvider(_async_engine, db_config)
+                        register_plugin(pg_pool_signal_provider)
+                    except Exception:
+                        logger.warning(
+                            "DBService: PG pool signal provider failed to register — "
+                            "PostgreSQL pool saturation will not feed the autoscaling "
+                            "control loop.",
+                            exc_info=True,
+                        )
+                        pg_pool_signal_provider = None
+            except Exception as e:
+                logger.critical(
+                    f"DBService: FATAL: Failed to create database connection pool: {e}",
+                    exc_info=True,
+                )
+                raise
+
+            try:
+                yield
+            except Exception as e:
+                # The pool was already established above — an exception surfacing
+                # here comes from the application body or teardown, not from pool
+                # creation, so it must not be relabelled as a connection-pool
+                # creation failure (that misleads operators during shutdown).
+                logger.critical(
+                    f"DBService: Error during database service runtime or shutdown: {e}",
+                    exc_info=True,
+                )
+                raise
         finally:
+            if pg_pool_signal_provider is not None:
+                from dynastore.tools.discovery import unregister_plugin
+
+                unregister_plugin(pg_pool_signal_provider)
             logger.info("DBService: Database connection shutdown initiated...")
             # Only dispose if we created it
             if (

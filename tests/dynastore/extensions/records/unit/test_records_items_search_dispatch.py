@@ -82,6 +82,18 @@ class _FakeCatalogs:
     async def get_collection_config(self, catalog_id, collection_id, ctx=None):
         return None
 
+    async def resolve_catalog_id(self, catalog_id, allow_missing=False):
+        return None
+
+    async def resolve_catalog_alias(self, catalog_id):
+        return None
+
+    async def resolve_collection_alias(self, catalog_internal_id, collection_id):
+        return None
+
+    async def get_catalog_model(self, catalog_internal_id):
+        return None
+
     async def stream_items(self, **kwargs):
         self.stream_called = True
 
@@ -95,6 +107,13 @@ class _FakeCatalogs:
             catalog_id=kwargs["catalog_id"],
             collection_id=kwargs["collection_id"],
         )
+
+
+async def _read_body(resp) -> bytes:
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+    return b"".join(chunks)
 
 
 def _build_query_response(features: List[_GeoJSONFeature], total: int, cat, col):
@@ -129,14 +148,10 @@ async def test_get_records_uses_search_dispatch_when_available(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _fake_dispatch
     )
 
-    resp = await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, filter=None, sortby=None, q=None,
-    )
+    resp = await svc.get_records(**_get_records_defaults())
 
     import json
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
     assert body["type"] == "FeatureCollection"
     assert body["numberMatched"] == 2
     assert body["numberReturned"] == 2
@@ -162,14 +177,10 @@ async def test_get_records_falls_back_to_pg_when_dispatch_declines(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _decline
     )
 
-    resp = await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, filter=None, sortby=None, q=None,
-    )
+    resp = await svc.get_records(**_get_records_defaults())
 
     import json
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
     assert body["numberMatched"] == 1
     assert [f["id"] for f in body["features"]] == ["pg-1"]
     assert catalogs.stream_called is True
@@ -196,15 +207,102 @@ async def test_get_records_skips_dispatch_for_cql_filter(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _spy
     )
 
-    await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0,
-        filter="title = 'x'", sortby=None, q=None,
-    )
+    await svc.get_records(**_get_records_defaults(filter="title = 'x'"))
 
     assert called["dispatch"] is False  # short-circuited before dispatch
     assert catalogs.stream_called is True
+
+
+def _get_records_defaults(**overrides) -> dict:
+    """Full default kwarg set for a direct ``get_records`` call — a direct
+    call bypasses FastAPI's ``Query()``/``Depends()`` resolution, so every
+    parameter needs an explicit value (omitted ones would otherwise arrive
+    as the raw ``Query``/``Depends`` sentinel objects)."""
+    kwargs = dict(
+        request=_make_request(),
+        catalog_id="cat", collection_id="col",
+        conn=None, limit=10, offset=0,
+        filter=None, filter_lang="cql2-text", filter_crs=None,
+        properties=None, skip_geometry=None, return_geometry=None,
+        sortby=None, bbox=None, q=None,
+        request_hints=frozenset(),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_get_records_over_max_limit_clamps_instead_of_erroring(monkeypatch):
+    """OGC API - Features Part 1 Core /req/core/fc-limit-response-1: a
+    ``limit`` above the configured maximum (1000 by default) is clamped, not
+    rejected. No ``ConfigsProtocol`` is registered in this test — the
+    resilient ``_get_plugin_config`` fallback supplies the code-level
+    ``RecordsPluginConfig()`` defaults."""
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    captured = {}
+
+    async def _decline(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(limit=5000))
+
+    assert captured["limit"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_get_records_omitted_limit_uses_configured_default(monkeypatch):
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    captured = {}
+
+    async def _decline(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(limit=None))
+
+    assert captured["limit"] == 10
+
+
+@pytest.mark.asyncio
+async def test_get_records_in_range_limit_is_unchanged(monkeypatch):
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    captured = {}
+
+    async def _decline(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(limit=250))
+
+    assert captured["limit"] == 250
 
 
 @pytest.mark.asyncio
@@ -228,11 +326,47 @@ async def test_get_records_skips_dispatch_for_free_text_q(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _spy
     )
 
-    await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, filter=None, sortby=None, q="rainfall",
-    )
+    await svc.get_records(**_get_records_defaults(q="rainfall"))
 
     assert called["dispatch"] is False
     assert catalogs.stream_called is True
+
+
+@pytest.mark.asyncio
+async def test_get_records_threads_collection_id_into_plugin_config_lookup(monkeypatch):
+    """#2717: a collection-scoped ``RecordsPluginConfig`` override (e.g. a
+    tighter ``default_limit``/``max_limit``) must actually be consulted — the
+    lookup has to carry ``collection_id``, not just ``catalog_id``, mirroring
+    the STAC ``_get_stac_config`` reference pattern."""
+    from dynastore.extensions.records.config import RecordsPluginConfig
+
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    config_calls: list = []
+
+    async def _get_configs():
+        class _Cfg:
+            async def get_config(self, cls, catalog_id=None, collection_id=None, ctx=None):
+                config_calls.append(
+                    {"catalog_id": catalog_id, "collection_id": collection_id}
+                )
+                return RecordsPluginConfig()
+
+        return _Cfg()
+
+    monkeypatch.setattr(svc, "_get_configs_service", _get_configs, raising=False)
+
+    async def _decline(**kwargs):
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(catalog_id="cat", collection_id="col"))
+
+    assert {"catalog_id": "cat", "collection_id": "col"} in config_calls

@@ -22,7 +22,7 @@ import logging
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, FrozenSet, List, Optional, Any, Dict, Union, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, FrozenSet, List, Optional, Any, Dict, Union, Sequence, Tuple
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.router import ResolvedDriver
@@ -44,6 +44,7 @@ from dynastore.models.ogc import Feature
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.protocols.items import ItemsProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.execution_context import in_task_run
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules.db_config import shared_queries
@@ -160,6 +161,27 @@ def _collect_generated_stats(
             if name in sc_payload:
                 flat[name] = sc_payload[name]
     return flat
+
+
+def _merge_index_results_into(
+    existing: Dict[str, Any],
+    batch_results: Dict[str, Any],
+) -> None:
+    """Merge one write's per-indexer ``BulkResult``s into the running
+    per-request totals in-place (``ctx.extensions["_index_results"]``).
+
+    Bounded merge (#2657) — delegates to :func:`merge_bulk_results` so the
+    accumulated ``failures`` detail list stays capped even when a single
+    request folds in many chunked writes (e.g. the ingestion task's inline
+    per-batch dispatch), instead of growing unbounded across the request.
+    """
+    from dynastore.models.protocols.indexer import merge_bulk_results
+
+    for indexer_id, bulk_res in batch_results.items():
+        if indexer_id in existing:
+            existing[indexer_id] = merge_bulk_results(existing[indexer_id], bulk_res)
+        else:
+            existing[indexer_id] = bulk_res
 
 
 async def _storage_resolves_columnar_async(
@@ -428,6 +450,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         lang: str = "en",
         context: Optional[FeaturePipelineContext] = None,
         read_policy: Optional[Any] = None,
+        collection_type: Optional[str] = None,
+        allow_geometry: Optional[bool] = None,
     ) -> Feature:
         """
         Canonical row-to-Feature mapper. Runs each configured sidecar's
@@ -454,6 +478,20 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         ``read_policy`` (optional) is published into context as
         ``_items_read_policy`` so sidecars can consult wire-shape decisions
         (e.g. external_id-as-feature-id) without re-fetching configs per row.
+
+        ``collection_type`` / ``allow_geometry`` (#2655, both optional) let a
+        caller that already knows the real ``CollectionInfo.kind`` thread it
+        into the internal ``_effective_sidecars`` resolution — the same
+        resolution ``collection_has_geometry()`` and
+        ``ItemsPostgresqlDriver._get_effective_driver_config`` use — so a
+        RECORDS row is mapped without resolving a geometry sidecar it will
+        never have data for. Left unset (the default for every current
+        caller), resolution is unchanged: ``_effective_sidecars`` falls back
+        to its own ``"VECTOR"`` default, exactly as before this parameter
+        existed. This is safe either way because the geometry sidecar's row
+        mapping only acts when a ``"geom"`` key is present in ``row`` — the
+        SELECT/JOIN that produces ``row`` is already gated on the real
+        collection type upstream (``_get_effective_driver_config``).
         """
 
         if not row:
@@ -502,8 +540,14 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         from dynastore.modules.storage.drivers.pg_sidecars.base import (
             SidecarProtocol,
         )
+        _effective_sidecars_kwargs: Dict[str, Any] = {}
+        if collection_type is not None:
+            _effective_sidecars_kwargs["collection_type"] = collection_type
+        if allow_geometry is not None:
+            _effective_sidecars_kwargs["context"] = {"allow_geometry": allow_geometry}
         sidecar_configs = _effective_sidecars(
             col_config, catalog_id="", collection_id="",
+            **_effective_sidecars_kwargs,
         )
         # Note: ``stac_metadata`` is now a first-class sidecar with its
         # own DDL/JOIN/SELECT (PR-G2). When the stac extension is loaded,
@@ -1061,6 +1105,28 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        # ── Resolve external → internal ids at the write boundary ─────────────
+        # catalog_id and collection_id from URL path params are public external
+        # ids.  Everything persisted (ES _source catalog_id/collection_id, ES
+        # index name, ES _routing, PG hub schema name, OUTBOX task rows) must
+        # use the IMMUTABLE internal id so a rename never stales stored items.
+        # Resolution is done once here so all downstream code (Branch A and B,
+        # _dispatch_index_upsert, fan-out) receives internal ids.
+        from dynastore.tools.discovery import get_protocol as _get_proto
+        from dynastore.models.protocols import CatalogsProtocol as _CatProto
+        _catalogs_svc = _get_proto(_CatProto)
+        if _catalogs_svc is not None:
+            _internal_cat = await _catalogs_svc.resolve_catalog_id(
+                catalog_id, allow_missing=True
+            )
+            if _internal_cat is not None:
+                catalog_id = _internal_cat
+            _internal_col = await _catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if _internal_col is not None:
+                collection_id = _internal_col
+
         # Determine if single or bulk to return consistent type
         is_single = False
         items_list = []
@@ -1187,19 +1253,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 # without additional round-trips.
                 if ctx is not None and _index_results:
                     existing = ctx.extensions.get("_index_results") or {}
-                    # Merge per-batch results: accumulate succeeded/failed totals.
-                    for indexer_id, bulk_res in _index_results.items():
-                        if indexer_id in existing:
-                            prev = existing[indexer_id]
-                            from dynastore.models.protocols.indexer import BulkResult
-                            existing[indexer_id] = BulkResult(
-                                total=prev.total + bulk_res.total,
-                                succeeded=prev.succeeded + bulk_res.succeeded,
-                                failed=prev.failed + bulk_res.failed,
-                                failures=prev.failures + bulk_res.failures,
-                            )
-                        else:
-                            existing[indexer_id] = bulk_res
+                    _merge_index_results_into(existing, _index_results)
                     ctx.extensions["_index_results"] = existing
 
             # Write-reactive tile-cache invalidation (#1292 / #1297 Phase 2b):
@@ -1361,7 +1415,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 collection_type=ct.kind.value,
-                context={"stac_items_pg": stac_items_pg},
+                context={"stac_items_pg": stac_items_pg, "allow_geometry": ct.allow_geometry},
             )
 
             sidecars: List[Any] = []
@@ -1615,10 +1669,68 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         # commit. Rejections are surfaced to the caller via
         # ``ctx.extensions["_rejections"]`` so the HTTP layer can build a 207
         # ``IngestionReport`` instead of reporting a 500 on a single bad row.
-        from dynastore.modules.storage.errors import SidecarRejectedError
+        from dynastore.modules.storage.errors import SidecarRejectedError, ConflictError
         rejections: List[Dict[str, Any]] = []
+        _use_batch_insert = (
+            items_write_policy is not None
+            and getattr(items_write_policy, "enable_batch_insert", False)
+        )
         for start in range(0, len(prepared), chunk_size):
             chunk = prepared[start:start + chunk_size]
+
+            # ── Batch fast path ────────────────────────────────────────────
+            # Attempt a multi-row INSERT when enable_batch_insert is True and
+            # the chunk has more than one plan.  The batch method opens its own
+            # managed_transaction; if it raises (geometry error, constraint
+            # violation, etc.) the transaction has already rolled back and we
+            # fall through to the per-row path which opens a fresh one.
+            # ConflictError (REFUSE_FAIL / refuse_batch) must propagate
+            # immediately — same as the per-row path.
+            if _use_batch_insert and len(chunk) > 1:
+                _batch_ok = False
+                try:
+                    async with managed_transaction(engine) as conn:
+                        _batch_rows, _batch_rejs = (
+                            await self.batch_insert_or_update_distributed(
+                                conn,
+                                catalog_id,
+                                collection_id,
+                                chunk,
+                                col_config=col_config,
+                                sidecars=sidecars,
+                                write_policy=items_write_policy,
+                            )
+                        )
+                    rejections.extend(_batch_rejs)
+                    for plan, row in zip(chunk, _batch_rows):
+                        if row is None:
+                            continue  # rejected — already in _batch_rejs
+                        write_results.append(row)
+                        item_ctx = plan["item_context"]
+                        hub_pl = plan["hub_payload"]
+                        generated_stats.append({
+                            "geoid": row.get("geoid", plan["geoid"]),
+                            "external_id": item_ctx.get("external_id"),
+                            "asset_id": item_ctx.get("asset_id"),
+                            "transaction_time": hub_pl.get("transaction_time"),
+                            "deleted_at": hub_pl.get("deleted_at"),
+                            "validity": hub_pl.get("validity"),
+                            "stats": _collect_generated_stats(
+                                plan["sidecar_payloads"], stat_names
+                            ),
+                        })
+                    _batch_ok = True
+                except ConflictError:
+                    raise
+                except Exception as _batch_exc:
+                    logger.warning(
+                        "Batch insert fell back to per-row for chunk [%d:%d]: %s",
+                        start, start + chunk_size, _batch_exc,
+                    )
+                if _batch_ok:
+                    continue
+
+            # ── Per-row path (unchanged) ───────────────────────────────────
             async with managed_transaction(engine) as conn:
                 for plan in chunk:
                     try:
@@ -2152,8 +2264,25 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 dispatcher, catalog_id, collection_id, ops, pg_conn=None,
             )
 
-        # Phase 2f: open a wrapping TX so the outbox INSERT (if any) is
-        # atomic with the indexer attempt.
+        # Inside a task/job run the ASYNC secondary write is absorbed inline
+        # (see IndexDispatcher.fan_out_bulk). Do NOT wrap that inline ES
+        # fan-out in a single wrapping transaction: it would park one pooled
+        # connection with an open transaction for the whole sequential
+        # dispatch, re-introducing the DB-pool / idle-in-transaction pressure
+        # this inline path exists to relieve. Instead hand the dispatcher a
+        # transaction factory so it opens a SHORT transaction per chunk —
+        # the connection is held only across one chunk's dispatch (kept open
+        # so an on-failure outbox enqueue stays durable) and released between
+        # chunks.
+        if in_task_run():
+            return await self._do_dispatch(
+                dispatcher, catalog_id, collection_id, ops,
+                pg_conn=None,
+                tx_factory=lambda: managed_transaction(engine),
+            )
+
+        # Serving path — Phase 2f: open a single wrapping TX so the outbox
+        # INSERT (if any) is atomic with the indexer attempt.
         async with managed_transaction(engine) as conn:
             return await self._do_dispatch(
                 dispatcher, catalog_id, collection_id, ops, pg_conn=conn,
@@ -2167,9 +2296,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         ops: List[Any],
         *,
         pg_conn: Optional[DbResource],
+        tx_factory: Optional[Callable[[], Any]] = None,
     ) -> Dict[str, Any]:
         """Inner dispatch helper — split out so the wrapping TX in
         :meth:`_dispatch_index_upsert` is a single ``async with`` block.
+
+        ``tx_factory``, when supplied, is a zero-arg callable returning an
+        ``async with``-able transaction (used by the in-task-run inline path
+        so the dispatcher opens a fresh short transaction per chunk instead
+        of running under one long-lived ``pg_conn``).
 
         Returns the per-indexer :class:`BulkResult` dict from
         :meth:`~IndexDispatcher.fan_out_bulk` so callers can inspect
@@ -2187,7 +2322,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             entity_type="item",
         )
         try:
-            return await dispatcher.fan_out_bulk(ctx, ops)
+            return await dispatcher.fan_out_bulk(ctx, ops, tx_factory=tx_factory)
         except IndexerFatal:
             # FATAL contract: a routing entry with on_failure=FATAL
             # MUST propagate so the caller's TX rolls back.  Don't
@@ -2240,6 +2375,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         footprint's tiles are dropped too.
         """
         if not results and not prior_bboxes:
+            return
+        if (processing_context or {}).get("defer_tile_invalidation"):
+            # The caller (bulk ingestion) suppresses per-batch invalidation and
+            # enqueues ONE coalesced tiles_invalidate for the whole ingested
+            # extent when it finishes — otherwise a large ingestion spawns one
+            # task per write batch (hundreds of redundant invalidations).
             return
         from dynastore.modules.tiles.tile_cache_sync import (
             enqueue_tile_invalidation_task,

@@ -61,6 +61,17 @@ class DynamicSource(BaseModel):
     target_attribute: Optional[str] = None
     custom_query: Optional[str] = None
 
+# STAC Datacube v2.3.0's `additional_dimension` / `vertical_spatial_dimension`
+# schema definitions require `type` + (`extent` OR `values`) on every entry
+# (see stac-extensions.github.io/datacube/v2.3.0/schema.json). DynaStore's own
+# pagination convention (`size` / `href` / `generator`, below) is not part of
+# that ratified schema, so a collection carrying a paginated dimension must
+# declare this URI *in addition to* the standard datacube URI, rather than
+# let the extra fields ride silently under the v2.3.0 conformance claim. This
+# reuses the same OGC Dimensions pagination building block already declared
+# by the `_dimensions_` reference-implementation path (dimensions_extension.py).
+OGC_DIMENSIONS_PAGINATION_URI = "http://www.opengis.net/spec/ogc-dimensions/1.0/conf/dimension-pagination"
+
 class DatacubeDimension(BaseModel):
     """STAC Datacube dimension with OGC Dimensions pagination support.
 
@@ -108,6 +119,38 @@ class DatacubeDimension(BaseModel):
             "See ogc-dimensions spec/schema/generator.json for the full schema."
         ),
     )
+
+    @model_validator(mode="after")
+    def ensure_datacube_extent_or_values(self) -> "DatacubeDimension":
+        """Guarantee STAC datacube v2.3.0 schema validity (#2985).
+
+        The v2.3.0 schema's ``additional_dimension`` definition requires
+        ``type`` plus either ``extent`` or ``values`` on every entry. A
+        paginated dimension (``size``/``href``/``generator`` set, members
+        too numerous to enumerate inline) previously could omit both,
+        producing a ``cube:dimensions`` entry that failed schema validation
+        while the collection still declared the v2.3.0 conformance URI.
+
+        For non-spatial dimensions missing both, synthesize an open/unbounded
+        ``extent`` (``[None, None]``) — the schema's ``extent_open``
+        definition explicitly allows null bounds for exactly this "the real
+        range lives behind ``href``" case, and this codebase already uses the
+        same null-bounds idiom for unknown temporal extents elsewhere
+        (``stac_generator.py``'s collection-extent fallback).
+
+        Spatial dimensions are left untouched: the schema's
+        ``horizontal_spatial_dimension`` branch requires a genuine numeric
+        ``extent`` with no values-only or null fallback, so a missing extent
+        there is an authoring gap the operator must fix, not one we can
+        paper over.
+        """
+        if (
+            self.extent is None
+            and self.values is None
+            and self.type != DatacubeDimensionType.SPATIAL
+        ):
+            self.extent = [None, None]
+        return self
 
 class HierarchyRule(BaseModel):
     """Defines a specific hierarchy level rule based on row content."""
@@ -358,5 +401,44 @@ class StacPluginConfig(ExposableConfigMixin, PluginConfig):
             "Defaults to False to prevent blocking network I/O on the async "
             "event loop during ingest.  Set to True only when a local schema "
             "cache is in place and the deployment can afford the latency."
+        ),
+    )
+
+    # --- Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*) ---
+    #
+    # Two pairs, mirroring the two distinct page-size policies already in
+    # code: items/search-style listings default to a small page with a
+    # protective ceiling, while the platform-wide /catalogs listing defaults
+    # larger with a higher ceiling (mirrors the Joins extension's own
+    # 100/10 000 pair for the same "listing a small root resource" shape).
+    default_limit: Mutable[int] = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Page size for items/search-style STAC listings (collection "
+            "items, item search, collection search, virtual assets/hierarchy) "
+            "when ``limit`` is omitted."
+        ),
+    )
+    max_limit: Mutable[int] = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Maximum page size for items/search-style STAC listings. A "
+            "requested ``limit`` above this value is clamped, never rejected "
+            "(fc-limit-response-1)."
+        ),
+    )
+    catalogs_default_limit: Mutable[int] = Field(
+        default=100,
+        ge=1,
+        description="Page size for GET /stac/catalogs when ``limit`` is omitted.",
+    )
+    catalogs_max_limit: Mutable[int] = Field(
+        default=10_000,
+        ge=1,
+        description=(
+            "Maximum page size for GET /stac/catalogs. A requested ``limit`` "
+            "above this value is clamped, never rejected (fc-limit-response-1)."
         ),
     )

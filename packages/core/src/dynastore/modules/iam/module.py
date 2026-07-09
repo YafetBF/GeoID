@@ -179,28 +179,57 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             # Compiled-rule cache TTL / rule-version refresher (#1343).
             # Pulls the live ``IamScaleConfig`` TTL + maxsize snapshot and
             # the platform binding-version counter on a slow timer so the
-            # sync hot path consumes them without an async hop. Registered
-            # on the exit stack so it stops cleanly on module unload.
+            # sync hot path consumes them without an async hop. Managed by
+            # BackgroundSupervisor so lifecycle is uniform with other services.
+            import asyncio as _asyncio
+            from dynastore.tools.background_service import (
+                BackgroundSupervisor as _IamBgSupervisor,
+                ServiceContext as _IamServiceContext,
+            )
+            from dynastore.modules.db_config.instance import (
+                get_service_name as _iam_get_service_name,
+            )
+            from dynastore.modules.iam.compiled_rule_cache import (
+                IamRuleCacheRefreshService,
+                refresh_config_snapshot,
+                iam_rule_version_async,
+            )
+            _iam_bg_shutdown = _asyncio.Event()
+            _iam_supervisor = _IamBgSupervisor()
+            _iam_supervisor.register(IamRuleCacheRefreshService())
+            # One initial refresh so the first cache read sees the live TTL
+            # and rule-version without waiting for the first tick.
             try:
-                from dynastore.modules.iam.compiled_rule_cache import (
-                    start_background_refresh,
-                )
-                _stop_refresh = await start_background_refresh()
-
-                @asynccontextmanager
-                async def _refresh_ctx():
-                    try:
-                        yield
-                    finally:
-                        await _stop_refresh()
-
-                await stack.enter_async_context(_refresh_ctx())
+                await refresh_config_snapshot()
+                await iam_rule_version_async("iam")
             except Exception:
                 logger.warning(
-                    "IamModule: compiled-rule cache refresher failed to start; "
+                    "IamModule: initial rule-cache snapshot failed; "
                     "TTL/version snapshots fall back to in-source defaults",
                     exc_info=True,
                 )
+            try:
+                _iam_db = get_protocol(DatabaseProtocol)
+                _iam_bg_engine = _iam_db.engine if _iam_db else None
+            except Exception:
+                _iam_bg_engine = None
+            _iam_bg_ctx = _IamServiceContext(
+                engine=_iam_bg_engine,
+                shutdown=_iam_bg_shutdown,
+                is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                name=_iam_get_service_name() or "unknown",
+            )
+            _iam_supervisor.start(_iam_bg_ctx)
+
+            async def _stop_iam_supervisor() -> None:
+                # Registered on the exit stack (LIFO: runs before the manager /
+                # DB teardown) so the refresher loop is always drained — even if
+                # an exception is raised after start() but before/at yield, which
+                # a bare post-yield stop would skip and leak the background task.
+                _iam_bg_shutdown.set()
+                await _iam_supervisor.stop()
+
+            stack.push_async_callback(_stop_iam_supervisor)
 
             yield
 
@@ -644,9 +673,20 @@ async def _seed_catalog_roles(conn: Any, schema: str, iam_storage: Any) -> None:
                 )
 
 
-@lifecycle_registry.sync_catalog_initializer()
+@lifecycle_registry.sync_catalog_initializer(critical=True)
 async def initialize_iam_tenant(conn: DbResource, schema: str, catalog_id: str):
-    """Initializes IAM and Policy tables within a tenant schema."""
+    """Initializes IAM and Policy tables within a tenant schema.
+
+    Registered ``critical=True``: this hook is the single owner of every
+    per-tenant IAM table (``roles``, ``role_hierarchy``, ``grants``,
+    ``policies`` + partitions). Authorization hard-depends on ``policies``,
+    so a silent SAVEPOINT rollback here (leaving a catalog that fails closed
+    with a 403 on every request) is worse than failing the create. Being
+    critical, a rollback aborts catalog creation so the tables commit
+    atomically with the catalog or not at all. The DDL is idempotent
+    (``CREATE ... IF NOT EXISTS`` + table sentinel), so a re-provision of a
+    catalog missing any table self-heals on the next create.
+    """
     logger.info(
         f"Initializing IAM tables for tenant: {catalog_id} in schema {schema}"
     )
@@ -667,3 +707,47 @@ async def initialize_iam_tenant(conn: DbResource, schema: str, catalog_id: str):
     # the IamRolesConfig catalog_roles so auth evaluations work on first
     # tenant access without requiring an explicit preset apply.
     await _seed_catalog_roles(conn, schema=schema, iam_storage=storage)
+
+
+from dynastore.modules.catalog.event_service import (  # noqa: E402
+    CatalogEventType,
+    sync_event_listener,
+)
+
+
+@sync_event_listener(CatalogEventType.AFTER_CATALOG_HARD_DELETION)
+async def _purge_applied_presets_on_catalog_hard_deletion(catalog_id: str, **kwargs: Any) -> None:
+    """Remove all iam.applied_presets rows scoped to this catalog.
+
+    Runs inside the catalog hard-delete transaction via ``db_resource=conn``
+    so the preset purge is atomic with the catalog row removal.  If the
+    connection is not passed (manual invocation) the service falls back to
+    its own managed transaction.
+
+    Covers both the exact ``catalog:<id>`` scope and every descendant scope
+    (``catalog:<id>/collection:<col>``) so a recreated catalog with the same
+    id starts with no inherited preset state.
+    """
+    from dynastore.models.protocols import DatabaseProtocol
+    from .applied_presets_service import AppliedPresetsService
+
+    conn = kwargs.get("db_resource")
+    if conn is None:
+        db = get_protocol(DatabaseProtocol)
+        conn = db.engine if db else None
+
+    try:
+        svc = AppliedPresetsService(conn)
+        deleted = await svc.delete_for_catalog(catalog_id, conn=conn)
+        logger.info(
+            "Purged %d applied_presets row(s) for hard-deleted catalog %r.",
+            deleted or 0,
+            catalog_id,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to purge applied_presets for catalog %r; "
+            "stale preset rows may remain in iam.applied_presets.",
+            catalog_id,
+            exc_info=True,
+        )

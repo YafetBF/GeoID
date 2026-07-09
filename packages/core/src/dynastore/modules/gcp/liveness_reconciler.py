@@ -22,8 +22,7 @@
 cold-start duration, fragile the moment the image grows or a region throttles.
 This reconciler replaces the guess with a real signal.
 
-Every ``interval_seconds`` (default 20s — faster than the MaintenanceSupervisor
-``task_reaper`` cadence, so it gets first look) it scans lapsed-lease
+Every ``interval_seconds`` (default from ``LeadershipConfig.leadership_interval_seconds``) it scans lapsed-lease
 ``gcp_cloud_run_*`` task rows and, for each, asks the owning runner — via
 :class:`LivenessProbeProtocol` — whether the Cloud Run execution backing the row
 is actually alive. It then acts on the verdict:
@@ -48,10 +47,19 @@ import logging
 import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional, Union
 
 from dynastore.modules.tasks import tasks_module
 from dynastore.modules.tasks.liveness import LivenessVerdict, resolve_probe, resolve_stop_signal
+from dynastore.modules.tasks.reconciliation import VerdictAction, decide_verdict_action
+from dynastore.modules.db_config.connection_health_config import resolve_leadership_config
+from dynastore.tools.background_service import (
+    Leadership,
+    LeaseRenewalMode,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,92 +100,99 @@ class ReconcileOutcome(NamedTuple):
     race_lost: bool = False
 
 
-# How long (in seconds) to keep trying graceful cancel before escalating
-# to force_stop on a DISMISSED-but-still-alive execution.  The reference
-# point is ``last_heartbeat_at`` (most recent alive signal from the job
-# container) falling back to ``timestamp`` (row creation time).  A value
-# of 600s (10 minutes) covers the worst-case Cloud Run cold-start window
-# plus a generous SIGTERM drain period, without letting a dismissed
-# execution run indefinitely.
-_DISMISS_FORCE_DELETE_AFTER: timedelta = timedelta(seconds=600)
+def _get_dismiss_force_delete_after() -> timedelta:
+    """Get the grace period before force-deleting dismissed liveness records.
 
-
-class GcpLivenessReconciler:
-    """Background loop that reconciles lapsed-lease Cloud Run task rows.
-
-    Lifecycle is explicit (``start`` / ``stop``) so the host — ``GCPModule``'s
-    lifespan — owns it cleanly. One bad row never kills the loop; one failed
-    pass never kills the loop.
+    Configuration: Resolved from
+    ``LeadershipConfig.dismiss_force_delete_after_seconds`` (default 600s).
     """
+    _, dismiss_seconds, _, _, _ = resolve_leadership_config()
+    return timedelta(seconds=dismiss_seconds)
+
+
+class GcpLivenessReconciler(PeriodicService):
+    """Periodic service that reconciles lapsed-lease Cloud Run task rows.
+
+    ``BackgroundSupervisor`` owns the loop lifecycle. One bad row never kills
+    the loop; one failed pass is logged and the supervisor continues on the
+    next cadence tick.
+
+    Leadership policy: ``LEADER_ONLY`` — exactly one pod per service drives
+    the reconciler writes. Followers skip until the advisory lock is free.
+
+    Pod policy: ``SKIP_EPHEMERAL`` — Cloud Run Job containers run one task
+    and exit; they must not open reconciler connections or contend on task rows.
+    This is defense-in-depth alongside the existing
+    ``_should_register_gcp_job_runner()`` gate in ``GCPModule.lifespan``.
+    """
+
+    name = "gcp_liveness_reconciler"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    # Default cadence (20s) sits close to the lease TTL (30s); per-tick
+    # acquire/release would re-elect almost every cycle. Heartbeat mode
+    # holds tenure across ticks and renews on its own cadence instead (#2900).
+    lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
 
     def __init__(
         self,
-        engine: Any,
+        engine: Any = None,
         *,
-        interval_seconds: float = 20.0,
-        extend_visibility_seconds: int = 300,
-        unknown_grace_seconds: int = 180,
+        interval_seconds: float | None = None,
+        extend_visibility_seconds: int | None = None,
+        unknown_grace_seconds: int | None = None,
+        staleness_grace_seconds: int | None = None,
+        staleness_max_passes: int | None = None,
     ) -> None:
-        self._engine = engine
-        self._interval_seconds = float(interval_seconds)
-        self._extend_visibility_seconds = int(extend_visibility_seconds)
-        self._unknown_grace_seconds = int(unknown_grace_seconds)
-        self._task: Optional[asyncio.Task] = None
-        self._stopped = asyncio.Event()
+        from dynastore.modules.db_config.instance import get_service_name as _get_service_name
+        service = _get_service_name() or "unknown"
 
-    # --- lifecycle ---------------------------------------------------------
+        # Resolve configurable leadership settings
+        _, _, cfg_interval, cfg_visibility, cfg_unknown_grace = resolve_leadership_config()
 
-    def start(self) -> None:
-        """Spawn the reconcile loop. Idempotent — a running loop is left alone."""
-        if self._task is not None and not self._task.done():
-            return
-        self._stopped.clear()
-        self._task = asyncio.create_task(self._run_loop())
+        self.cadence_seconds: float = float(interval_seconds if interval_seconds is not None else cfg_interval)
+        self.lock_key: Optional[Union[int, str]] = f"gcp-liveness-reconciler:{service}"
+        self._engine: Any = engine
+        self._extend_visibility_seconds: int = int(extend_visibility_seconds if extend_visibility_seconds is not None else cfg_visibility)
+        self._unknown_grace_seconds: int = int(unknown_grace_seconds if unknown_grace_seconds is not None else cfg_unknown_grace)
+        # geoid#2819: non-locking staleness detection tunables. Defaults here
+        # (mirroring the backstop's hardcoded-default pattern above) are
+        # overridden by GcpModuleConfig.liveness_staleness_grace_seconds /
+        # liveness_staleness_max_passes when wired from gcp_module.py.
+        self._staleness_grace_seconds: int = int(
+            staleness_grace_seconds if staleness_grace_seconds is not None else 60
+        )
+        self._staleness_max_passes: int = int(
+            staleness_max_passes if staleness_max_passes is not None else 2
+        )
+        # In-process streak tracker: task_id -> consecutive passes seen by the
+        # non-locking staleness scan but NOT reached by this pass's FOR UPDATE
+        # SKIP LOCKED scan. Leader-gated (this instance only ticks on the
+        # elected leader pod), so no cross-pod synchronization is needed —
+        # a leadership handoff simply restarts the streak, which is safe:
+        # a genuinely stuck row re-accumulates the streak within
+        # ``staleness_max_passes`` more ticks.
+        self._stale_streak: Dict[Any, int] = {}
 
-    async def stop(self) -> None:
-        """Signal the loop to stop, cancel it, and await its teardown.
+    # --- PeriodicService tick ----------------------------------------------
 
-        Safe to call when the reconciler was never started.
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One reconcile pass, driven by ``BackgroundSupervisor`` on cadence.
+        
+        Uses ``ctx.lock_connection`` when available (LEADER_ONLY mode) to reuse
+        the advisory-lock connection for DB work, avoiding a second pool checkout.
+        Falls back to ``ctx.engine`` for RUN_EVERYWHERE mode or non-leader calls.
         """
-        self._stopped.set()
-        if self._task is None:
-            return
-        self._task.cancel()
+        # Prefer lock_connection (AUTOCOMMIT advisory-lock connection) to avoid
+        # acquiring a second connection from the pool during the tick.
+        self._engine = ctx.lock_connection if ctx.lock_connection is not None else ctx.engine
         try:
-            await self._task
-        except asyncio.CancelledError:
-            pass  # expected — we just cancelled it
-        except Exception:
-            logger.warning(
-                "GCPLivenessReconciler: loop task errored during teardown",
+            await self._reconcile_once()
+        except Exception as e:  # noqa: BLE001 — one bad pass must not kill the loop
+            logger.error(
+                "GcpLivenessReconciler: reconcile pass failed: %s", e,
                 exc_info=True,
             )
-        self._task = None
-
-    # --- loop --------------------------------------------------------------
-
-    async def _run_loop(self) -> None:
-        """Run ``_reconcile_once`` every ``interval_seconds`` until stopped.
-
-        A failed pass is logged and the loop continues — the reconciler is a
-        safety net, it must not be the thing that breaks.
-        """
-        while not self._stopped.is_set():
-            try:
-                await self._reconcile_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 — one bad pass must not kill the loop
-                logger.error(
-                    "GcpLivenessReconciler: reconcile pass failed: %s", e,
-                    exc_info=True,
-                )
-            try:
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=self._interval_seconds
-                )
-            except asyncio.TimeoutError:
-                pass
 
     async def _reconcile_once(self) -> None:
         """Scan lapsed-lease Cloud Run rows and reconcile each one.
@@ -198,6 +213,7 @@ class GcpLivenessReconciler:
         non-zero to keep the line compact.
         """
         rows = await tasks_module.select_lapsed_gcp_tasks(self._engine)
+        claimed_ids = {row.get("task_id") for row in rows if row.get("task_id") is not None}
         verdicts: Counter[str] = Counter()
         unmapped = 0
         errors = 0
@@ -247,6 +263,11 @@ class GcpLivenessReconciler:
             _SERVICE_NAME_FOR_METRICS, len(rows), race_lost, verdict_suffix,
         )
 
+        # geoid#2819: non-locking staleness pass — catches a row the FOR
+        # UPDATE SKIP LOCKED scan above keeps silently skipping because a
+        # zombie PG session still holds its row lock.
+        await self._check_staleness(claimed_ids)
+
         # Dismissed-unconfirmed scan: drive DISMISSED rows whose backing
         # Cloud Run execution is still alive toward a confirmed stop.
         dismissed_rows = await tasks_module.select_dismissed_unconfirmed_gcp_tasks(
@@ -273,6 +294,99 @@ class GcpLivenessReconciler:
                 dismiss_unconfirmed_total,
             )
 
+    async def _check_staleness(self, claimed_ids: set[Any]) -> None:
+        """geoid#2819: surface a row the locking scan keeps silently skipping.
+
+        Diffs a plain, non-locking SELECT of lapsed rows
+        (:func:`tasks_module.select_stale_gcp_tasks`) against ``claimed_ids``
+        — the ``task_id``s this pass's ``FOR UPDATE SKIP LOCKED`` scan
+        actually reached. A row present in the former but absent from the
+        latter, past ``_staleness_grace_seconds``, was silently skipped by
+        the locking scan — consistent with a zombie PG session still holding
+        its row lock (the row lock itself is invisible from application code
+        without a ``pg_locks`` join; this is a symptom-based proxy).
+
+        Only after ``_staleness_max_passes`` consecutive occurrences is the
+        row logged loudly and a lock-free heal attempted, via the same
+        probe + owner-guarded-write path ``_reconcile_row`` already uses for
+        the primary scan and the RUN_EVERYWHERE backstop. Those writes are
+        plain ``UPDATE ... WHERE task_id = ...`` statements bounded by
+        ``DBConfig.lock_timeout`` (#2837 delivered this) — a still-live
+        zombie lock makes the attempt fail fast instead of hanging, so
+        retrying it every pass is safe. If the zombie session has since been
+        reaped (by ``idle_in_transaction_session_timeout``, also #2837) the
+        write lands immediately.
+
+        The streak tracker is in-process state on this leader-gated instance
+        — acceptable per geoid#2819: a leadership handoff simply restarts a
+        stuck row's streak, and a genuinely stuck row re-accumulates it
+        within a few more ticks.
+        """
+        try:
+            stale_rows = await tasks_module.select_stale_gcp_tasks(
+                self._engine, self._staleness_grace_seconds
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — detection must not break the tick
+            logger.warning(
+                "GcpLivenessReconciler: staleness scan failed: %s", e,
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        seen_ids: set = set()
+        for row in stale_rows:
+            task_id = row.get("task_id")
+            if task_id is None:
+                continue
+            seen_ids.add(task_id)
+
+            if task_id in claimed_ids:
+                # The locking scan reached this row on this very pass — it
+                # is merely lapsed, not stuck behind a lock. Reset any prior
+                # streak; a future occurrence starts counting from zero.
+                self._stale_streak.pop(task_id, None)
+                continue
+
+            streak = self._stale_streak.get(task_id, 0) + 1
+            self._stale_streak[task_id] = streak
+            if streak < self._staleness_max_passes:
+                continue
+
+            locked_until = row.get("locked_until")
+            age_s = (now - locked_until).total_seconds() if locked_until is not None else -1.0
+            logger.warning(
+                "liveness_staleness_visible_unclaimable service=%s task_id=%s "
+                "owner_id=%s runner_ref=%s age_s=%.0f passes=%d — row is "
+                "visible to a plain SELECT but has been skipped by FOR "
+                "UPDATE SKIP LOCKED for %d consecutive reconciler pass(es); "
+                "likely a zombie PG session still holding the row lock. "
+                "Attempting a lock-free heal.",
+                _SERVICE_NAME_FOR_METRICS, task_id, row.get("owner_id"),
+                row.get("runner_ref"), age_s, streak, streak,
+            )
+            try:
+                await self._reconcile_row(row)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the rest
+                logger.warning(
+                    "GcpLivenessReconciler: lock-free heal attempt failed "
+                    "for task %s: %s", task_id, e,
+                )
+                # Leave the streak in place — the row is still stuck and the
+                # next pass will retry the heal without re-logging until the
+                # streak next crosses the threshold on a fresh occurrence.
+
+        # Rows that dropped out of the stale scan this pass (healed,
+        # reclaimed by the locking scan, or no longer lapsed) reset — a
+        # fresh occurrence starts the streak over rather than accumulating
+        # across unrelated incidents.
+        for task_id in list(self._stale_streak):
+            if task_id not in seen_ids:
+                self._stale_streak.pop(task_id, None)
+
     async def _reconcile_dismissed_row(self, row: Dict[str, Any]) -> bool:
         """Drive a single DISMISSED-but-unconfirmed GCP row toward confirmed stop.
 
@@ -283,8 +397,8 @@ class GcpLivenessReconciler:
         b) Execution still ALIVE within the force-delete deadline:
            call ``runner.signal_stop(task)`` (cancel / graceful SIGTERM) and
            return ``False`` — the next reconciler cycle re-probes.
-        c) Execution still ALIVE past the deadline (``_DISMISS_FORCE_DELETE_AFTER``
-           elapsed since ``last_heartbeat_at`` or ``timestamp``):
+        c) Execution still ALIVE past the deadline
+           (``LeadershipConfig.dismiss_force_delete_after_seconds``, default 600s):
            call ``runner.force_stop(task)`` (hard delete), stamp
            ``dismiss_confirmed_at``, emit ``dismiss_unconfirmed_total``,
            return ``True``.
@@ -349,7 +463,7 @@ class GcpLivenessReconciler:
         ref_ts: Optional[datetime] = row.get("last_heartbeat_at") or row.get("timestamp")
         elapsed = (now - ref_ts) if ref_ts is not None else None
         past_deadline = (
-            elapsed is not None and elapsed >= _DISMISS_FORCE_DELETE_AFTER
+            elapsed is not None and elapsed >= _get_dismiss_force_delete_after()
         )
 
         if past_deadline:
@@ -380,6 +494,15 @@ class GcpLivenessReconciler:
             )
         return False
 
+    async def _reconcile_row_public(self, row: Dict[str, Any]) -> Optional[ReconcileOutcome]:
+        """Public alias of :meth:`_reconcile_row` for :class:`GcpLivenessBackstop`.
+
+        Both classes live in this module and share the verdict→action policy;
+        the alias avoids a private-member reach-across while keeping
+        ``_reconcile_row`` itself unchanged for the primary tick path.
+        """
+        return await self._reconcile_row(row)
+
     async def _reconcile_row(self, row: Dict[str, Any]) -> Optional[ReconcileOutcome]:
         """Probe the owning runner for ``row`` and act on the verdict.
 
@@ -407,7 +530,15 @@ class GcpLivenessReconciler:
         now = datetime.now(timezone.utc)
         runner_ref = row.get("runner_ref")
 
-        if verdict == LivenessVerdict.ALIVE:
+        # ``decide_verdict_action`` is the single source of truth for the
+        # verdict→action mapping, shared with the on-demand
+        # ``reconcile_task_liveness`` read-path trigger (#750-followup) — the
+        # two paths cannot drift apart on which action a verdict authorizes.
+        # Each branch below still owns its own logging, retry-message wording,
+        # race-loss bookkeeping and terminal-action routing.
+        action = decide_verdict_action(verdict)
+
+        if action is VerdictAction.EXTEND_LEASE:
             # The execution is genuinely running (or cold-starting) — extend
             # the lease so the reaper's next pass skips the row. This IS the
             # liveness signal that replaces the fixed spawn-lease timer.
@@ -439,7 +570,7 @@ class GcpLivenessReconciler:
             # verdict stays ALIVE (the probe was truthful); race_lost carries
             # the "reaper got there first" signal for the pass summary.
             return ReconcileOutcome(verdict, race_lost=not extended)
-        elif verdict in (LivenessVerdict.DEAD, LivenessVerdict.TERMINAL_FAILED):
+        elif action is VerdictAction.FAIL_RETRY:
             reason = (
                 "Cloud Run execution failed"
                 if verdict == LivenessVerdict.TERMINAL_FAILED
@@ -482,7 +613,7 @@ class GcpLivenessReconciler:
                         inputs=row.get("inputs"),
                         caller_id=row.get("caller_id"),
                         collection_id=row.get("collection_id"),
-                        schema=row.get("schema_name", "tasks"),
+                        schema=row.get("catalog_id", "tasks"),
                         scope=row.get("scope"),
                     )
                 except Exception as _ta_exc:
@@ -500,7 +631,7 @@ class GcpLivenessReconciler:
                     task_id, verdict.value, runner_ref,
                 )
             return ReconcileOutcome(verdict, race_lost=not acted)
-        elif verdict == LivenessVerdict.TERMINAL_SUCCEEDED:
+        elif action is VerdictAction.COMPLETE:
             # The execution exited 0 but the row is still ACTIVE — reconcile it
             # to COMPLETED from the outputs the container persisted before exit
             # (main_task.py writes outputs before the terminal status flip, so
@@ -538,7 +669,7 @@ class GcpLivenessReconciler:
                         inputs=row.get("inputs"),
                         caller_id=row.get("caller_id"),
                         collection_id=row.get("collection_id"),
-                        schema=row.get("schema_name", "tasks"),
+                        schema=row.get("catalog_id", "tasks"),
                         scope=row.get("scope"),
                     )
                 except Exception as _ta_exc:
@@ -556,11 +687,16 @@ class GcpLivenessReconciler:
                     task_id, runner_ref,
                 )
             return ReconcileOutcome(verdict, race_lost=not acted)
-        else:  # LivenessVerdict.UNKNOWN
+        else:  # VerdictAction.NOOP (LivenessVerdict.UNKNOWN)
             started_at = row.get("started_at")
-            young = (
-                started_at is not None
-                and started_at > now - timedelta(seconds=self._unknown_grace_seconds)
+            # #2893: started_at is NULL while a REMOTE task's container is
+            # still cold-starting (no longer stamped at dispatch). NULL here
+            # means "not started yet", not "unknown" — treat it as maximally
+            # young rather than falling through to the else branch below,
+            # which would deny this grace extension to every not-yet-booted
+            # container.
+            young = started_at is None or (
+                started_at > now - timedelta(seconds=self._unknown_grace_seconds)
             )
             if not runner_ref and young:
                 # The spawn→runner_ref-capture gap: give the row one short
@@ -583,3 +719,129 @@ class GcpLivenessReconciler:
                     task_id,
                 )
             return ReconcileOutcome(verdict)
+
+
+class GcpLivenessBackstop(PeriodicService):
+    """RUN_EVERYWHERE watchdog that heals lapsed rows a starved leader misses (#2771).
+
+    ``GcpLivenessReconciler`` is ``LEADER_ONLY``: exactly one pod drives its
+    writes, and every other pod skips its tick until the advisory/lease lock
+    is free. If the leader loop never elects — e.g. the DB-pool-churn
+    scenario in #2333, where every ``acquire_leadership()`` attempt trips a
+    transient connection error — the reconciler's pass silently never runs.
+    Lapsed-lease Cloud Run task rows then sit un-probed with no operator
+    signal until someone notices a job stuck ``RUNNING`` for days.
+
+    This service ticks on every pod, independent of leader election, so a
+    starved leader loop can no longer take the whole backstop down with it.
+
+    Detection is symptom-based rather than tied to one election backend (the
+    lease-table backend persists a row a follower could inspect; the
+    advisory backend does not). A lapsed-lease row only trips the backstop
+    once it has been expired for at least ``stale_multiplier *
+    liveness_reconciler_interval_seconds`` — long enough that a healthy
+    reconciler tick would certainly have reached it already, so ordinary
+    cadence jitter between reconciler passes never fires this path. When the
+    primary reconciler is healthy, this tick's scan finds nothing past the
+    staleness bar and is a cheap no-op indexed SELECT.
+
+    Once starvation is confirmed for the pass, every currently lapsed row is
+    reconciled (not only the stale ones that tripped detection) via
+    :meth:`GcpLivenessReconciler._reconcile_row_public` — the same probe +
+    :func:`~dynastore.modules.tasks.reconciliation.decide_verdict_action` +
+    owner-guarded write path the primary reconciler and the on-demand #2620
+    read-path trigger both use, so this is wiring, not new verdict policy.
+
+    Concurrent execution across pods during a real starvation event is
+    tolerated by the same race-handling the reconciler already documents:
+    every write is owner_id-guarded, so a pod that loses the race to another
+    pod (or to the MaintenanceSupervisor task_reaper) gets a truthful no-op,
+    not a double-write. No additional advisory lock is taken here on
+    purpose — the failure mode this backstop exists for is exactly a DB
+    under lock/connection pressure, and adding another lock acquisition to
+    the recovery path would trade a correctness gap for a liveness gap.
+    """
+
+    name = "gcp_liveness_backstop"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+
+    def __init__(
+        self,
+        *,
+        cadence_seconds: Optional[float] = None,
+        stale_multiplier: Optional[float] = None,
+        extend_visibility_seconds: Optional[int] = None,
+        unknown_grace_seconds: Optional[int] = None,
+    ) -> None:
+        _, _, cfg_interval, cfg_visibility, cfg_unknown_grace = resolve_leadership_config()
+        self._primary_interval_seconds: float = cfg_interval
+        self.cadence_seconds = float(
+            cadence_seconds if cadence_seconds is not None else max(cfg_interval * 3.0, 60.0)
+        )
+        self._stale_multiplier: float = float(
+            stale_multiplier if stale_multiplier is not None else 3.0
+        )
+        self._extend_visibility_seconds: Optional[int] = extend_visibility_seconds
+        self._unknown_grace_seconds: Optional[int] = unknown_grace_seconds
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        try:
+            await self._reconcile_if_starved(ctx.engine)
+        except Exception as e:  # noqa: BLE001 — one bad pass must not kill the loop
+            logger.error(
+                "GcpLivenessBackstop: pass failed: %s", e, exc_info=True,
+            )
+
+    async def _reconcile_if_starved(self, engine: Any) -> None:
+        rows = await tasks_module.select_lapsed_gcp_tasks(engine)
+        if not rows:
+            return
+
+        now = datetime.now(timezone.utc)
+        stale_cutoff = now - timedelta(
+            seconds=self._primary_interval_seconds * self._stale_multiplier
+        )
+        starved = [
+            row for row in rows
+            if row.get("locked_until") is not None and row["locked_until"] <= stale_cutoff
+        ]
+        if not starved:
+            # Rows exist but none are stale enough to prove the primary
+            # reconciler missed them — ordinary inter-pass jitter.
+            return
+
+        oldest_lapsed_s = max(
+            (now - row["locked_until"]).total_seconds() for row in starved
+        )
+        logger.warning(
+            "liveness_backstop_starvation_detected service=%s scanned=%d "
+            "starved=%d oldest_lapsed_s=%.0f — the LEADER_ONLY reconciler "
+            "appears to have missed at least %.0f cycle(s); reconciling directly.",
+            _SERVICE_NAME_FOR_METRICS, len(rows), len(starved),
+            oldest_lapsed_s, self._stale_multiplier,
+        )
+
+        reconciler = GcpLivenessReconciler(
+            engine,
+            extend_visibility_seconds=self._extend_visibility_seconds,
+            unknown_grace_seconds=self._unknown_grace_seconds,
+        )
+        healed = 0
+        for row in rows:
+            try:
+                outcome = await reconciler._reconcile_row_public(row)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the rest
+                logger.warning(
+                    "GcpLivenessBackstop: failed to reconcile task %s: %s",
+                    row.get("task_id"), e,
+                )
+                continue
+            if outcome is not None:
+                healed += 1
+        logger.info(
+            "liveness_backstop_pass service=%s scanned=%d healed=%d",
+            _SERVICE_NAME_FOR_METRICS, len(rows), healed,
+        )

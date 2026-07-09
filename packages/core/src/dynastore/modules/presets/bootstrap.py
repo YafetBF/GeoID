@@ -57,9 +57,21 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+from dynastore.modules.db_config.exceptions import ConfigResolutionError
 from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 
 logger = logging.getLogger(__name__)
+
+# Process-lifetime cache of preset names confirmed structurally impossible to
+# apply in this SCOPE — e.g. a preset that writes an item whose sidecar
+# requires an extension not installed on a slim image. ``bootstrap_presets``
+# runs on essentially every service boot/rebuild tick, so without this cache
+# a slim SCOPE re-raises and re-logs the exact same "cannot run here" fact
+# forever, drowning real regressions in noise (#3033). Populated only from a
+# ``ConfigResolutionError`` whose ``missing_key`` starts with ``"extension:"``
+# — that prefix is the structured signal that the failure is about a whole
+# extension package being absent, not an ordinary misconfiguration.
+_structurally_unavailable_presets: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Sentinel queries — read from the existing iam.applied_presets table.
@@ -133,6 +145,7 @@ async def bootstrap_preset_if_absent(
     from pydantic import ValidationError
 
     from dynastore.modules.db_config.locking_tools import acquire_startup_lock
+    from dynastore.modules.db_config.query_executor import is_lock_not_available_error
     from dynastore.modules.storage.presets.preset import NoParams
     from dynastore.modules.storage.presets.registry import find_preset
 
@@ -143,87 +156,124 @@ async def bootstrap_preset_if_absent(
 
     _lock_key = lock_key or f"iam_seed:{preset_name}:{scope_key}"
 
-    async with acquire_startup_lock(engine, _lock_key) as conn:
-        if conn is None:
-            return False
+    # A lock-timeout (PG 55P03) raises out of ``acquire_startup_lock`` rather
+    # than yielding None, so it's caught here and folded into the same
+    # skip-and-return-False path as the "already applied" / "conn is None"
+    # cases below — a peer pod racing to first-boot is expected, not fatal
+    # (#2625).
+    try:
+        async with acquire_startup_lock(engine, _lock_key) as conn:
+            if conn is None:
+                return False
 
-        # Re-check bootstrap guard inside the lock (double-checked locking).
-        # force=True bypasses the guard — load-bearing self-heal presets must
-        # always run regardless of the guard state.
-        if not force:
-            from dynastore.modules.catalog.bootstrap_guard import is_initialized
-            if await is_initialized(db_resource=conn):
+            # Re-check bootstrap guard inside the lock (double-checked locking).
+            # force=True bypasses the guard — load-bearing self-heal presets must
+            # always run regardless of the guard state.
+            if not force:
+                from dynastore.modules.catalog.bootstrap_guard import is_initialized
+                if await is_initialized(db_resource=conn):
+                    logger.debug(
+                        "bootstrap_preset_if_absent: bootstrap guard set — "
+                        "skipping %r (force=False).",
+                        preset_name,
+                    )
+                    return False
+
+            row = await _SELECT_SENTINEL.execute(conn, preset_name=preset_name, scope_key=scope_key)
+            if row is not None and not force:
                 logger.debug(
-                    "bootstrap_preset_if_absent: bootstrap guard set — "
-                    "skipping %r (force=False).",
+                    "bootstrap_preset_if_absent: sentinel present for %r at %r — skipping",
+                    preset_name,
+                    scope_key,
+                )
+                return False
+            if row is not None and force:
+                logger.debug(
+                    "bootstrap_preset_if_absent: sentinel present for %r at %r — "
+                    "re-applying (force=True) to self-heal",
+                    preset_name,
+                    scope_key,
+                )
+
+            preset = find_preset(preset_name)
+            if preset is None:
+                logger.warning(
+                    "bootstrap_preset_if_absent: preset %r not registered — skipping",
                     preset_name,
                 )
                 return False
 
-        row = await _SELECT_SENTINEL.execute(conn, preset_name=preset_name, scope_key=scope_key)
-        if row is not None and not force:
-            logger.debug(
-                "bootstrap_preset_if_absent: sentinel present for %r at %r — skipping",
-                preset_name,
-                scope_key,
-            )
-            return False
-        if row is not None and force:
-            logger.debug(
-                "bootstrap_preset_if_absent: sentinel present for %r at %r — "
-                "re-applying (force=True) to self-heal",
-                preset_name,
-                scope_key,
-            )
-
-        preset = find_preset(preset_name)
-        if preset is None:
-            logger.warning(
-                "bootstrap_preset_if_absent: preset %r not registered — skipping",
-                preset_name,
-            )
-            return False
-
-        # Resolve params: explicit arg → file loader → empty dict.
-        if params is not None:
-            resolved_raw = params
-        else:
-            from dynastore.modules.presets.param_loader import load_preset_params
-            file_params = load_preset_params(preset_name)
-            resolved_raw = file_params if file_params is not None else {}
-
-        # Validate against the preset's own params_model.
-        params_model = getattr(preset, "params_model", None)
-        try:
-            if callable(params_model):
-                validated = params_model.model_validate(resolved_raw)
+            # Resolve params: explicit arg → file loader → empty dict.
+            if params is not None:
+                resolved_raw = params
             else:
-                validated = NoParams.model_validate(resolved_raw)
-        except ValidationError as exc:
-            logger.error(
-                "bootstrap_preset_if_absent: params validation failed for %r: %s — skipping",
-                preset_name,
-                exc,
+                from dynastore.modules.presets.param_loader import load_preset_params
+                file_params = load_preset_params(preset_name)
+                resolved_raw = file_params if file_params is not None else {}
+
+            # Validate against the preset's own params_model.
+            params_model = getattr(preset, "params_model", None)
+            try:
+                if callable(params_model):
+                    validated = params_model.model_validate(resolved_raw)
+                else:
+                    validated = NoParams.model_validate(resolved_raw)
+            except ValidationError as exc:
+                logger.error(
+                    "bootstrap_preset_if_absent: params validation failed for %r: %s — skipping",
+                    preset_name,
+                    exc,
+                )
+                return False
+
+            ctx = _build_ctx(engine)
+            descriptor = await preset.apply(validated, scope_key, ctx)
+
+            payload = descriptor.payload if hasattr(descriptor, "payload") else {}
+            await _INSERT_SENTINEL.execute(
+                conn,
+                preset_name=preset_name,
+                scope_key=scope_key,
+                params_snapshot=json.dumps(validated.model_dump(mode="json")),
+                revoke_descriptor=json.dumps(payload),
             )
-            return False
-
-        ctx = _build_ctx(engine)
-        descriptor = await preset.apply(validated, scope_key, ctx)
-
-        payload = descriptor.payload if hasattr(descriptor, "payload") else {}
-        await _INSERT_SENTINEL.execute(
-            conn,
-            preset_name=preset_name,
-            scope_key=scope_key,
-            params_snapshot=json.dumps(validated.model_dump(mode="json")),
-            revoke_descriptor=json.dumps(payload),
-        )
+            logger.info(
+                "bootstrap_preset_if_absent: preset %r applied at scope %r on cold-boot",
+                preset_name,
+                scope_key,
+            )
+            return True
+    except Exception as exc:
+        if not is_lock_not_available_error(exc):
+            raise
         logger.info(
-            "bootstrap_preset_if_absent: preset %r applied at scope %r on cold-boot",
-            preset_name,
-            scope_key,
+            "bootstrap_preset_if_absent: %s timed out (another process is "
+            "likely still applying it) — skipping %r: %s",
+            _lock_key, preset_name, exc,
         )
-        return True
+        return False
+
+
+async def preset_previously_applied(
+    engine: Any,
+    *,
+    preset_name: str,
+    scope_key: str = "platform",
+) -> bool:
+    """Return ``True`` if an ``iam.applied_presets`` row exists for *preset_name*.
+
+    Row presence — regardless of state (``applied``, ``failed``, ...) — is the
+    signal that an operator or a prior boot sequence already intended this
+    preset to be active for this deployment. Capability self-heal contributors
+    (see ``modules/presets/enable_cold_boot.py``) use this to avoid
+    force-opening an opt-in, anonymous-read capability (e.g. ``tiles_enable``)
+    on a deployment that never requested it — unlike ``auth_enable``, which is
+    universally desired and always self-heals.
+    """
+    row = await _SELECT_SENTINEL.execute(
+        engine, preset_name=preset_name, scope_key=scope_key
+    )
+    return row is not None
 
 
 async def bootstrap_presets(
@@ -244,6 +294,19 @@ async def bootstrap_presets(
     because boot resilience matters more than atomicity here.  Callers that
     need atomicity should use ``CompositePreset`` instead.
 
+    A preset that raises ``ConfigResolutionError`` with a ``missing_key``
+    starting with ``"extension:"`` is treated differently: that prefix means
+    the failure is structural — this SCOPE will never be able to run this
+    preset, in this process, no matter how many times it retries (e.g. a
+    slim image missing the extension a preset's write path depends on). The
+    preset name is cached in ``_structurally_unavailable_presets`` after one
+    INFO-level log, and subsequent calls to ``bootstrap_presets`` in the same
+    process skip it outright instead of re-invoking
+    ``bootstrap_preset_if_absent`` and re-logging the same fact on every
+    tick. Any other exception — including a ``ConfigResolutionError`` with an
+    unrelated ``missing_key`` — keeps the loud ERROR log and retries on
+    every call, since that may be a genuine, fixable misconfiguration.
+
     ``payload.scope_key`` overrides ``default_scope_key`` per entry.
 
     Returns a dict mapping ``preset_name`` to the applied bool from
@@ -256,6 +319,11 @@ async def bootstrap_presets(
 
     for entry in preset_list:
         scope = entry.scope_key if entry.scope_key != "platform" else default_scope_key
+
+        if entry.preset_name in _structurally_unavailable_presets:
+            results[entry.preset_name] = False
+            continue
+
         try:
             applied = await bootstrap_preset_if_absent(
                 engine,
@@ -264,6 +332,21 @@ async def bootstrap_presets(
                 force=entry.force,
                 params=entry.params or None,
             )
+        except ConfigResolutionError as exc:
+            if exc.missing_key.startswith("extension:"):
+                _structurally_unavailable_presets.add(entry.preset_name)
+                logger.info(
+                    "bootstrap_presets: preset %r skipped: requires %s, not in this SCOPE",
+                    entry.preset_name,
+                    exc.missing_key,
+                )
+            else:
+                logger.error(
+                    "bootstrap_presets: preset %r raised unexpectedly — continuing chain: %s",
+                    entry.preset_name,
+                    exc,
+                )
+            applied = False
         except Exception as exc:
             logger.error(
                 "bootstrap_presets: preset %r raised unexpectedly — continuing chain: %s",

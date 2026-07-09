@@ -18,10 +18,19 @@
 
 import logging
 import asyncio
+import random
 from contextlib import AbstractAsyncContextManager
 from typing import Optional, Any, Iterator, Callable, List, Awaitable, Dict, Tuple
 
 logger = logging.getLogger(__name__)
+
+# pg_notify channel carrying platform-scope config-write commits (Layer A
+# hot-reload watcher). Emitted co-transactionally by PlatformConfigService's
+# platform-tier write paths (set_config / set_config_by_ref) and consumed by
+# ConfigReloadService via SignalBus, riding the same LISTEN connection the
+# task-queue bridge already holds — see modules/tasks/queue.py and
+# modules/db_config/config_reload_service.py.
+PLATFORM_CONFIG_CHANGED = "platform_config_changed"
 
 
 class SyncQueueIterator:
@@ -161,11 +170,12 @@ class AsyncBufferAggregator:
     - Key-based aggregation (e.g. summing increments for the same API key)
     """
     def __init__(
-        self, 
+        self,
         flush_callback: Callable[[List[Any]], Awaitable[None]],
         threshold: int = 100,
         interval: float = 5.0,
-        name: str = "aggregator"
+        name: str = "aggregator",
+        max_size: Optional[int] = None,
     ):
         self._callback = flush_callback
         self._threshold = threshold
@@ -177,38 +187,78 @@ class AsyncBufferAggregator:
         self._flush_event = asyncio.Event()
         self._last_flush = 0.0  # Lazy initialization on first flush
         self._flush_exec_lock: Optional[asyncio.Lock] = None
+        # Hard cap on the buffer (None = unbounded, the historical default —
+        # existing callers of this generic utility are unaffected). When set,
+        # add() drops the OLDEST buffered item once at capacity rather than
+        # growing memory without bound while the backend is slow; drops are
+        # rate-limited to one summary warning per _DROP_WARNING_COOLDOWN.
+        self._max_size = max_size
+        self._dropped_since_warning = 0
+        self._last_drop_warning = 0.0
+
+    _DROP_WARNING_COOLDOWN = 30.0  # seconds
 
     async def add(self, item: Any):
-        """Adds an item to the buffer and triggers flush if threshold reached."""
+        """Adds an item to the buffer and triggers flush if threshold reached.
+
+        When ``max_size`` is set and the buffer is already at capacity, the
+        oldest buffered item is dropped to make room — bounded memory over
+        completeness, since a backlog this deep already implies old items
+        are stale by the time they would flush.
+        """
         async with self._lock:
+            if self._max_size is not None and len(self._buffer) >= self._max_size:
+                self._buffer.pop(0)
+                self._dropped_since_warning += 1
+                now = asyncio.get_event_loop().time()
+                if now - self._last_drop_warning >= self._DROP_WARNING_COOLDOWN:
+                    logger.warning(
+                        "%s: buffer at cap (%d) — dropped %d oldest entr%s "
+                        "in the last %.0fs (backend too slow to keep up).",
+                        self._name,
+                        self._max_size,
+                        self._dropped_since_warning,
+                        "y" if self._dropped_since_warning == 1 else "ies",
+                        self._DROP_WARNING_COOLDOWN,
+                    )
+                    self._last_drop_warning = now
+                    self._dropped_since_warning = 0
             self._buffer.append(item)
             if len(self._buffer) >= self._threshold:
                 self._flush_event.set()
 
     async def _trigger_flush(self, wait: bool = False) -> Optional[asyncio.Task]:
-        """Internal: Drains buffer and executes callback."""
-        if not self._buffer:
-            return None
+        """Internal: swaps the buffer out under the lock, then dispatches the
+        callback OUTSIDE the lock.
 
-        to_flush = self._buffer[:]
-        self._buffer.clear()
-        self._last_flush = asyncio.get_running_loop().time()
-        
-        # We wrap the callback in another lock check if we want to serialize flushes.
-        # But wait, run_in_background is decoupled.
-        # Let's ensure ONE flush runs at a time for THIS aggregator.
-        
+        The swap (copy + clear) is the only step that needs ``self._lock`` —
+        it must be atomic with respect to concurrent ``add()`` calls. The
+        callback itself (a network call to the log backend) must NOT run
+        while the lock is held: every producer's ``add()`` blocks on that
+        same lock, so a slow (not dead) backend would otherwise stall every
+        in-flight ``log_event()`` call for the callback's full retry budget —
+        reintroducing, at the aggregator layer, the exact "logging blocks the
+        request path" failure class #2749 exists to eliminate.
+        """
+        async with self._lock:
+            if not self._buffer:
+                return None
+            to_flush = self._buffer[:]
+            self._buffer.clear()
+            self._last_flush = asyncio.get_running_loop().time()
+
         from dynastore.modules.concurrency import run_in_background
-        
+
         async def _flush_locked():
             # This second internal lock ensures that callback executions for this
-            # specific aggregator are serialized.
+            # specific aggregator are serialized. It is independent of
+            # self._lock (which only ever guards the buffer itself).
             if self._flush_exec_lock is None:
                 self._flush_exec_lock = asyncio.Lock()
 
             async with self._flush_exec_lock:
                 await self._callback(to_flush)
-                
+
         task = run_in_background(_flush_locked(), name=f"flush_{self._name}")
         if wait:
              await task
@@ -241,10 +291,12 @@ class AsyncBufferAggregator:
                 except asyncio.TimeoutError:
                     pass # Interval reached
 
-                async with self._lock:
-                    self._flush_event.clear()
-                    await self._trigger_flush(wait=True)
-                    
+                # _trigger_flush takes self._lock itself, only around the
+                # buffer swap — do NOT wrap it in self._lock here, or the
+                # callback dispatch below runs while every add() is blocked.
+                self._flush_event.clear()
+                await self._trigger_flush(wait=True)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -266,12 +318,14 @@ class KeyValueAggregator(AsyncBufferAggregator):
                  self._flush_event.set()
 
     async def _trigger_flush(self, wait: bool = False) -> Optional[asyncio.Task]:
-        if not self._kv_buffer:
-            return None
-
-        to_flush = list(self._kv_buffer.items())
-        self._kv_buffer.clear()
-        self._last_flush = asyncio.get_event_loop().time()
+        """Swaps ``_kv_buffer`` out under the lock, dispatches outside it —
+        see ``AsyncBufferAggregator._trigger_flush`` for why."""
+        async with self._lock:
+            if not self._kv_buffer:
+                return None
+            to_flush = list(self._kv_buffer.items())
+            self._kv_buffer.clear()
+            self._last_flush = asyncio.get_event_loop().time()
 
         from dynastore.modules.concurrency import run_in_background
 
@@ -280,7 +334,7 @@ class KeyValueAggregator(AsyncBufferAggregator):
                 self._flush_exec_lock = asyncio.Lock()
             async with self._flush_exec_lock:
                 await self._callback(to_flush)
-                
+
         task = run_in_background(_flush_locked(), name=f"flush_{self._name}")
         if wait:
              await task
@@ -516,15 +570,79 @@ class PgListenBridge:
         self._running = False
 
 
+# ---------------------------------------------------------------------------
+# Shared LISTEN/NOTIFY channel registry
+# ---------------------------------------------------------------------------
+#
+# One ``PgListenBridge`` per process is enough: LISTEN multiplexes every
+# channel over a single connection. Historically the only bridge was started
+# by the task queue, so any feature that wanted a cross-pod wake (config
+# hot-reload, and soon collection L1 invalidation) had to bolt its channel
+# and transform onto ``modules/tasks/queue.py`` — making TasksModule the
+# accidental owner of unrelated wakeups.
+#
+# This registry inverts that: each feature registers its channel(s) and an
+# optional transform here, from its own module, and a single neutral hub
+# service (``modules/db_config/notification_hub.py``) owns the one bridge.
+# Nothing needs to import TasksModule to get a cross-pod wake.
+
+# channel -> transform. A ``None`` transform forwards the payload verbatim as
+# the SignalBus identifier (the bridge's default behaviour).
+_LISTEN_CHANNELS: "Dict[str, Optional[Callable[[str, Optional[str]], Optional[Tuple[str, Optional[str]]]]]]" = {}
+
+
+def register_listen_channel(
+    channel: str,
+    transform: Optional[Callable[[str, Optional[str]], Optional[Tuple[str, Optional[str]]]]] = None,
+) -> None:
+    """Register a NOTIFY *channel* (and optional transform) with the shared hub.
+
+    Idempotent per channel name. The last registration for a channel wins, so a
+    module can refine its own transform without ordering constraints. Register
+    at import/lifespan time, before the hub builds its bridge; the hub reads a
+    snapshot of the registry when it starts.
+
+    The *transform* maps ``(channel, payload)`` to ``(signal_name, identifier)``
+    for ``SignalBus``, or returns ``None`` to suppress the notification. When
+    omitted, the bridge forwards the payload as the identifier.
+    """
+    _LISTEN_CHANNELS[channel] = transform
+
+
+def registered_listen_channels() -> "List[str]":
+    """Return the currently-registered channel names (sorted, stable order)."""
+    return sorted(_LISTEN_CHANNELS)
+
+
+def build_registry_transform() -> "Callable[[str, Optional[str]], Optional[Tuple[str, Optional[str]]]]":
+    """Build a single transform dispatching per-channel to registered transforms.
+
+    Channels without a registered transform (or registered with ``None``) fall
+    through to the default behaviour: forward the payload as the identifier.
+    """
+    def _dispatch(
+        channel: str, payload: Optional[str]
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        fn = _LISTEN_CHANNELS.get(channel)
+        if fn is None:
+            return (channel, payload)
+        return fn(channel, payload)
+
+    return _dispatch
+
+
 # --- Leader-elected periodic loops ---
 
 async def run_leader_loop(
     *,
-    acquire_leadership: Callable[[], AbstractAsyncContextManager[bool]],
-    on_leader: Callable[[], Awaitable[None]],
+    acquire_leadership: Callable[[], AbstractAsyncContextManager[Tuple[bool, Any]]],
+    on_leader: Callable[[Any], Awaitable[None]],
     name: str,
     cadence_seconds: float = 5.0,
     is_shutdown: Optional[Callable[[], bool]] = None,
+    shutdown_event: Optional[asyncio.Event] = None,
+    tick_timeout: Optional[float] = None,
+    pre_tick_probe: Optional[Callable[[Any], Awaitable[None]]] = None,
 ) -> None:
     """Run a leader-elected loop that resigns on any exception.
 
@@ -535,35 +653,92 @@ async def run_leader_loop(
 
     Each outer iteration:
       1. Calls ``acquire_leadership()`` and enters its context manager
-         (typically a non-blocking advisory-lock acquire).
-      2. If the context yields ``True``, awaits ``on_leader()`` exactly once.
-      3. Exits the context (releasing the lock) and sleeps ``cadence_seconds``.
+         (typically a non-blocking lease-table CAS acquire — see
+         ``dynastore.modules.db_config.locking_tools.lease_leadership``).
+      2. The context yields ``(is_leader, lock_connection)``. ``lock_connection``
+         is backend-defined — ``lease_leadership`` always yields ``None`` since
+         it does not pin a connection between yield and release, but the
+         signature stays generic so a future backend could hand one back for
+         the leader to reuse. If ``is_leader`` is ``True``,
+         ``on_leader(lock_connection)`` is called.
+      3. Exits the context (releasing leadership) and sleeps ``cadence_seconds``.
       4. On any exception inside the leadership context, the context is exited
-         (releasing the lock) before sleeping — preventing leader-held resources
-         (e.g. AUTOCOMMIT advisory-lock connections) from staying associated
-         with a poisoned pool slot across retries.
+         (releasing leadership) before sleeping — preventing leader-held
+         resources from staying associated with a poisoned pool slot across
+         retries.
 
-    ``on_leader`` may run its own inner periodic loop, but MUST let exceptions
-    propagate. Swallowing exceptions inside ``on_leader`` keeps the lock held
-    and is the anti-pattern this helper exists to prevent.
+    ``on_leader`` receives the lock connection and may run its own inner
+    periodic loop, but MUST let exceptions propagate. Swallowing exceptions
+    inside ``on_leader`` keeps leadership held and is the anti-pattern this
+    helper exists to prevent.
+
+    INVARIANT — no inner per-tick retry loop. ``on_leader`` must fail fast on a
+    transient error and let it propagate so this loop resigns (exits the
+    leadership context, releasing the lease) and leadership hands off to
+    another pod. Do NOT wrap the tick body in a retry/backoff loop: an inner
+    retry withholds leadership from other pods through the entire backoff,
+    worsening pool pressure exactly when the DB is already struggling.
+    Self-healing belongs to the OUTER loop here (resign → sleep one cadence →
+    re-elect), never the inner tick.
 
     ``acquire_leadership`` MUST yield exactly once on every code path. Do not
-    hand-roll it for Postgres advisory locks — use
-    ``dynastore.modules.db_config.locking_tools.pg_advisory_leadership``,
-    which holds the lock on a dedicated AUTOCOMMIT connection (no transaction
-    pinned across the tenure, no lock leaking into the pool) and never yields
-    from an ``except`` handler (the historical double-yield bug surfaced as
+    hand-roll it — use
+    ``dynastore.modules.db_config.locking_tools.lease_leadership``, which is
+    safe under transaction-mode connection pooling (no connection pinned
+    across the tenure, no lease leaking into the pool) and never yields from
+    an ``except`` handler (the historical double-yield bug surfaced as
     ``RuntimeError: generator didn't stop`` and resigned every cycle).
+
+    ``tick_timeout`` bounds the maximum time leadership is held per tick. If
+    the tick exceeds this timeout, it is cancelled and leadership is
+    released, preventing a slow tick from blocking leadership election under
+    pool contention or external API latency. Defaults to ``cadence_seconds``
+    to ensure the tick completes within one cadence window.
     """
     is_shutdown = is_shutdown or (lambda: False)
+    # When cadence_seconds is zero (test/fast-loop mode) the effective tick
+    # timeout defaults to None (unbounded) rather than zero (instant cancel).
+    # A zero-second wait_for would cancel the body before it runs.
+    effective_tick_timeout: Optional[float] = (
+        tick_timeout if tick_timeout is not None
+        else (cadence_seconds if cadence_seconds > 0 else None)
+    )
+
+    async def _sleep_cadence() -> None:
+        # Jitter the wait by +/-15% so a fleet of replicas on the same
+        # cadence doesn't herd on a shared hot row every period. The
+        # zero-cadence test/fast-loop case is left unjittered.
+        jittered = (
+            cadence_seconds * random.uniform(0.85, 1.15)
+            if cadence_seconds > 0
+            else cadence_seconds
+        )
+        if shutdown_event is not None:
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=jittered)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(jittered)
+
     while not is_shutdown():
         try:
-            async with acquire_leadership() as is_leader:
+            async with acquire_leadership() as (is_leader, lock_conn):
                 if not is_leader:
-                    await asyncio.sleep(cadence_seconds)
+                    await _sleep_cadence()
                     continue
                 logger.info("%s: leadership acquired", name)
-                await on_leader()
+                if pre_tick_probe is not None:
+                    await pre_tick_probe(lock_conn)
+                try:
+                    await asyncio.wait_for(on_leader(lock_conn), timeout=effective_tick_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "%s: tick timed out after %.1fs (leadership released); "
+                        "consider reducing tick workload or increasing tick_timeout.",
+                        name, effective_tick_timeout,
+                    )
+            await _sleep_cadence()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -571,4 +746,4 @@ async def run_leader_loop(
                 "%s: leader loop error; resigning and retrying in %ss",
                 name, cadence_seconds,
             )
-            await asyncio.sleep(cadence_seconds)
+            await _sleep_cadence()

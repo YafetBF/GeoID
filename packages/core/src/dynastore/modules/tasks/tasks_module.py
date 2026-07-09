@@ -19,13 +19,14 @@
 # dynastore/modules/tasks/tasks_module.py
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from typing import List, Optional, Any, Dict, AsyncGenerator
+from typing import List, Optional, Any, Dict, AsyncGenerator, Union
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules import ModuleProtocol
@@ -34,6 +35,8 @@ from dynastore.modules.db_config.query_executor import (
     DDLBatch,
     DQLQuery,
     managed_transaction,
+    background_managed_transaction,
+    retry_on_transient_connect,
     ResultHandler,
     DbResource,
     run_in_event_loop,
@@ -41,12 +44,20 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.db_config.locking_tools import (
     check_table_exists,
     check_trigger_exists,
+    run_startup_ddl_tolerating_lock_timeout,
 )
 from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
 from dynastore.models.protocols.task_queue import TaskQueueProtocol
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 
 from .models import Task, TaskCreate, TaskUpdate
+from .workclass_ddl import render_partition_create_ahead_ddl, render_partition_retention_ddl
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +106,7 @@ def get_task_lookback() -> timedelta:
 GLOBAL_TASKS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.tasks (
     task_id           UUID          NOT NULL,
-    schema_name       VARCHAR(255)  NOT NULL,
+    catalog_id        VARCHAR(255)  NOT NULL,
     scope             VARCHAR(50)   NOT NULL DEFAULT 'CATALOG',
     caller_id         VARCHAR(255),
     task_type         VARCHAR       NOT NULL,
@@ -130,12 +141,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_queue
     ON {schema}.tasks (status, task_type, execution_mode, locked_until)
     WHERE status IN ('PENDING', 'ACTIVE');
 CREATE INDEX IF NOT EXISTS idx_tasks_schema_status
-    ON {schema}.tasks (schema_name, status);
+    ON {schema}.tasks (catalog_id, status);
 -- Dedup index: includes timestamp (partition key) as PG requires it for
 -- unique indexes on partitioned tables. Per-partition uniqueness.
 -- cross-partition dedup enforced at the application layer in enqueue().
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_dedup
-    ON {schema}.tasks (schema_name, dedup_key, timestamp)
+    ON {schema}.tasks (catalog_id, dedup_key, timestamp)
     WHERE dedup_key IS NOT NULL AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER');
 CREATE INDEX IF NOT EXISTS idx_tasks_caller
     ON {schema}.tasks (caller_id);
@@ -144,6 +155,17 @@ CREATE INDEX IF NOT EXISTS idx_tasks_timestamp
 -- task_id lookup index: enables complete/fail/heartbeat without full partition scan
 CREATE INDEX IF NOT EXISTS idx_tasks_task_id
     ON {schema}.tasks (task_id);
+-- Listing indexes for the Tasks API (catalog scope, newest-first keyset pagination)
+CREATE INDEX IF NOT EXISTS idx_tasks_scope_listing
+    ON {schema}.tasks (catalog_id, timestamp DESC, task_id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_catalog_type_ts
+    ON {schema}.tasks (catalog_id, type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_collection
+    ON {schema}.tasks (catalog_id, collection_id, timestamp DESC)
+    WHERE collection_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_dead_letter
+    ON {schema}.tasks (catalog_id, timestamp DESC)
+    WHERE status = 'DEAD_LETTER';
 
 CREATE OR REPLACE FUNCTION {schema}.notify_task_ready()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -233,98 +255,18 @@ def set_hard_retry_cap(value: int) -> None:
 # These are called by the MaintenanceSupervisor; pg_cron is NOT used.
 # ---------------------------------------------------------------------------
 
-# NOTE: {schema} survives until DDLQuery substitutes it via
-# str.replace("{schema}", value) — NOT str.format — so a doubled brace
-# (\d{{4}}) is NOT collapsed and PostgreSQL would receive the literal
-# "\d{{4}}", which matches no partition and silently disables retention.
-# The regexes below therefore use the single-brace form \d{4}_\d{2}.
-GLOBAL_TASKS_RETENTION_FUNC_DDL = """
-CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_tasks"() RETURNS void AS $$
-DECLARE
-    row RECORD;
-    cutoff_date DATE;
-    default_deleted BIGINT;
-    prune_count INT;
-    prune_list TEXT;
-BEGIN
-    -- Bound AccessExclusiveLock wait: if a partition is being scanned
-    -- fail this DROP fast and let the next supervisor tick retry.
-    SET LOCAL lock_timeout = '10s';
-    -- 'daily' is not a valid PostgreSQL date_trunc unit; the correct unit is 'day'.
-    cutoff_date := date_trunc('day', NOW()) - INTERVAL '1 month';
-    -- Pre-flight (#2106): announce, at LOG level, how many monthly leaf
-    -- partitions this run will DROP and their names.  The per-partition message
-    -- below is NOTICE, which the server log suppresses at the default
-    -- log_min_messages=WARNING, so without this the deletion is invisible in
-    -- production.  A retention fix applied to a long-running deployment can drop
-    -- several months of accumulated partitions on the first tick; this makes
-    -- that one-time bulk prune observable instead of silent.
-    SELECT count(*), string_agg(c.relname, ', ' ORDER BY c.relname)
-      INTO prune_count, prune_list
-      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = '{schema}' AND c.relkind = 'r'
-        AND c.relname ~ '^tasks_\\d{4}_\\d{2}$'
-        AND to_date(substring(c.relname from '\\d{4}_\\d{2}$'), 'YYYY_MM') < cutoff_date;
-    IF prune_count > 0 THEN
-        RAISE LOG 'partition retention [{schema}.tasks]: dropping % monthly partition(s) older than % : %', prune_count, cutoff_date, prune_list;
-    END IF;
-    FOR row IN SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{schema}' AND c.relkind = 'r' AND c.relname ~ '^tasks_\\d{4}_\\d{2}$' LOOP
-        DECLARE
-            date_str TEXT;
-            part_date DATE;
-        BEGIN
-            date_str := substring(row.relname from '\\d{4}_\\d{2}$');
-            part_date := to_date(date_str, 'YYYY_MM');
-            IF part_date < cutoff_date THEN
-                RAISE NOTICE 'Pruning old partition: {schema}.%', row.relname;
-                EXECUTE format('DROP TABLE "{schema}".%I', row.relname);
-            END IF;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'Failed to process partition {schema}.%: %', row.relname, SQLERRM;
-        END;
-    END LOOP;
-    -- Drain rows from the DEFAULT partition (catches clock-skew / far-future
-    -- timestamps that never land in a monthly partition).  Idempotent: a
-    -- DELETE WHERE nothing matches is a no-op.
-    DELETE FROM "{schema}".tasks_default
-    WHERE timestamp < (NOW() - INTERVAL '1 month');
-    GET DIAGNOSTICS default_deleted = ROW_COUNT;
-    IF default_deleted > 0 THEN
-        RAISE NOTICE 'Pruned % row(s) from {schema}.tasks_default', default_deleted;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
-"""
+# tasks.tasks partitions are MONTHLY (distinct from the DAILY events/storage
+# partitions in workclass_ddl.py). Both function bodies are rendered by the
+# shared template in workclass_ddl.py — see that module's docstring for why
+# {schema} survives as a literal placeholder and why the regex uses the
+# single-brace form \d{4}_\d{2}.
+GLOBAL_TASKS_RETENTION_FUNC_DDL = render_partition_retention_ddl(
+    table="tasks", granularity="month", retention=1
+)
 
-GLOBAL_TASKS_PARTCREATE_FUNC_DDL = """
-CREATE OR REPLACE FUNCTION "{schema}"."create_partitions_{schema}_tasks"() RETURNS void AS $$
-DECLARE
-    i INT;
-    target_date DATE;
-    start_date TIMESTAMPTZ;
-    end_date TIMESTAMPTZ;
-    part_name TEXT;
-BEGIN
-    FOR i IN 0..3 LOOP
-        target_date := date_trunc('month', NOW()) + (i || ' months')::INTERVAL;
-        start_date := target_date;
-        end_date := target_date + INTERVAL '1 month';
-        part_name := 'tasks_' || to_char(target_date, 'YYYY_MM');
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = '{schema}' AND c.relname = part_name
-        ) THEN
-            EXECUTE format(
-                'CREATE TABLE IF NOT EXISTS "{schema}".%I PARTITION OF "{schema}"."tasks" FOR VALUES FROM (%L) TO (%L)',
-                part_name, start_date::TEXT, end_date::TEXT
-            );
-            RAISE NOTICE 'Created partition: {schema}.%', part_name;
-        END IF;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-"""
+GLOBAL_TASKS_PARTCREATE_FUNC_DDL = render_partition_create_ahead_ddl(
+    table="tasks", granularity="month", window=4
+)
 
 # DEFAULT partition DDL: absorbs any timestamp outside the monthly partition range
 # so inserts never fail with "no partition of relation found for row".
@@ -455,9 +397,6 @@ def _build_tasks_ddl_batch(schema: str) -> DDLBatch:
             DDLQuery(GLOBAL_TASKS_STATUS_TRIGGER_DDL, check_query=_check_status),
         ],
     )
-
-
-
 
 
 class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
@@ -591,7 +530,8 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
         from dynastore.tasks import get_loaded_task_types, discover_tasks
         from dynastore.modules.gcp.tools.jobs import try_load_process_definition
 
-        discover_tasks()
+        if not get_loaded_task_types():
+            discover_tasks()
         result = []
         for task_type in get_loaded_task_types():
             defn = try_load_process_definition(task_type)
@@ -615,8 +555,6 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
         """
         import asyncio
         from dynastore.modules.concurrency import get_background_executor
-        from dynastore.modules.tasks.queue import start_queue_listener
-        from dynastore.modules.tasks.dispatcher import run_dispatcher
         from dynastore.tasks import manage_tasks
 
         logger.info("TasksModule: Initialising task singletons …")
@@ -646,6 +584,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                     )
             logger.info("TasksModule: Task singletons active.")
 
+            supervisor = None
             if engine is not None:
                 executor = get_background_executor()
                 schema = get_task_schema()
@@ -674,6 +613,8 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 cap_refresh = 30.0
                 sweep_interval = 60.0
                 sweep_min_age = 300.0
+                retention_sweep_interval = 86400.0
+                drain_spawn_interval = 120.0
                 config_mgr = get_protocol(PlatformConfigsProtocol)
                 if config_mgr:
                     try:
@@ -686,6 +627,8 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                             cap_refresh = tasks_config.capability_publisher_refresh_seconds
                             sweep_interval = tasks_config.proactive_sweep_interval_seconds
                             sweep_min_age = tasks_config.proactive_sweep_min_age_seconds
+                            retention_sweep_interval = tasks_config.retention_sweep_interval_seconds
+                            drain_spawn_interval = tasks_config.drain_spawn_interval_seconds
                     except Exception as e:
                         logger.warning(f"TasksModule: Failed to load TasksPluginConfig, defaulting to {poll_interval}s / hard_cap={hard_cap}: {e}")
 
@@ -758,21 +701,21 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 # SAME connection as the DDL, otherwise two concurrent revisions
                 # can both observe "table missing" and race to create it (and
                 # its partitions). Using the locked_conn yielded by
-                # acquire_startup_lock guarantees that.
-                from dynastore.modules.db_config.locking_tools import acquire_startup_lock
-                async with acquire_startup_lock(
-                    engine, f"tasks_storage_init.{schema}"
-                ) as locked_conn:
-                    if locked_conn is None:
-                        raise RuntimeError(
-                            f"TasksModule: could not acquire startup lock for '{schema}.tasks' "
-                            "initialization — refusing to start dispatcher."
-                        )
-                    await ensure_task_storage_exists(locked_conn, schema)
+                # acquire_startup_lock guarantees that. A lock-timeout (a peer
+                # pod still holding it, possibly pool-starved — #2333) is
+                # tolerated rather than fatal (#2616): the DDL is idempotent,
+                # so it is safe to run unlocked instead of crash-looping the
+                # foundational module.
+                async def _init_tasks_storage(conn: DbResource) -> None:
+                    await ensure_task_storage_exists(conn, schema)
                     from dynastore.modules.tasks.workclass_ddl import (
                         ensure_workclass_storage_exists,
                     )
-                    await ensure_workclass_storage_exists(locked_conn, schema)
+                    await ensure_workclass_storage_exists(conn, schema)
+
+                await run_startup_ddl_tolerating_lock_timeout(
+                    engine, f"tasks_storage_init.{schema}", _init_tasks_storage,
+                )
 
                 # Ensure configs.task_capability_registry exists before the
                 # backstop/sweep loops start querying it. PlatformConfigService
@@ -782,17 +725,22 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 # point the engine is present and the idempotent CREATE TABLE IF NOT
                 # EXISTS is safe.  Advisory lock mirrors the tasks_storage_init
                 # namespace pattern: one pod wins per cold-start, others skip.
+                # A lock timeout is tolerated the same way as above.
                 from dynastore.modules.db_config.typed_store.ddl import (
                     TASK_CAPABILITY_REGISTRY_DDL,
                 )
-                async with acquire_startup_lock(
-                    engine, f"tasks_storage_init.{schema}.registry"
-                ) as reg_conn:
-                    if reg_conn is not None:
-                        await DDLQuery(TASK_CAPABILITY_REGISTRY_DDL).execute(reg_conn)
-                        logger.info(
-                            "TasksModule: configs.task_capability_registry ensured."
-                        )
+
+                async def _init_task_capability_registry(conn: DbResource) -> None:
+                    await DDLQuery(TASK_CAPABILITY_REGISTRY_DDL).execute(conn)
+                    logger.info(
+                        "TasksModule: configs.task_capability_registry ensured."
+                    )
+
+                await run_startup_ddl_tolerating_lock_timeout(
+                    engine,
+                    f"tasks_storage_init.{schema}.registry",
+                    _init_task_capability_registry,
+                )
 
                 # Optional one-shot cleanup of pre-existing per-tenant
                 # ``{schema}.tasks`` tables left over from the
@@ -832,7 +780,6 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 from dynastore.modules.tasks.capability_publisher import (
                     _collect_local_capabilities,
                     _refresh_once,
-                    run_capability_publisher,
                 )
                 try:
                     await _refresh_once(
@@ -844,58 +791,67 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         exc,
                     )
 
-                executor.submit(start_queue_listener(engine, shutdown_event, poll_timeout=poll_interval), task_name="service:queue_listener")
-                executor.submit(run_dispatcher(engine, None, shutdown_event), task_name="service:dispatcher")
-                # Stuck-PENDING warner — periodic read-only scan for tasks that
-                # have been PENDING with retry_count=0 for too long. The most
-                # common cause is a routing typo or a service that should claim
-                # the task but isn't deployed. See _warn_stuck_pending_tasks.
-                executor.submit(
-                    _warn_stuck_pending_tasks(engine, schema, shutdown_event),
-                    task_name="service:stuck_pending_warner",
+                from dynastore.tools.background_service import (
+                    BackgroundSupervisor,
+                    ServiceContext as _ServiceContext,
                 )
-                # Proactive capability sweep (#524) — bulk-DLQ rows for
-                # confirmed-dead capabilities without waiting for the
-                # reactive reaper to claim+reject each row. Shares the
-                # same advisory-lock namespace as the reactive path so
-                # cross-pod dedupe holds. Reactive branch stays as a
-                # safety net until PR C deletes it.
-                executor.submit(
-                    _run_proactive_capability_sweep(
-                        engine, schema, shutdown_event,
+                # Task-queue LISTEN channels are registered with the shared
+                # notification hub at ``queue`` import time; the single bridge
+                # is owned by DBConfigModule's NotificationHubService. Import
+                # the module here so its ``register_listen_channel`` calls run
+                # before the hub next polls the registry.
+                import dynastore.modules.tasks.queue  # noqa: F401  (registers channels)
+                from dynastore.modules.tasks.dispatcher import DispatcherService
+                from dynastore.modules.tasks.capability_publisher import (
+                    CapabilityPublisherService,
+                )
+                from dynastore.modules.tasks.registry.publisher import (
+                    RegistryHeartbeatService,
+                )
+                from dynastore.modules.tasks.drain_spawner import DrainSpawnerService
+                from dynastore.modules.db_config.instance import (
+                    get_service_name as _get_service_name,
+                )
+
+                bg_ctx = _ServiceContext(
+                    engine=engine,
+                    shutdown=shutdown_event,
+                    is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                    name=_get_service_name() or "unknown",
+                )
+                supervisor = BackgroundSupervisor(executor)
+                supervisor.register(DispatcherService())
+                supervisor.register(StuckPendingWarnerService(schema=schema))
+                supervisor.register(
+                    ProactiveSweepService(
+                        schema=schema,
                         interval_s=sweep_interval,
                         min_age_s=sweep_min_age,
                         capability_ttl_s=cap_ttl,
-                    ),
-                    task_name="service:proactive_capability_sweep",
+                    )
                 )
-                # Async refresh loop. Initial publish already ran
-                # synchronously above (before run_dispatcher was submitted)
-                # so dispatcher reactive-reaper checks never see an empty
-                # cache during cold start.
-                executor.submit(
-                    run_capability_publisher(
-                        shutdown_event,
+                supervisor.register(
+                    TaskRetentionService(interval_s=retention_sweep_interval)
+                )
+                supervisor.register(
+                    DrainSpawnerService(interval_s=drain_spawn_interval)
+                )
+                # Async capability-sentinel refresh. Initial publish already ran
+                # synchronously above (before the supervisor starts) so
+                # dispatcher reactive-reaper checks never see an empty cache
+                # during cold start.
+                supervisor.register(
+                    CapabilityPublisherService(
                         ttl_seconds=cap_ttl,
                         refresh_seconds=cap_refresh,
-                    ),
-                    task_name="service:capability_publisher",
+                    )
                 )
                 # Durable task-capability registry: self-publish this pod's task
                 # inventory (version-gated via the shared cache, so the structural
                 # write happens ~once per deploy) and heartbeat last_seen on the
                 # same cadence as the capability publisher.
-                from dynastore.modules.tasks.registry.publisher import (
-                    run_registry_heartbeat,
-                )
-                executor.submit(
-                    run_registry_heartbeat(
-                        engine,
-                        shutdown_event,
-                        refresh_seconds=cap_refresh,
-                    ),
-                    task_name="service:task_registry_heartbeat",
-                )
+                supervisor.register(RegistryHeartbeatService(refresh_seconds=cap_refresh))
+                supervisor.start(bg_ctx)
                 logger.info(f"TasksModule: QueueListener (poll_interval={poll_interval}s) and Multi-Tenant Dispatcher launched.")
             else:
                 logger.warning(
@@ -908,10 +864,12 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
             finally:
                 shutdown_event.set()
                 logger.info("TasksModule: Shutdown event set — QueueListener/Dispatcher stopping.")
+                if supervisor is not None:
+                    await supervisor.stop()
 
 
 # --- Internal Query Objects ---
-# All queries target the global tasks table. The `schema_name` column
+# All queries target the global tasks table. The `catalog_id` column
 # distinguishes tenants; `get_task_schema()` returns the PostgreSQL schema
 # that hosts the global table (default: "tasks").
 
@@ -982,66 +940,98 @@ async def _redispatch_stuck_rows(
         logger.debug("stuck-pending redispatch: pg_notify failed: %s", exc)
 
 
-async def _warn_stuck_pending_tasks(
-    engine: DbResource,
-    schema: str,
-    shutdown_event: asyncio.Event,
-    interval_s: float = 60.0,
-    min_age_s: float = 600.0,
-    sample_limit: int = 50,
-) -> None:
-    """Periodic scan that logs WARNINGs for PENDING/retry_count=0 tasks older
-    than ``min_age_s`` seconds, then re-signals the dispatcher so claimable
-    rows are recovered without relying on pg_notify delivery or pg_cron.
+class _BackgroundSlotBusy(Exception):
+    """Fast-skip signal: the background DB-slot semaphore was saturated.
 
-    The most common cause is a missed ``pg_notify`` at enqueue time (no
-    listener active at that instant) combined with pg_cron being absent or
-    misconfigured (as on dev). In that case the task sits PENDING forever
-    with no actor to claim it.
-
-    Recovery: after logging, :func:`_redispatch_stuck_rows` emits the
-    in-process signal_bus (immediate same-pod wakeup) and ``pg_notify``
-    (cross-pod wakeup). ``claim_batch`` uses ``FOR UPDATE SKIP LOCKED`` so
-    only one pod claims each row — no double-execution across pods.
-
-    Rows whose required capability is confirmed dead (``cap_live is False``)
-    are skipped here — the proactive capability sweep owns their DLQ path.
-
-    The MaintenanceSupervisor-driven ``reap_stuck_tasks`` SQL function continues
-    to handle stuck *ACTIVE* tasks (heartbeat expired); this coroutine handles stuck
-    *PENDING* tasks (never claimed). Two orthogonal failure modes, two
-    independent recovery paths.
-
-    Idempotent and crash-safe: any error is logged and swallowed; the loop
-    sleeps and retries. Stops cleanly when ``shutdown_event`` is set.
+    ``background_managed_transaction`` caps its semaphore wait at ~2s and raises
+    ``asyncio.TimeoutError`` so a maintenance pass skips rather than blocking.
+    But ``asyncio.TimeoutError`` is in ``_TRANSIENT_CONNECT_EXCEPTIONS``, so a
+    bare ``retry_on_transient_connect`` would retry the busy-skip 5× (~25s, 5
+    warnings) and amplify pool pressure. Callers convert that timeout to this
+    non-transient sentinel so only a real mid-query backend drop (08003) retries;
+    the busy-skip propagates once and is logged at debug.
     """
-    sql = (
-        f'SELECT task_id, task_type, schema_name, inputs, '  # nosec - schema is validated upstream
-        f'  EXTRACT(EPOCH FROM NOW() - timestamp) AS age_s '
-        f'FROM "{schema}".tasks '
-        f"WHERE status = 'PENDING' "
-        f"  AND retry_count = 0 "
-        f"  AND timestamp < NOW() - make_interval(secs => :min_age_s) "
-        f"ORDER BY timestamp ASC LIMIT :sample_limit;"
-    )
-    query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
 
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
-            break  # shutdown signalled during sleep
-        except asyncio.TimeoutError:
-            pass  # normal — periodic wakeup
+
+class StuckPendingWarnerService(PeriodicService):
+    """Periodic read-only scan for stuck PENDING tasks (retry_count=0).
+
+    Elects a single leader pod (LEADER_ONLY) and skips ephemeral Cloud Run
+    Job pods (SKIP_EPHEMERAL) — job pods claim one task and exit, never
+    managing stuck rows. Resolves #2279 for this loop.
+
+    A single pod scanning is sufficient: the redispatch it triggers
+    (``_redispatch_stuck_rows``) emits ``pg_notify('new_task_queued', ...)``,
+    which every pod's QueueListener receives — so cross-pod wakeup still
+    reaches capable dispatchers on other pods even though only the leader
+    runs the scan. Previously RUN_EVERYWHERE, this produced one identical
+    scan per pod per cadence and a redundant ``pg_notify`` per stuck event
+    at full scale.
+
+    The scan, log, and redispatch body is implemented in tick() — PeriodicService
+    supplies the loop, shutdown handling, and the initial tick. Note that
+    PeriodicService ticks IMMEDIATELY on startup then on cadence (the old
+    hand-rolled loop slept first); this is safe because the min_age guard
+    (min_age_s) filters freshly-enqueued rows.
+    """
+
+    name = "stuck_pending_warner"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
+
+    def __init__(
+        self,
+        *,
+        schema: str,
+        interval_s: float = 60.0,
+        min_age_s: float = 600.0,
+        sample_limit: int = 50,
+    ) -> None:
+        self._schema = schema
+        self.cadence_seconds = interval_s
+        self._min_age_s = min_age_s
+        self._sample_limit = sample_limit
+        # Build the DQLQuery once; it is stateless and safe to share across ticks.
+        self._query = DQLQuery(
+            (
+                f'SELECT task_id, task_type, catalog_id, inputs, '  # nosec
+                f'  EXTRACT(EPOCH FROM NOW() - timestamp) AS age_s '
+                f'FROM "{schema}".tasks '
+                f"WHERE status = 'PENDING' "
+                f"  AND retry_count = 0 "
+                f"  AND timestamp < NOW() - make_interval(secs => :min_age_s) "
+                f"ORDER BY timestamp ASC LIMIT :sample_limit;"
+            ),
+            result_handler=ResultHandler.ALL_DICTS,
+        )
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        # Retry the read on a fresh connection when a transaction-mode pooler
+        # tears down the backend mid-checkout (08003). Only the DB scan is
+        # retried; the downstream emit/redispatch side-effects run once.
+        @retry_on_transient_connect()
+        async def _scan():
+            try:
+                async with background_managed_transaction(ctx.engine) as conn:
+                    return await self._query.execute(
+                        conn,
+                        min_age_s=self._min_age_s,
+                        sample_limit=self._sample_limit,
+                    )
+            except asyncio.TimeoutError as exc:
+                # Background-slot saturation, not a connection drop: skip this
+                # pass instead of retrying it. See _BackgroundSlotBusy.
+                raise _BackgroundSlotBusy from exc
 
         try:
-            async with managed_transaction(engine) as conn:
-                rows = await query.execute(
-                    conn, min_age_s=min_age_s, sample_limit=sample_limit,
-                )
+            rows = await _scan()
             rows = rows or []
             await _emit_stuck_pending_logs(rows)
             if rows:
-                await _redispatch_stuck_rows(engine, rows)
+                await _redispatch_stuck_rows(ctx.engine, rows)
+        except _BackgroundSlotBusy:
+            logger.debug("stuck-pending warner: skipped pass, background DB slots busy")
         except Exception as exc:  # noqa: BLE001 — never crash on diagnostic
             logger.warning("stuck-pending warner: scan failed: %s", exc)
 
@@ -1060,11 +1050,13 @@ async def sweep_wedged_provisioning_catalogs(
     mark time) the catalog is left ``provisioning`` indefinitely.
 
     This sweep detects that condition — ``provisioning_status = 'provisioning'``
-    AND no ``PENDING``/``ACTIVE`` ``gcp_provision_catalog`` task pointing at the
-    same ``catalog_id`` in its ``inputs`` — and calls
+    AND no ``PENDING``/``ACTIVE`` ``gcp_provision_catalog`` or ``catalog_provision``
+    task pointing at the same ``catalog_id`` in its ``inputs`` — and calls
     ``drain_pending_checklist_steps`` on each such catalog.  The drain marks
-    still-``pending`` steps ``"degraded"`` so the catalog becomes ``ready``
-    rather than staying wedged.
+    still-``pending`` steps ``"failed"``: a provisioning task that died without
+    completing and is no longer being retried is a failure, so the catalog
+    surfaces as ``failed`` (recoverable via reprovision) instead of staying
+    wedged in ``provisioning`` or being misreported as ``ready``.
 
     Returns the number of catalogs drained this pass (0 = nothing to do).
 
@@ -1085,18 +1077,23 @@ async def sweep_wedged_provisioning_catalogs(
               SELECT 1
               FROM "{task_schema}".tasks t
               WHERE t.status IN ('PENDING', 'ACTIVE')
-                AND t.task_type = 'gcp_provision_catalog'
+                AND t.task_type IN ('gcp_provision_catalog', 'catalog_provision')
                 AND t.inputs->>'catalog_id' = c.id
           )
         LIMIT :sample_limit;
     """
     try:
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
             if not await check_table_exists(conn, "catalogs", "catalog"):
                 return 0
             rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
                 conn, min_age_s=min_age_s, sample_limit=sample_limit,
             )
+    except TimeoutError:
+        logger.warning(
+            "sweep_wedged_provisioning_catalogs: background semaphore saturated — skipping pass."
+        )
+        return 0
     except Exception as exc:  # noqa: BLE001
         logger.warning("sweep_wedged_provisioning_catalogs: scan query failed: %s", exc)
         return 0
@@ -1123,8 +1120,14 @@ async def sweep_wedged_provisioning_catalogs(
         if not catalog_id:
             continue
         try:
+            # A catalog wedged in 'provisioning' with no live/queued task means
+            # its provisioning task died without completing (crash / SIGKILL /
+            # DB unavailable at mark time) and is not being retried. Under the
+            # atomic provisioning contract that is a failure, not a success:
+            # drain its pending steps to 'failed' so it surfaces as 'failed'
+            # (operator reprovisions to recover) instead of silently 'ready'.
             updated = await catalogs.drain_pending_checklist_steps(
-                catalog_id, terminal_status="degraded",
+                catalog_id, terminal_status="failed",
             )
             if updated:
                 drained += 1
@@ -1140,6 +1143,12 @@ async def sweep_wedged_provisioning_catalogs(
     return drained
 
 
+# Lock namespace for the backstop pass below — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# static lock/lease key.
+_MANDATORY_BACKSTOP_LOCK_NAME = "dynastore.mandatory.backstop"
+
+
 async def _run_mandatory_backstop_pass(
     engine: DbResource, schema: str, *, ttl_grace_seconds: float, min_age_s: float
 ) -> None:
@@ -1148,7 +1157,8 @@ async def _run_mandatory_backstop_pass(
     pod wins ``pg_try_advisory_xact_lock`` for this pass; others return immediately.
     Fail-open: any error is logged and swallowed."""
     from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+        DQLQuery, ResultHandler, background_managed_transaction,
+        retry_on_transient_connect,
     )
     from dynastore.modules.tasks.dispatcher import (
         _stable_advisory_lock_key, sweep_unclaimable_rows,
@@ -1156,79 +1166,95 @@ async def _run_mandatory_backstop_pass(
     )
     from dynastore.modules.tasks.mandatory import check_mandatory_ownership
 
-    lock_key = _stable_advisory_lock_key("dynastore.mandatory.backstop")
+    lock_key = _stable_advisory_lock_key(_MANDATORY_BACKSTOP_LOCK_NAME)
+
+    # The whole locked pass is idempotent (a backstop sweep), so on a
+    # transaction-mode pooler tearing down the backend mid-pass (08003) we
+    # re-run it on a fresh connection rather than waiting a full tick. The
+    # advisory xact lock is re-acquired each attempt; a non-transient error
+    # falls through to the warning below after the retry budget is spent.
+    @retry_on_transient_connect()
+    async def _locked_pass() -> None:
+        try:
+            async with background_managed_transaction(engine) as conn:
+                got = await DQLQuery(
+                    "SELECT pg_try_advisory_xact_lock(:k) AS got",
+                    result_handler=ResultHandler.ONE_DICT,
+                ).execute(conn, k=lock_key)
+                if not got or not got.get("got"):
+                    return  # another pod owns this pass; advisory xact lock held until txn end
+                # All three sub-calls receive the locked connection so the whole pass
+                # runs on one pool slot instead of opening three additional connections.
+                await check_mandatory_ownership(engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn)
+                await sweep_unclaimable_rows(
+                    engine, schema, ttl_grace_seconds=ttl_grace_seconds, min_age_s=min_age_s, conn=conn,
+                )
+                await auto_requeue_recovered_mandatory(
+                    engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn,
+                )
+        except asyncio.TimeoutError as exc:
+            # Background-slot saturation, not a connection drop: skip this pass
+            # instead of retrying it. See _BackgroundSlotBusy.
+            raise _BackgroundSlotBusy from exc
+
     try:
-        async with managed_transaction(engine) as conn:
-            got = await DQLQuery(
-                "SELECT pg_try_advisory_xact_lock(:k) AS got",
-                result_handler=ResultHandler.ONE_DICT,
-            ).execute(conn, k=lock_key)
-            if not got or not got.get("got"):
-                return  # another pod owns this pass; advisory xact lock held until txn end
-            # All three sub-calls receive the locked connection so the whole pass
-            # runs on one pool slot instead of opening three additional connections.
-            await check_mandatory_ownership(engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn)
-            await sweep_unclaimable_rows(
-                engine, schema, ttl_grace_seconds=ttl_grace_seconds, min_age_s=min_age_s, conn=conn,
-            )
-            await auto_requeue_recovered_mandatory(
-                engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn,
-            )
+        await _locked_pass()
+    except _BackgroundSlotBusy:
+        logger.debug("proactive_sweep: mandatory backstop skipped, background DB slots busy")
     except Exception as exc:  # noqa: BLE001 — never crash the sweep loop
         logger.warning("proactive_sweep: mandatory backstop pass failed: %s", exc)
 
 
-async def _run_proactive_capability_sweep(
-    engine: DbResource,
-    schema: str,
-    shutdown_event: asyncio.Event,
-    *,
-    interval_s: float = 60.0,
-    min_age_s: float = 300.0,
-    max_caps_per_pass: int = 50,
-    capability_ttl_s: float = 90.0,
-) -> None:
-    """Periodically DLQ PENDING/retry=0 rows whose required capability
-    has no live worker (issue #524).
+class ProactiveSweepService(PeriodicService):
+    """Periodic DLQ sweep for PENDING rows whose required capability has no
+    live worker.
 
-    Complements the reactive reaper in ``dispatcher.py`` — same advisory
-    lock + double-check, but driven by a wall-clock timer instead of
-    waiting for a claim+reject cycle. With this loop running, the
-    worst-case latency between "last pod for a capability dies" and
-    "rows leave PENDING" is bounded by ``interval_s`` regardless of
-    incoming task volume.
+    Runs on every pod (RUN_EVERYWHERE) and skips ephemeral Cloud Run Job
+    pods (SKIP_EPHEMERAL). Resolves #2279 for this loop.
 
-    Per-pass: walks ``TASK_TYPE_CAPABILITY_INPUTS_KEY``, queries
-    distinct capability ids referenced by old PENDING rows, calls
-    ``sweep_dead_capability_rows`` per pair. Returns ``0`` when the
-    oracle says the capability is live or the advisory lock is taken
-    by another pod — so multiple pods running this loop in parallel
-    do not multiply work.
-
-    Idempotent and crash-safe: any error is logged and swallowed; the
-    loop sleeps and retries. Stops cleanly when ``shutdown_event`` is
-    set.
+    The in-body advisory lock (_run_mandatory_backstop_pass /
+    pg_try_advisory_xact_lock) is preserved — do NOT add loop-level
+    LEADER_ONLY leadership here; the per-pass locking already deduplicates
+    across pods for the backstop step. PeriodicService supplies the outer
+    loop and shutdown handling. Note that PeriodicService ticks IMMEDIATELY
+    on startup then on cadence (the old hand-rolled loop slept first); this
+    is safe because the min_age guard (min_age_s) filters freshly-enqueued rows.
     """
-    from dynastore.modules.tasks.capability_oracle import (
-        TASK_TYPE_CAPABILITY_INPUTS_KEY,
-    )
-    from dynastore.modules.tasks.dispatcher import sweep_dead_capability_rows
 
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
-            break  # shutdown signalled during sleep
-        except asyncio.TimeoutError:
-            pass  # normal — periodic wakeup
+    name = "proactive_capability_sweep"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
+
+    def __init__(
+        self,
+        *,
+        schema: str,
+        interval_s: float = 60.0,
+        min_age_s: float = 300.0,
+        max_caps_per_pass: int = 50,
+        capability_ttl_s: float = 90.0,
+    ) -> None:
+        self._schema = schema
+        self.cadence_seconds = interval_s
+        self._min_age_s = min_age_s
+        self._max_caps_per_pass = max_caps_per_pass
+        self._capability_ttl_s = capability_ttl_s
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.tasks.capability_oracle import (
+            TASK_TYPE_CAPABILITY_INPUTS_KEY,
+        )
+        from dynastore.modules.tasks.dispatcher import sweep_dead_capability_rows
 
         try:
             for task_type, inputs_key in TASK_TYPE_CAPABILITY_INPUTS_KEY.items():
-                if shutdown_event.is_set():
+                if ctx.shutdown.is_set():
                     return
                 try:
                     cap_ids = await _distinct_pending_capability_ids(
-                        engine, schema, task_type, inputs_key,
-                        min_age_s, max_caps_per_pass,
+                        ctx.engine, self._schema, task_type, inputs_key,
+                        self._min_age_s, self._max_caps_per_pass,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1237,11 +1263,11 @@ async def _run_proactive_capability_sweep(
                     )
                     continue
                 for cap_id in cap_ids:
-                    if shutdown_event.is_set():
+                    if ctx.shutdown.is_set():
                         return
                     try:
                         dlqed = await sweep_dead_capability_rows(
-                            engine, cap_id, task_type=task_type,
+                            ctx.engine, cap_id, task_type=task_type,
                         )
                         if dlqed > 0:
                             logger.info(
@@ -1255,20 +1281,14 @@ async def _run_proactive_capability_sweep(
                             "(capability=%s task_type=%s): %s",
                             cap_id, task_type, exc,
                         )
-            # Capability-less backstop + mandatory-ownership invariant. Runs on
-            # one pod per pass (advisory-locked inside the helper) so it covers
-            # task types the capability reaper skips for required_capability=None
-            # rows.
             await _run_mandatory_backstop_pass(
-                engine, schema, ttl_grace_seconds=capability_ttl_s, min_age_s=min_age_s,
+                ctx.engine, self._schema,
+                ttl_grace_seconds=self._capability_ttl_s,
+                min_age_s=self._min_age_s,
             )
-            # Wedged-provisioning reconciler: drain still-pending checklist
-            # steps for catalogs stuck in 'provisioning' with no live task.
-            # Runs on every pod independently — drain_pending_checklist_steps
-            # uses SELECT … FOR UPDATE, so concurrent pods are serialised.
             try:
                 drained = await sweep_wedged_provisioning_catalogs(
-                    engine, min_age_s=min_age_s,
+                    ctx.engine, min_age_s=self._min_age_s,
                 )
                 if drained:
                     logger.info(
@@ -1281,6 +1301,99 @@ async def _run_proactive_capability_sweep(
                 )
         except Exception as exc:  # noqa: BLE001 — never crash the loop
             logger.warning("proactive_sweep: pass failed: %s", exc)
+
+
+class TaskRetentionService(PeriodicService):
+    """Leader-elected periodic service that enforces task retention policy.
+
+    Runs on a configurable cadence (default daily). On each tick it:
+    1. Purges COMPLETED/FAILED tasks older than ``terminal_task_ttl_days``.
+    2. Hard-deletes DEAD_LETTER tasks older than ``dlq_max_age_days``.
+    3. Emits a ``tasks.health_alert / dead_letter_overflow`` event when the
+       global DEAD_LETTER count exceeds ``dlq_alert_threshold``.
+
+    Only one pod runs each tick (LEADER_ONLY) to avoid duplicate DELETEs.
+    Skipped on ephemeral Cloud Run Jobs (SKIP_EPHEMERAL).  Config values are
+    read live inside tick() so hot-reload via TasksPluginConfig takes effect
+    on the next cadence without a pod restart.
+    """
+
+    name = "task_retention"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = "dynastore.task_retention"
+
+    def __init__(self, *, interval_s: float = 86400.0) -> None:
+        self.cadence_seconds = interval_s
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.maintenance import (
+            purge_completed_tasks,
+            purge_dead_letter_tasks,
+            get_task_statistics,
+        )
+        from dynastore.models.driver_context import DriverContext
+
+        _cfg: Optional[TasksPluginConfig] = None
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr:
+            try:
+                _raw = await config_mgr.get_config(
+                    TasksPluginConfig, ctx=DriverContext(db_resource=ctx.engine)
+                )
+                if isinstance(_raw, TasksPluginConfig):
+                    _cfg = _raw
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("task_retention: failed to load TasksPluginConfig: %s", exc)
+
+        ttl_days = _cfg.terminal_task_ttl_days if _cfg else 30
+        dlq_max_days = _cfg.dlq_max_age_days if _cfg else 90
+        dlq_threshold = _cfg.dlq_alert_threshold if _cfg else 100
+
+        try:
+            purged = await purge_completed_tasks(
+                ctx.engine, older_than=timedelta(days=ttl_days)
+            )
+            if purged:
+                logger.info("task_retention: purged %d terminal task(s)", purged)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("task_retention: terminal-task purge failed: %s", exc)
+
+        try:
+            archived = await purge_dead_letter_tasks(
+                ctx.engine, older_than=timedelta(days=dlq_max_days)
+            )
+            if archived:
+                logger.info("task_retention: purged %d stale DEAD_LETTER task(s)", archived)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("task_retention: DLQ age-cap purge failed: %s", exc)
+
+        try:
+            stats = await get_task_statistics(ctx.engine)
+            dlq_count = int(stats.get("DEAD_LETTER", 0))
+            if dlq_count > dlq_threshold:
+                logger.error(
+                    "task_retention: ALERT — DEAD_LETTER count %d exceeds threshold %d",
+                    dlq_count,
+                    dlq_threshold,
+                )
+                try:
+                    from dynastore.modules.catalog.event_service import emit_event  # noqa: PLC0415
+                    await emit_event(
+                        "tasks.health_alert",
+                        alert_type="dead_letter_overflow",
+                        tasks_dlq_count=dlq_count,
+                        threshold=dlq_threshold,
+                    )
+                except Exception as emit_exc:  # noqa: BLE001
+                    logger.warning(
+                        "task_retention: failed to emit tasks.health_alert: %s", emit_exc
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("task_retention: DLQ count check failed: %s", exc)
 
 
 async def _distinct_pending_capability_ids(
@@ -1313,7 +1426,7 @@ async def _distinct_pending_capability_ids(
         f"LIMIT :sample_limit;"
     )
     query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
-    async with managed_transaction(engine) as conn:
+    async with background_managed_transaction(engine) as conn:
         rows = await query.execute(
             conn,
             task_type=task_type,
@@ -1346,7 +1459,7 @@ async def _emit_stuck_pending_logs(rows: List[Dict[str, Any]]) -> None:
         logger.warning(
             "stuck-pending: task '%s' (%s, schema=%s) has been "
             "PENDING for %.0fs with retry_count=0 — %s",
-            row["task_id"], row["task_type"], row.get("schema_name"),
+            row["task_id"], row["task_type"], row.get("catalog_id"),
             row["age_s"],
             _stuck_pending_hint(row["task_type"], cap_id, cap_live),
         )
@@ -1456,8 +1569,8 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
 
     There is exactly ONE legitimate caller: ``TasksModule.lifespan`` at app
     startup, with ``schema == get_task_schema()`` (default ``"tasks"``).
-    Multi-tenancy is column-based — ``schema_name`` on each task row carries
-    the catalog physical schema; the table itself is never duplicated per
+    Multi-tenancy is column-based — ``catalog_id`` on each task row carries
+    the catalog internal id; the table itself is never duplicated per
     tenant. Callers that pass a catalog/tenant schema are a bug: they would
     create an unread shadow table per tenant.
 
@@ -1489,7 +1602,7 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
             f"ensure_task_storage_exists: refusing DDL on non-global schema "
             f"{schema!r} (expected {global_schema!r}). Tasks live in a single "
             f"global partitioned table; per-tenant tasks tables are a bug "
-            f"and were never read. Use schema_name='{schema}' on the row "
+            f"and were never read. Use catalog_id='{schema}' on the row "
             f"instead (the tenant discriminator column)."
         )
 
@@ -1671,16 +1784,31 @@ async def list_tasks_for_catalog(
     limit: int = 20,
     offset: int = 0,
     kind: Optional[str] = None,
+    *,
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    asset_id: Optional[str] = None,
+    created_before: Optional[datetime] = None,
+    cursor: Optional[str] = None,
 ) -> List[Task]:
     """
     Lists tasks from a catalog's schema.
     Uses CatalogsProtocol to resolve the physical schema.
 
     Pass ``kind`` to narrow results to a specific task type (forwarded to
-    :func:`list_tasks`).
+    :func:`list_tasks`).  All additional keyword filters are forwarded as-is.
     """
     schema = await _resolve_catalog_schema(catalog_id, conn)
-    return await list_tasks(conn, schema, limit, offset, kind=kind)
+    return await list_tasks(
+        conn, schema, limit, offset, kind=kind,
+        status=status,
+        task_type=task_type,
+        collection_id=collection_id,
+        asset_id=asset_id,
+        created_before=created_before,
+        cursor=cursor,
+    )
 
 
 async def update_task_for_catalog(
@@ -1695,9 +1823,34 @@ async def update_task_for_catalog(
 
 
 # --- Low-level functions ---
-# The `schema` parameter in these functions refers to the `schema_name` column
-# value (e.g. tenant schema "s_abc123" or "system"), NOT the PostgreSQL schema
-# that hosts the table.  The actual table lives in `get_task_schema()`.tasks.
+# The `schema` parameter in these functions refers to the `catalog_id` column
+# value (e.g. catalog internal id "s_abc123" or the sentinel "system"), NOT the
+# PostgreSQL schema that hosts the table.  The table lives in `get_task_schema()`.tasks.
+
+async def get_active_task_by_dedup_key(
+    engine: DbResource, schema: str, dedup_key: str
+) -> Optional[Dict[str, Any]]:
+    """Return ``{task_id, status}`` of the non-terminal task carrying
+    ``dedup_key`` in ``schema`` (catalog_id column), or None.
+
+    Mirrors the dedup pre-check inside :func:`create_task`.  The spawn API uses
+    it to return the existing :class:`TaskRef` on a dedup hit, so a retried
+    spawn is idempotent instead of failing with 409.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        SELECT task_id, status FROM {task_schema}.tasks
+        WHERE dedup_key = :dedup_key
+          AND catalog_id = :catalog_id
+          AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
+        ORDER BY timestamp DESC
+        LIMIT 1;
+    """
+    async with managed_transaction(engine) as conn:
+        return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
+            conn, dedup_key=dedup_key, catalog_id=schema
+        )
+
 
 async def create_task(
     engine: DbResource,
@@ -1709,7 +1862,7 @@ async def create_task(
     locked_until: Optional[datetime] = None,
 ) -> Optional[Task]:
     """
-    Creates a new task in the global tasks table with schema_name = `schema`.
+    Creates a new task in the global tasks table with catalog_id = `schema`.
 
     Pass initial_status='RUNNING' to bypass the dispatcher queue (e.g. for
     audit tasks created by BackgroundRunner that are already being executed
@@ -1725,7 +1878,7 @@ async def create_task(
     update_task(ACTIVE), spawning a duplicate Cloud Run Job.
 
     Dedup: if `task_data.dedup_key` is set, a pre-check rejects insert when
-    a non-terminal task already carries the same (schema_name, dedup_key) —
+    a non-terminal task already carries the same (catalog_id, dedup_key) —
     this is what lets every event-driven caller survive at-least-once
     redelivery. Returns None on dedup hit.
     """
@@ -1740,13 +1893,13 @@ async def create_task(
             check_sql = f"""
                 SELECT task_id FROM {task_schema}.tasks
                 WHERE dedup_key = :dedup_key
-                  AND schema_name = :schema_name
+                  AND catalog_id = :catalog_id
                   AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
                 LIMIT 1;
             """
             existing = await DQLQuery(
                 check_sql, result_handler=ResultHandler.ONE_DICT
-            ).execute(conn, dedup_key=task_data.dedup_key, schema_name=schema)
+            ).execute(conn, dedup_key=task_data.dedup_key, catalog_id=schema)
             if existing:
                 return None
 
@@ -1775,7 +1928,7 @@ async def create_task(
         # ingestion job is capped at the deploy-time intent (typically 1) rather
         # than a generic 3-retry default.
         cols: List[str] = [
-            "task_id", "schema_name", "scope", "caller_id", "task_type", "type",
+            "task_id", "catalog_id", "scope", "caller_id", "task_type", "type",
             "execution_mode", "inputs", "timestamp", "collection_id", "dedup_key",
             "status",
         ]
@@ -1788,7 +1941,7 @@ async def create_task(
         resolved_type = resolve_task_type_kind(task_data.task_type, task_data.type)
         insert_kwargs: Dict[str, Any] = dict(
             task_id=task_id,
-            schema_name=schema,
+            catalog_id=schema,
             scope=task_data.scope,
             caller_id=task_data.caller_id,
             task_type=task_data.task_type,
@@ -1809,11 +1962,16 @@ async def create_task(
         if locked_until is not None:
             cols.append("locked_until")
             insert_kwargs["locked_until"] = locked_until
-        # Stamp ACTIVE timing fields so the row looks identical to one
-        # claim_batch / claim_by_id would have produced.
+        # Stamp the ACTIVE ownership/liveness fields so the row looks
+        # identical to one claim_batch / claim_by_id would have produced.
+        # started_at is deliberately NOT stamped here (#2893): this branch is
+        # the REMOTE born-claimed path (GcpJobRunner's REST dispatch) — the
+        # container has not started yet at insert time, so started_at stays
+        # NULL until claim_for_execution's COALESCE(started_at, NOW()) stamps
+        # the real container-start moment.
         if initial_status == "ACTIVE":
-            sql_extra = ", started_at, last_heartbeat_at"
-            values_extra = ", NOW(), NOW()"
+            sql_extra = ", last_heartbeat_at"
+            values_extra = ", NOW()"
         else:
             sql_extra = ""
             values_extra = ""
@@ -1854,9 +2012,9 @@ async def update_task(
 
     set_sql = ", ".join(set_clauses)
 
-    sql = f'UPDATE {task_schema}.tasks SET {set_sql} WHERE task_id = :task_id AND schema_name = :schema_name RETURNING *;'
+    sql = f'UPDATE {task_schema}.tasks SET {set_sql} WHERE task_id = :task_id AND catalog_id = :catalog_id RETURNING *;'
 
-    query_params = {**update_fields, "task_id": task_id, "schema_name": schema}
+    query_params = {**update_fields, "task_id": task_id, "catalog_id": schema}
 
     # Commit the write explicitly. ``conn`` is frequently a bare engine — every
     # BackgroundRunner / GcpJobRunner terminal flip passes ``context.engine`` —
@@ -1877,13 +2035,19 @@ async def update_task(
     return Task.model_validate(updated_task_dict) if updated_task_dict else None
 
 
-@cached(maxsize=256, namespace="tasks", ignore=["conn"])
+@cached(
+    maxsize=256,
+    namespace="tasks",
+    ignore=["conn"],
+    ttl=60,
+    l1_ttl=2,
+)
 async def get_task(conn: DbResource, task_id: uuid.UUID, schema: str) -> Optional[Task]:
     """Retrieves a single task by its ID from the global tasks table."""
     task_schema = get_task_schema()
-    sql = f'SELECT * FROM {task_schema}.tasks WHERE task_id = :task_id AND schema_name = :schema_name;'
+    sql = f'SELECT * FROM {task_schema}.tasks WHERE task_id = :task_id AND catalog_id = :catalog_id;'
     task_dict = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
-        conn, task_id=task_id, schema_name=schema
+        conn, task_id=task_id, catalog_id=schema
     )
     return Task.model_validate(task_dict) if task_dict else None
 
@@ -1891,7 +2055,7 @@ async def get_task(conn: DbResource, task_id: uuid.UUID, schema: str) -> Optiona
 async def get_task_by_id_unscoped(
     conn: DbResource, task_id: uuid.UUID
 ) -> Optional[Task]:
-    """Retrieve a task by ``task_id`` alone, ignoring the tenant ``schema_name``.
+    """Retrieve a task by ``task_id`` alone, ignoring the tenant ``catalog_id``.
 
     Task IDs are UUIDv7 — globally unique — so a single task_id matches at most
     one row in the partitioned ``tasks`` table. Used by the unscoped OGC
@@ -1911,31 +2075,189 @@ async def get_task_by_id_unscoped(
     return Task.model_validate(task_dict) if task_dict else None
 
 
+def encode_cursor(task: "Task") -> str:
+    """Encode a keyset cursor from the last row of a page.
+
+    The cursor is an opaque, URL-safe base64 string encoding
+    ``{timestamp_iso}|{task_id}``.  Pass it as ``?cursor=`` on the next
+    request to resume listing from the row after this one.
+    """
+    raw = f"{task.timestamp.isoformat()}|{task.jobID}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def decode_cursor(cursor: str) -> tuple:
+    """Decode a keyset cursor produced by :func:`encode_cursor`.
+
+    Returns a ``(datetime, uuid.UUID)`` tuple for use in the keyset
+    WHERE clause: ``(timestamp, task_id) < (:c_ts, :c_id)``.
+
+    Raises ``ValueError`` on malformed input so the route layer can
+    surface a 422 to the caller.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        ts_str, task_id_str = raw.rsplit("|", 1)
+        return datetime.fromisoformat(ts_str), uuid.UUID(task_id_str)
+    except Exception as exc:
+        raise ValueError(f"Invalid cursor: {exc}") from exc
+
+
 async def list_tasks(
     conn: DbResource,
     schema: str,
     limit: int = 20,
     offset: int = 0,
     kind: Optional[str] = None,
+    *,
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    asset_id: Optional[str] = None,
+    created_before: Optional[datetime] = None,
+    cursor: Optional[str] = None,
 ) -> List[Task]:
-    """Lists tasks filtered by schema_name, ordered by creation date.
+    """Lists tasks filtered by catalog_id, ordered newest-first.
 
-    Pass ``kind`` to narrow results to a specific task type (e.g. ``'process'``
-    for OGC Process jobs only).  When ``None`` all types are returned — the
-    admin Tasks API relies on this full view.
+    Existing positional callers (``kind`` as keyword, ``offset`` for
+    offset-based pagination) are unaffected — all new parameters are
+    keyword-only with defaults.
+
+    Keyset pagination: when ``cursor`` is provided (a value from
+    :func:`encode_cursor`), offset is ignored and a ``(timestamp, task_id)``
+    ``<`` predicate replaces OFFSET, giving stable pagination on
+    ``timestamp DESC, task_id DESC``.
+
+    The route layer retrieves ``limit+1`` rows by passing ``limit+1`` to
+    detect whether a next page exists, then slices to ``limit`` and encodes
+    :func:`encode_cursor` on the (limit+1)-th row if present.
+
+    Args:
+        conn:           DB connection or engine.
+        schema:         ``catalog_id`` column value (physical schema id, or
+                        'system'/'platform' sentinels).
+        limit:          Max rows to return.  Caller passes ``limit+1`` to
+                        detect next-page existence.
+        offset:         Deprecated for keyset callers; kept for offset-based
+                        back-compat (processes_service).
+        kind:           Filter by the ``type`` column ('task' or 'process').
+        status:         Filter by task status string.
+        task_type:      Filter by the ``task_type`` column.
+        collection_id:  Filter by the ``collection_id`` column.
+        asset_id:       Filter by ``inputs->>'asset_id'`` JSONB extraction.
+        created_before: Filter rows with ``timestamp < created_before``.
+        cursor:         Opaque keyset cursor from :func:`encode_cursor`.
     """
     task_schema = get_task_schema()
+    clauses = ["catalog_id = :catalog_id"]
+    params: Dict[str, Any] = {"catalog_id": schema, "limit": limit}
+
     if kind is not None:
-        sql = f'SELECT * FROM {task_schema}.tasks WHERE schema_name = :schema_name AND type = :kind ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
-        task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, schema_name=schema, limit=limit, offset=offset, kind=kind
+        clauses.append("type = :kind")
+        params["kind"] = kind
+    if status is not None:
+        clauses.append("status = :status")
+        params["status"] = status
+    if task_type is not None:
+        clauses.append("task_type = :task_type")
+        params["task_type"] = task_type
+    if collection_id is not None:
+        clauses.append("collection_id = :collection_id")
+        params["collection_id"] = collection_id
+    if asset_id is not None:
+        clauses.append("inputs->>'asset_id' = :asset_id")  # nosec — parameterised
+        params["asset_id"] = asset_id
+    if created_before is not None:
+        clauses.append("timestamp < :created_before")
+        params["created_before"] = created_before
+
+    where = " AND ".join(clauses)
+
+    if cursor is not None:
+        c_ts, c_id = decode_cursor(cursor)
+        params["c_ts"] = c_ts
+        params["c_id"] = c_id
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} AND (timestamp, task_id) < (:c_ts, :c_id) "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit;"
         )
     else:
-        sql = f'SELECT * FROM {task_schema}.tasks WHERE schema_name = :schema_name ORDER BY timestamp DESC LIMIT :limit OFFSET :offset;'
-        task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, schema_name=schema, limit=limit, offset=offset
+        params["offset"] = offset
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit OFFSET :offset;"
         )
-    return [Task.model_validate(t) for t in task_dicts]
+
+    task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, **params
+    )
+    return [Task.model_validate(t) for t in (task_dicts or [])]
+
+
+async def list_tasks_system(
+    conn: DbResource,
+    limit: int = 20,
+    *,
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    kind: Optional[str] = None,
+    asset_id: Optional[str] = None,
+    created_before: Optional[datetime] = None,
+    cursor: Optional[str] = None,
+) -> List[Task]:
+    """Lists tasks whose ``catalog_id`` is one of the system sentinels.
+
+    Covers ``catalog_id IN ('system', 'platform')`` — the two sentinels used
+    for cross-tenant platform work.  Accepts the same keyset / filter params
+    as :func:`list_tasks` (except ``collection_id`` which is not meaningful
+    at system scope).
+
+    The route layer passes ``limit+1`` to detect next-page existence.
+    """
+    task_schema = get_task_schema()
+    clauses = ["catalog_id IN ('system', 'platform')"]
+    params: Dict[str, Any] = {"limit": limit}
+
+    if status is not None:
+        clauses.append("status = :status")
+        params["status"] = status
+    if task_type is not None:
+        clauses.append("task_type = :task_type")
+        params["task_type"] = task_type
+    if kind is not None:
+        clauses.append("type = :kind")
+        params["kind"] = kind
+    if asset_id is not None:
+        clauses.append("inputs->>'asset_id' = :asset_id")  # nosec — parameterised
+        params["asset_id"] = asset_id
+    if created_before is not None:
+        clauses.append("timestamp < :created_before")
+        params["created_before"] = created_before
+
+    where = " AND ".join(clauses)
+
+    if cursor is not None:
+        c_ts, c_id = decode_cursor(cursor)
+        params["c_ts"] = c_ts
+        params["c_id"] = c_id
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} AND (timestamp, task_id) < (:c_ts, :c_id) "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit;"
+        )
+    else:
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"WHERE {where} "
+            f"ORDER BY timestamp DESC, task_id DESC LIMIT :limit;"
+        )
+
+    task_dicts = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, **params
+    )
+    return [Task.model_validate(t) for t in (task_dicts or [])]
 
 
 # --- Synchronous Wrappers for Task Runners ---
@@ -1982,24 +2304,24 @@ async def enqueue(
             check_sql = f"""
                 SELECT task_id FROM {task_schema}.tasks
                 WHERE dedup_key = :dedup_key
-                  AND schema_name = :schema_name
+                  AND catalog_id = :catalog_id
                   AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
                 LIMIT 1;
             """
             existing = await DQLQuery(
                 check_sql, result_handler=ResultHandler.ONE_DICT
-            ).execute(conn, dedup_key=dedup_key, schema_name=schema_name)
+            ).execute(conn, dedup_key=dedup_key, catalog_id=schema_name)
             if existing:
                 return None
 
             sql = f"""
                 INSERT INTO {task_schema}.tasks
-                    (task_id, schema_name, scope, caller_id, task_type, type,
+                    (task_id, catalog_id, scope, caller_id, task_type, type,
                      execution_mode, inputs, timestamp, collection_id, dedup_key)
                 VALUES
-                    (:task_id, :schema_name, :scope, :caller_id, :task_type, :type,
+                    (:task_id, :catalog_id, :scope, :caller_id, :task_type, :type,
                      :execution_mode, :inputs, :timestamp, :collection_id, :dedup_key)
-                ON CONFLICT (schema_name, dedup_key, timestamp)
+                ON CONFLICT (catalog_id, dedup_key, timestamp)
                     WHERE dedup_key IS NOT NULL
                     AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')
                 DO NOTHING
@@ -2008,10 +2330,10 @@ async def enqueue(
         else:
             sql = f"""
                 INSERT INTO {task_schema}.tasks
-                    (task_id, schema_name, scope, caller_id, task_type, type,
+                    (task_id, catalog_id, scope, caller_id, task_type, type,
                      execution_mode, inputs, timestamp, collection_id)
                 VALUES
-                    (:task_id, :schema_name, :scope, :caller_id, :task_type, :type,
+                    (:task_id, :catalog_id, :scope, :caller_id, :task_type, :type,
                      :execution_mode, :inputs, :timestamp, :collection_id)
                 RETURNING *;
             """
@@ -2023,7 +2345,7 @@ async def enqueue(
         task_dict = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
             conn,
             task_id=task_id,
-            schema_name=schema_name,
+            catalog_id=schema_name,
             scope=scope,
             caller_id=task_data.caller_id,
             task_type=task_data.task_type,
@@ -2104,7 +2426,7 @@ async def claim_next(
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
-        RETURNING task_id, schema_name, scope, task_type, execution_mode,
+        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
                   caller_id, inputs, collection_id, retry_count, max_retries,
                   timestamp, dedup_key, owner_id;
     """
@@ -2163,10 +2485,10 @@ async def claim_batch(
 
     mode_filter = " OR ".join(conditions)
 
-    # Fairness: pick the oldest PENDING task per tenant (schema_name) first,
+    # Fairness: pick the oldest PENDING task per tenant (catalog_id) first,
     # then fill remaining batch slots from those results. This prevents a
     # single high-volume tenant from monopolising all claim slots.
-    # DISTINCT ON (schema_name) ORDER BY schema_name, timestamp ASC
+    # DISTINCT ON (catalog_id) ORDER BY catalog_id, timestamp ASC
     # returns exactly one row per tenant — the oldest eligible task.
     # DISTINCT ON and FOR UPDATE SKIP LOCKED cannot be combined in the same
     # SELECT (PostgreSQL forbids FOR UPDATE with DISTINCT). Use a two-step
@@ -2178,14 +2500,14 @@ async def claim_batch(
     # its next pass. This caps the cost of any future re-enqueue regression.
     sql = f"""
         WITH candidates AS (
-            SELECT DISTINCT ON (schema_name) timestamp, task_id
+            SELECT DISTINCT ON (catalog_id) timestamp, task_id
             FROM {task_schema}.tasks
             WHERE status = 'PENDING'
               AND timestamp >= :lookback
               AND (locked_until IS NULL OR locked_until <= :now)
               AND retry_count < :hard_cap
               AND ({mode_filter})
-            ORDER BY schema_name, timestamp ASC
+            ORDER BY catalog_id, timestamp ASC
         )
         UPDATE {task_schema}.tasks
         SET status = 'ACTIVE',
@@ -2201,7 +2523,7 @@ async def claim_batch(
             LIMIT :batch_size
             FOR UPDATE SKIP LOCKED
         )
-        RETURNING task_id, schema_name, scope, task_type, execution_mode,
+        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
                   caller_id, inputs, collection_id, retry_count, max_retries,
                   timestamp, dedup_key, owner_id;
     """
@@ -2268,6 +2590,113 @@ async def complete_task(
         rowcount = await DQLQuery(
             sql, result_handler=ResultHandler.ROWCOUNT
         ).execute(conn, **params)
+    return bool(rowcount and rowcount > 0)
+
+
+async def update_task_ingestion_offset(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    offset: int,
+) -> bool:
+    """Stamp a committed-row cursor onto ``inputs.ingestion_request.offset`` (#2820).
+
+    Called by the ingestion loop after every batch commit so a subsequent
+    claim of this task row — a dispatcher retry after a timeout/kill, which
+    resets status/owner via ``fail_task(retry=True)`` but never touches
+    ``inputs`` — rebuilds ``TaskIngestionRequest`` (see ``IngestionTask.run``,
+    which reads ``inputs`` fresh from the claimed row on every dispatch)
+    starting at the last durably committed offset instead of the original
+    request's (almost always 0).
+
+    Scoped by ``task_id`` only, matching ``complete_task`` / ``fail_task`` —
+    the ingestion loop already holds ``task_id`` from its own dispatch and
+    has no cheap access to the ``catalog_id`` column value here.
+
+    Returns ``True`` when a row was updated, ``False`` when none matched.
+    Callers should treat this as best-effort — a missed write degrades to
+    the pre-#2820 behaviour (a retry restarts from the original offset)
+    rather than aborting an otherwise-successful batch.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET inputs = jsonb_set(
+            COALESCE(inputs, '{{}}'::jsonb),
+            '{{ingestion_request,offset}}',
+            to_jsonb(CAST(:offset_value AS bigint)),
+            true
+        )
+        WHERE task_id = :task_id;
+    """
+    async with managed_transaction(engine) as conn:
+        rowcount = await DQLQuery(
+            sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, task_id=task_id, offset_value=offset)
+    return bool(rowcount and rowcount > 0)
+
+
+async def update_task_harvest_cursor(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    collection_id: Optional[str],
+    items_href: Optional[str],
+    done: bool,
+) -> bool:
+    """Stamp a resume cursor onto ``inputs.inputs.resume`` (#3034).
+
+    Mirrors ``update_task_ingestion_offset`` (#2820) for the ``stac_harvest``
+    task: called after each items-page batch write commits so a dispatcher
+    retry after a Cloud Run Job timeout/kill resumes the source walk instead
+    of restarting it from the first collection. ``StacHarvestTask.run``
+    rebuilds ``StacHarvestRequest`` from the claimed row's ``inputs`` on every
+    dispatch (a retry resets ``status``/``owner_id`` via
+    ``fail_task(retry=True)`` but never touches ``inputs``), so stamping the
+    cursor here is sufficient to seed the resumed run.
+
+    ``stac_harvest`` is always submitted via ``execute_process`` (the
+    ``stac_harvester`` preset), so the row's ``inputs`` column carries the
+    ``ExecuteRequest`` wrapper — the actual ``StacHarvestRequest`` fields
+    (and ``resume``) live one level down at ``inputs.inputs``, unlike
+    ingestion's flat ``inputs.ingestion_request``. The whole ``resume``
+    object is replaced in one ``jsonb_set`` call (rather than patching
+    ``collection_id``/``items_href``/``done`` as separate leaf paths) because
+    ``inputs.inputs.resume`` does not exist on the row until the first write:
+    ``jsonb_set`` only auto-creates the *last* path element even with
+    ``create_missing=true``, so a leaf-only path (e.g.
+    ``{inputs,resume,collection_id}``) would silently no-op while ``resume``
+    itself is still missing. Setting the whole object at
+    ``{inputs,resume}`` needs only ``inputs`` (which is always present) to
+    already exist.
+
+    ``collection_id`` is the source collection currently in progress (``None``
+    while a single-collection harvest has not yet started, or between
+    collections). ``items_href`` is the STAC ``rel=next`` page URL to resume
+    items from within that collection (``None`` means start it from the
+    beginning). ``done`` marks that collection's item walk as fully drained,
+    so a resumed catalog walk skips it entirely and moves to the next one.
+
+    Returns ``True`` when a row was updated, ``False`` when none matched.
+    Best-effort: a missed write only degrades to a retry restarting the
+    affected collection from the beginning, never aborts the harvest.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET inputs = jsonb_set(
+            COALESCE(inputs, '{{}}'::jsonb),
+            '{{inputs,resume}}',
+            CAST(:resume_json AS jsonb),
+            true
+        )
+        WHERE task_id = :task_id;
+    """
+    resume_json = json.dumps(
+        {"collection_id": collection_id, "items_href": items_href, "done": done}
+    )
+    async with managed_transaction(engine) as conn:
+        rowcount = await DQLQuery(
+            sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, task_id=task_id, resume_json=resume_json)
     return bool(rowcount and rowcount > 0)
 
 
@@ -2645,6 +3074,24 @@ async def persist_outputs(
         )
 
 
+def _decode_gcp_task_rows_inputs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Decode the raw JSONB-as-text ``inputs`` column on each row, in place.
+
+    asyncpg hands JSONB back as a JSON *string* under a raw ``text()``/
+    ``DQLQuery`` read; ``apply_terminal_action`` only spreads ``inputs`` when
+    ``isinstance(inputs, dict)``, so an un-decoded string silently drops the
+    original payload (geoid#1743).
+    """
+    for row in rows:
+        inputs_raw = row.get("inputs")
+        if isinstance(inputs_raw, str):
+            try:
+                row["inputs"] = json.loads(inputs_raw)
+            except (ValueError, TypeError):
+                row["inputs"] = None
+    return rows
+
+
 async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     """Return lapsed-lease Cloud Run task rows for the liveness reconciler.
 
@@ -2668,7 +3115,7 @@ async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     """
     task_schema = get_task_schema()
     sql = f"""
-        SELECT task_id, schema_name, task_type, owner_id, runner_ref,
+        SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
                started_at, locked_until, retry_count, max_retries, outputs,
                scope, caller_id, inputs, collection_id
         FROM {task_schema}.tasks
@@ -2680,14 +3127,51 @@ async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     """
     async with managed_transaction(engine) as conn:
         rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(conn)
-    for row in rows or []:
-        inputs_raw = row.get("inputs")
-        if isinstance(inputs_raw, str):
-            try:
-                row["inputs"] = json.loads(inputs_raw)
-            except (ValueError, TypeError):
-                row["inputs"] = None
-    return rows or []
+    return _decode_gcp_task_rows_inputs(rows or [])
+
+
+async def select_stale_gcp_tasks(
+    engine: DbResource, grace_seconds: float
+) -> List[Dict[str, Any]]:
+    """Return lapsed ``ACTIVE`` Cloud Run rows via a plain, non-locking SELECT.
+
+    geoid#2819: :func:`select_lapsed_gcp_tasks` takes ``FOR UPDATE SKIP
+    LOCKED`` — correct for avoiding a fight with the pg_cron reaper, but it
+    means a row held by a zombie PG session (a SIGKILLed remote backend that
+    left an idle-in-transaction lock behind) is silently skipped on *every*
+    pass, not just delayed. This query has no ``FOR UPDATE`` clause, so it
+    sees such a row regardless of any lock another session holds on it — the
+    liveness reconciler diffs this result against
+    :func:`select_lapsed_gcp_tasks`'s to tell "naturally lapsed, about to be
+    claimed" apart from "stuck behind a lock, invisible to every locking
+    scan".
+
+    ``grace_seconds`` is deliberately larger than the locking scan's implicit
+    zero-grace ``locked_until < NOW()`` — it filters out rows that merely
+    lapsed within the last reconciler tick or two, so this scan only reports
+    rows old enough that a healthy locking scan would certainly have reached
+    them by now.
+
+    Returns the identical row shape as :func:`select_lapsed_gcp_tasks` so a
+    row surfaced here can be handed straight to
+    ``GcpLivenessReconciler._reconcile_row`` for a lock-free heal attempt.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
+               started_at, locked_until, retry_count, max_retries, outputs,
+               scope, caller_id, inputs, collection_id
+        FROM {task_schema}.tasks
+        WHERE status = 'ACTIVE'
+          AND locked_until < NOW() - make_interval(secs => :grace_seconds)
+          AND owner_id LIKE 'gcp_cloud_run_%'
+        LIMIT 500;
+    """
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, grace_seconds=grace_seconds
+        )
+    return _decode_gcp_task_rows_inputs(rows or [])
 
 
 async def select_dismissed_unconfirmed_gcp_tasks(
@@ -2708,7 +3192,7 @@ async def select_dismissed_unconfirmed_gcp_tasks(
     """
     task_schema = get_task_schema()
     sql = f"""
-        SELECT task_id, schema_name, task_type, owner_id, runner_ref,
+        SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
                timestamp, started_at, last_heartbeat_at, retry_count, max_retries
         FROM {task_schema}.tasks
         WHERE status = 'DISMISSED'
@@ -2767,7 +3251,7 @@ async def claim_by_id(
             last_heartbeat_at = NOW()
         WHERE task_id = :task_id
           AND status = 'PENDING'
-        RETURNING task_id, schema_name, scope, task_type, execution_mode,
+        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
                   caller_id, inputs, collection_id, retry_count, max_retries,
                   timestamp, dedup_key, owner_id;
     """
@@ -2817,7 +3301,7 @@ async def claim_for_execution(
             started_at = COALESCE(started_at, NOW()),
             last_heartbeat_at = NOW()
         WHERE task_id = :task_id
-          AND schema_name = :schema_name
+          AND catalog_id = :catalog_id
           AND status NOT IN ('COMPLETED', 'FAILED', 'DISMISSED', 'DEAD_LETTER')
           AND NOT (
                 status = 'ACTIVE'
@@ -2831,7 +3315,7 @@ async def claim_for_execution(
         return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
             conn,
             task_id=task_id,
-            schema_name=schema,
+            catalog_id=schema,
             owner_id=owner_id,
             locked_until=locked_until,
         )
@@ -2872,7 +3356,8 @@ async def claim_for_dispatch(
         UPDATE {task_schema}.tasks
         SET owner_id = :owner_id,
             locked_until = :locked_until,
-            last_heartbeat_at = NOW()
+            last_heartbeat_at = NOW(),
+            started_at = NULL
         WHERE task_id = :task_id
           AND status = 'ACTIVE'
           AND (
@@ -2941,7 +3426,7 @@ async def find_stale_tasks(
 ) -> List[Dict[str, Any]]:
     """
     Find active tasks with expired locks (janitor use).
-    If schema_name is provided, scopes to that tenant.
+    If schema_name is provided, scopes to that tenant (matches the catalog_id column value).
     """
     task_schema = get_task_schema()
     cutoff = datetime.now(timezone.utc) - stale_threshold
@@ -2949,11 +3434,11 @@ async def find_stale_tasks(
     schema_filter = ""
     params: Dict[str, Any] = {"cutoff": cutoff}
     if schema_name is not None:
-        schema_filter = "AND schema_name = :schema_name"
-        params["schema_name"] = schema_name
+        schema_filter = "AND catalog_id = :catalog_id"
+        params["catalog_id"] = schema_name
 
     sql = f"""
-        SELECT task_id, schema_name, task_type, execution_mode, retry_count, max_retries,
+        SELECT task_id, catalog_id, task_type, execution_mode, retry_count, max_retries,
                owner_id, locked_until, last_heartbeat_at
         FROM {task_schema}.tasks
         WHERE status = 'ACTIVE'
@@ -2976,8 +3461,8 @@ async def cleanup_orphan_tasks(
     """
     Move tasks for deleted catalogs to DEAD_LETTER.
 
-    Checks schema_name against existing catalog schemas. Tasks whose
-    schema_name no longer exists and whose creation timestamp is older
+    Checks catalog_id against existing catalog ids. Tasks whose
+    catalog_id no longer exists and whose creation timestamp is older
     than grace_period are dead-lettered.
     """
     task_schema = get_task_schema()
@@ -2988,24 +3473,24 @@ async def cleanup_orphan_tasks(
         if not await check_table_exists(conn, "catalogs", "catalog"):
             return 0
 
-        # Find orphaned tasks: schema_name not in any active catalog schema
+        # Find orphaned tasks: catalog_id not in any active catalog id
         # and task is not already in a terminal state
         sql = f"""
             WITH active_schemas AS (
-                SELECT DISTINCT physical_schema
+                SELECT DISTINCT id
                 FROM catalog.catalogs
                 WHERE deleted_at IS NULL
             )
             UPDATE {task_schema}.tasks t
             SET status = 'DEAD_LETTER',
-                error_message = 'Orphaned: catalog schema no longer exists',
+                error_message = 'Orphaned: catalog no longer exists',
                 finished_at = NOW(),
                 locked_until = NULL
             WHERE t.status IN ('PENDING', 'ACTIVE')
               AND t.scope = 'CATALOG'
               AND t.timestamp < :cutoff
-              AND t.schema_name NOT IN (SELECT physical_schema FROM active_schemas)
-              AND t.schema_name != 'system';
+              AND t.catalog_id NOT IN (SELECT id FROM active_schemas)
+              AND t.catalog_id != 'system';
         """
 
         result = await DQLQuery(sql, result_handler=ResultHandler.ROWCOUNT).execute(

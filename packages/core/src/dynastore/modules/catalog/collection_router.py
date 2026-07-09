@@ -37,12 +37,13 @@ the driver.  Same pattern as the catalog-tier router.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 from dynastore.models.protocols.entity_store import (
     CollectionStore,
     EntityStoreCapability,
 )
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routed_resolver import resolve_routed
 from dynastore.modules.storage.routing_config import CollectionRoutingConfig, Operation
 
@@ -111,6 +112,7 @@ async def _routed_drivers(
     catalog_id: str,
     collection_id: Optional[str],
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     db_resource: Optional[Any] = None,
 ) -> Optional[List[CollectionStore]]:
     """Config-driven driver list for an operation.
@@ -118,10 +120,12 @@ async def _routed_drivers(
     Returns the ordered ``CollectionStore`` instances configured under
     ``CollectionRoutingConfig.operations[operation]``, or ``None`` when the
     routing config could not be consulted (early boot — caller falls back
-    to :func:`_resolve_drivers` discovery).
+    to :func:`_resolve_drivers` discovery).  When ``hints`` is non-empty
+    the list is pre-filtered by hint overlap (see ``routed_resolver``).
     """
     resolved = await resolve_routed(
         CollectionRoutingConfig, operation, catalog_id, collection_id,
+        hints=hints,
         db_resource=db_resource,
     )
     if not resolved:
@@ -142,6 +146,7 @@ async def _dispatch_collection_index(
     *,
     op_type: Literal["upsert", "delete"] = "upsert",
     db_resource: Optional[Any] = None,
+    lifecycle_status: Optional[str] = None,
 ) -> None:
     """Fan a collection ``upsert`` / ``delete`` to every Indexer configured
     as a secondary-index ``WRITE`` entry (``secondary_index=True``) in
@@ -188,6 +193,7 @@ async def _dispatch_collection_index(
         correlation_id=get_correlation_id() or "",
         pg_conn=db_resource,
         entity_type="collection",
+        lifecycle_status=lifecycle_status,
     )
     try:
         await dispatcher.fan_out_bulk(ctx, ops)
@@ -206,11 +212,34 @@ async def get_collection_metadata(
     catalog_id: str,
     collection_id: str,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
     drivers: Optional[List[CollectionStore]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Merge every registered driver's READ slice into a single envelope.
+
+    **Dispatch semantics depend on whether hints are supplied.**
+
+    *No hints (empty frozenset):* existing merge-all behaviour — every driver
+    in the resolved list contributes its domain slice; the envelopes are
+    merged with ``dict.update`` (last-driver wins on duplicate keys).  This
+    is the default path and is preserved byte-identical.
+
+    *Non-empty hints:* first-non-None semantics — the hint-filtered ordered
+    driver list is iterated sequentially; the first driver returning a
+    truthy (non-None) result wins and is returned immediately.  An ES miss
+    (None/empty) causes the iterator to advance to the next driver (PG),
+    ensuring PG always answers if ES has no indexed copy.  This is the
+    correct contract for per-request geometry-precision routing: a caller
+    asking for geometry_simplified on a collection not yet indexed in ES
+    should still get data (from PG), not a 404.
+
+    No preset configures more than one collection READ entry today, so the
+    merge-all / first-non-None distinction is only observable when a
+    deployment has two READ drivers explicitly configured.  Merge-all for
+    the no-hint default keeps that theoretical multi-driver preset working
+    without modification.
 
     **Sequential fan-out (load-bearing).**  Earlier versions used
     ``asyncio.gather`` here, but when the caller passes a shared
@@ -226,7 +255,9 @@ async def get_collection_metadata(
     """
     if drivers is None:
         routed = await _routed_drivers(
-            Operation.READ, catalog_id, collection_id, db_resource=db_resource,
+            Operation.READ, catalog_id, collection_id,
+            hints=hints,
+            db_resource=db_resource,
         )
         # READ deliberately does NOT run drivers through ``_filter_capable``.
         # A pinned ``driver_ref`` lacking READ is invoked anyway, because
@@ -254,6 +285,14 @@ async def get_collection_metadata(
 
     # Sequential to avoid asyncpg single-wire deadlock when db_resource
     # is a shared Connection (see docstring).
+    if hints:
+        # Hinted path: first-non-None wins (ES → PG fallback chain).
+        for d in drivers:
+            result = await _safe_get(d)
+            if result:
+                return result
+        return None
+
     results: List[Optional[Dict[str, Any]]] = []
     for d in drivers:
         results.append(await _safe_get(d))
@@ -275,6 +314,7 @@ async def upsert_collection_metadata(
     *,
     db_resource: Optional[Any] = None,
     drivers: Optional[List[CollectionStore]] = None,
+    lifecycle_status: Optional[str] = None,
 ) -> None:
     """Fan-out WRITE across every registered driver (sequential, fail-fast).
 
@@ -329,9 +369,14 @@ async def upsert_collection_metadata(
     # secondary-index WRITE hop — propagate the envelope to ES (and any
     # other configured Indexer).  Pure post-write propagation; PG above is
     # the system of record.  db_resource (when a live conn) makes the OUTBOX enqueue
-    # atomic with the caller's transaction.
+    # atomic with the caller's transaction.  lifecycle_status (when non-None)
+    # is threaded into the IndexContext so the ES driver can stamp it on the
+    # system container; PG drivers above are NOT passed lifecycle_status —
+    # they manage it via a dedicated column.
     await _dispatch_collection_index(
-        catalog_id, collection_id, metadata, db_resource=db_resource,
+        catalog_id, collection_id, metadata,
+        db_resource=db_resource,
+        lifecycle_status=lifecycle_status,
     )
 
 
@@ -395,6 +440,39 @@ async def delete_collection_metadata(
             catalog_id, collection_id, op_type="delete", db_resource=db_resource,
         )
     else:
+        raise first_error
+
+
+async def _clear_collection_es_lifecycle_status(
+    catalog_id: str,
+    collection_id: str,
+) -> None:
+    """Targeted partial-update: remove ``system.lifecycle_status`` from the
+    collection's ES document so it becomes visible in q-based searches.
+
+    Discovers all registered ``CollectionStore`` drivers that expose a
+    ``clear_lifecycle_status`` method (i.e. ES-backed drivers) and calls them
+    in sequence.  Errors are re-raised after all drivers have been attempted
+    so the caller can wrap the whole call in best-effort handling.  The PG
+    system-of-record flip is independent of this call.
+    """
+    drivers = _resolve_drivers()
+    first_error: Optional[BaseException] = None
+    for driver in drivers:
+        clear_fn = getattr(driver, "clear_lifecycle_status", None)
+        if clear_fn is None:
+            continue
+        try:
+            await clear_fn(catalog_id, collection_id)
+        except Exception as exc:
+            logger.warning(
+                "_clear_collection_es_lifecycle_status: driver %s failed for "
+                "%s/%s: %s",
+                type(driver).__name__, catalog_id, collection_id, exc,
+            )
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
         raise first_error
 
 

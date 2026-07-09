@@ -33,6 +33,7 @@ from sqlalchemy import text
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
 from dynastore.models.protocols import AssetsProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.db import qualify_table
 from dynastore.modules.db_config.tools import map_pg_to_json_type
 from dynastore.models.field_types import CANONICAL_TO_PG_DDL
 from dynastore.modules.storage.field_constraints import pg_native_to_canonical
@@ -636,12 +637,38 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             ext_id_cols = pk_columns + [ext_col] if pk_columns else [ext_col]
             ddl += f'\nCREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_ext_id" ON {{schema}}."{table_name}" ({", ".join(ext_id_cols)});'
 
+        # Sort index: a plain B-tree on external_id alone (no pk_columns prefix)
+        # so PostgreSQL can drive the default-sort query (ORDER BY external_id ASC
+        # LIMIT n) via an index-ordered scan of this sidecar rather than a full
+        # filesort of the joined result.  The leading-column of idx_ext_id is
+        # geoid (the PK), so that index does not help ORDER BY external_id.
+        # This index is unconditional on index_external_id because it serves
+        # ORDER BY, not uniqueness.  Created separately so it can be added by
+        # the one-time offline migration (scripts/migrate_attrs_ext_id_sort_index_2567.sql)
+        # for existing collections without reprovisioning.
+        if self.config.external_id_field is not None:
+            ext_col = self.config.external_id_field
+            ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_ext_id_sort" ON {{schema}}."{table_name}" ({ext_col});'
+
         if self.config.asset_id_field is not None and self.config.index_asset_id:
             asset_col = self.config.asset_id_field
             ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_asset_id" ON {{schema}}."{table_name}" ({asset_col});'
             # Note: We cannot add a simple FK to assets(asset_id) because assets table is partitioned by collection_id
             # and thus PK is (collection_id, asset_id).
             # Integrity is enforced via trigger (trg_asset_cleanup).
+
+        # Composite UNIQUE indexes — bridged from ItemsSchema.constraints
+        # (2+ column UniqueConstraint entries) by
+        # field_constraints.bridge_schema_to_attribute_sidecar onto
+        # ``composite_unique_constraints`` (an extra, undeclared attribute;
+        # absent when no composite constraint was declared).
+        for composite_cols in getattr(self.config, "composite_unique_constraints", None) or []:
+            quoted_cols = ", ".join(f'"{c}"' for c in composite_cols)
+            idx_name = f"idx_{table_name}_" + "_".join(composite_cols) + "_uniq"
+            ddl += (
+                f'\nCREATE UNIQUE INDEX IF NOT EXISTS "{idx_name}" '
+                f'ON {{schema}}."{table_name}" ({quoted_cols});'
+            )
 
         # Add Computed Indices from schema/paths
         for idx_stmt in indexes:
@@ -757,29 +784,65 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             sort_fields = {s.field for s in (request.sort or [])} if hasattr(request, "sort") and request.sort else set()
             all_needed = requested | filter_fields | sort_fields
 
+            # #2829: a GROUP BY request must not pull in auxiliary columns
+            # (identity, attribute, statistics) that are neither grouped nor
+            # aggregated — PostgreSQL rejects any SELECT-list column that
+            # isn't. When ``group_by`` is set, ``_include`` narrows inclusion
+            # to exactly those field names and ignores ``default`` (the
+            # ordinary per-field requested/filter/sort/wildcard/empty-select
+            # rule below, preserved as-is for the non-grouped case).
+            group_by_fields = set(request.group_by) if request.group_by else None
+
+            def _include(*names: str, default: bool) -> bool:
+                if group_by_fields is not None:
+                    return any(n in group_by_fields for n in names)
+                return default
+
             # 1. Identity Columns (null-object: field name present → column enabled)
-            if self.config.external_id_field is not None and (
-                self.config.external_id_field in all_needed
-                or "id" in all_needed
-                or "*" in requested
-                or not requested
+            if self.config.external_id_field is not None and _include(
+                self.config.external_id_field,
+                "id",
+                default=(
+                    self.config.external_id_field in all_needed
+                    or "id" in all_needed
+                    or "*" in requested
+                    or not requested
+                ),
             ):
                 fields.append(f"{alias}.{self.config.external_id_field}")
 
-            if self.config.asset_id_field is not None and (
-                self.config.asset_id_field in all_needed or "*" in requested
+            if self.config.asset_id_field is not None and _include(
+                self.config.asset_id_field,
+                default=(
+                    self.config.asset_id_field in all_needed or "*" in requested
+                ),
             ):
                 fields.append(f"{alias}.{self.config.asset_id_field}")
 
             # 2. Attribute Columns
             storage_mode = self.resolved_storage_mode
             if storage_mode == AttributeStorageMode.JSONB:
-                fields.append(f"{alias}.{self.config.jsonb_column_name}")
+                # Skip the raw blob passthrough for a GROUP BY request (#2829):
+                # map_row_to_feature's JSONB branch merges every key of this
+                # column into properties, which is meaningless for a grouped
+                # result set and — because the requested fields already reach
+                # SELECT via their own dynamically-resolved JSONB extraction
+                # expressions — also an ungrouped column PostgreSQL rejects
+                # ("column ... must appear in the GROUP BY clause").
+                if group_by_fields is None:
+                    fields.append(f"{alias}.{self.config.jsonb_column_name}")
             else:
                 # Relational mode: return selectively
                 if self.config.attribute_schema:
                     for attr in self.config.attribute_schema:
-                        if attr.name in all_needed or "*" in requested or not requested:
+                        if _include(
+                            attr.name,
+                            default=(
+                                attr.name in all_needed
+                                or "*" in requested
+                                or not requested
+                            ),
+                        ):
                             fields.append(f'{alias}."{attr.name}"')
 
             # 3. Attribute Statistics (ATTRIBUTE_STAT overlay) — COLUMNAR per
@@ -787,11 +850,14 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             # Gated like the geometries sidecar's geom_stats projection. #1074
             for stat in self._columnar_stat_fields():
                 stat_key = stat.resolved_name
-                if stat_key not in all_needed and "*" not in requested:
+                if not _include(
+                    stat_key, default=(stat_key in all_needed or "*" in requested)
+                ):
                     continue
                 fields.append(f'{alias}."{stat_key}"')
-            if self._has_jsonb_stats() and (
-                "attribute_stats" in all_needed or "*" in requested
+            if self._has_jsonb_stats() and _include(
+                "attribute_stats",
+                default=("attribute_stats" in all_needed or "*" in requested),
             ):
                 fields.append(f"{alias}.attribute_stats")
         else:
@@ -1363,14 +1429,24 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
     def get_internal_columns(self) -> set:
         """Columns owned by this sidecar that are never part of Feature properties."""
-        cols = {"geoid", "external_id", "validity", "transaction_time", "deleted_at",
+        cols = {"geoid", "validity", "transaction_time", "deleted_at",
                 "transaction_period", "catalog_id", "collection_id"}
+        if self.config.external_id_field is not None:
+            cols.add(self.config.external_id_field)
         if self.config.asset_id_field is not None:
             cols.add(self.config.asset_id_field)
         # attributes_hash is write-policy plumbing for ComputedKind.ATTRIBUTES_HASH;
         # never leak it into Feature.properties.  Only present in Mode B (JSONB).
         if self.resolved_storage_mode == AttributeStorageMode.JSONB:
             cols.add("attributes_hash")
+            # The JSONB blob column itself (default "attributes") is pure internal
+            # storage: map_row_to_feature promotes its *content* into
+            # Feature.properties, so the raw column must never surface on the
+            # Feature root. Without this, item_service.map_row_to_feature's
+            # sidecar-data bridge flattens the whole row and re-emits the blob as
+            # a top-level foreign member -- non-spec GeoJSON on the OGC Features
+            # wire (an "attributes" member beside "properties").
+            cols.add(self.config.jsonb_column_name)
         # Attribute-statistics columns surface via the expose loop, never as raw
         # Feature properties. #1074
         if self._has_jsonb_stats():
@@ -1775,7 +1851,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         if asset_id and self.config.asset_id_field is not None:
             asset_col = self.config.asset_id_field
             query = text(f"""
-                SELECT 1 FROM "{physical_schema}"."{table}"
+                SELECT 1 FROM {qualify_table(physical_schema, table)}
                 WHERE {asset_col} = :asset_id
                 {f"AND geoid != :exclude_geoid" if exclude_geoid else ""}
                 LIMIT 1
@@ -1822,7 +1898,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         # Check standard identity fields
         if field_name in ["external_id", "asset_id"]:
-            sql = f'SELECT 1 FROM "{physical_schema}"."{sc_table}" WHERE {field_name} = :val'
+            sql = f'SELECT 1 FROM {qualify_table(physical_schema, sc_table)} WHERE {field_name} = :val'
             params: Dict[str, Any] = {"val": str(value)}
             if exclude_geoid:
                 sql += " AND geoid <> :exclude"
@@ -1841,7 +1917,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         ):
             attr_names = {a.name for a in self.config.attribute_schema}
             if field_name in attr_names:
-                sql = f'SELECT 1 FROM "{physical_schema}"."{sc_table}" WHERE "{field_name}" = :val'
+                sql = f'SELECT 1 FROM {qualify_table(physical_schema, sc_table)} WHERE "{field_name}" = :val'
                 params = {"val": value}
                 if exclude_geoid:
                     sql += " AND geoid <> :exclude"
@@ -1917,9 +1993,9 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         sql = f"""
             SELECT {", ".join(select_fields)}
-            FROM "{physical_schema}"."{physical_table}" h,
-                 "{physical_schema}"."{sc_table}" s,
-                 "{physical_schema}"."{geom_sc_table}" g
+            FROM {qualify_table(physical_schema, physical_table)} h,
+                 {qualify_table(physical_schema, sc_table)} s,
+                 {qualify_table(physical_schema, geom_sc_table)} g
             WHERE {" AND ".join(where_conditions)}
             ORDER BY h.transaction_time DESC
             LIMIT 1;
@@ -1958,8 +2034,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         geom_sidecar_table = f"{physical_table}_geometries"
         sql = f"""
             SELECT h.geoid, s.geometry_hash
-            FROM "{physical_schema}"."{physical_table}" h
-            JOIN "{physical_schema}"."{geom_sidecar_table}" s
+            FROM {qualify_table(physical_schema, physical_table)} h
+            JOIN {qualify_table(physical_schema, geom_sidecar_table)} s
               ON s.geoid = h.geoid
             WHERE s.geometry_hash = :ch
               AND h.deleted_at IS NULL
@@ -2014,9 +2090,9 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         geom_sc_table = f"{physical_table}_geometries"
         sql = f"""
             SELECT h.geoid, g.geometry_hash, s.attributes_hash
-            FROM "{physical_schema}"."{physical_table}" h,
-                 "{physical_schema}"."{sc_table}" s,
-                 "{physical_schema}"."{geom_sc_table}" g
+            FROM {qualify_table(physical_schema, physical_table)} h,
+                 {qualify_table(physical_schema, sc_table)} s,
+                 {qualify_table(physical_schema, geom_sc_table)} g
             WHERE h.geoid = s.geoid
               AND g.geoid = h.geoid
               AND h.deleted_at IS NULL
@@ -2074,7 +2150,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         sc_table = f"{physical_table}_{self.sidecar_id}"
         # Standard Postgres temporal range update: set upper bound to expire_at
-        sql = f'UPDATE "{physical_schema}"."{sc_table}" SET validity = tstzrange(lower(validity), :expire_at, \'[)\') WHERE geoid = :geoid'
+        sql = f'UPDATE {qualify_table(physical_schema, sc_table)} SET validity = tstzrange(lower(validity), :expire_at, \'[)\') WHERE geoid = :geoid'
 
         from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 

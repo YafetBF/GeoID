@@ -39,7 +39,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _make_ctx(db: Any = None, principal: Any = None) -> Any:
+def _make_ctx(db: Any = None, principal: Any = None, catalogs: Any = None) -> Any:
     from dynastore.modules.storage.presets.preset import PresetContext
 
     return PresetContext(
@@ -52,7 +52,7 @@ def _make_ctx(db: Any = None, principal: Any = None) -> Any:
         libs=None,
         principal=principal,
         scope="catalog:test-cat",
-        catalogs=None,
+        catalogs=catalogs,
     )
 
 
@@ -149,7 +149,7 @@ async def test_preset_apply_explicit_target_catalog_overrides_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_preset_apply_maps_all_params() -> None:
-    """Custom max_collections / max_items / with_assets / drivers are forwarded."""
+    """Custom harvest parameters are forwarded."""
     from dynastore.extensions.stac.presets.stac_harvester import (
         STAC_HARVESTER_PRESET,
         StacHarvesterParams,
@@ -167,6 +167,8 @@ async def test_preset_apply_maps_all_params() -> None:
         max_collections=5,
         max_items=100,
         with_assets=False,
+        skip_empty_collections=True,
+        kind="RASTER",
         drivers="pg_es",
     )
 
@@ -180,6 +182,8 @@ async def test_preset_apply_maps_all_params() -> None:
     assert inp["max_collections"] == 5
     assert inp["max_items"] == 100
     assert inp["with_assets"] is False
+    assert inp["skip_empty_collections"] is True
+    assert inp["kind"] == "RASTER"
     assert inp["drivers"] == "pg_es"
 
 
@@ -198,6 +202,281 @@ async def test_preset_apply_raises_without_db() -> None:
 
     with pytest.raises(RuntimeError, match="engine.*is None"):
         await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Preset apply() — bucket-free target_catalog creation (defer hint)
+# ---------------------------------------------------------------------------
+
+
+def _ready_model() -> MagicMock:
+    return MagicMock(provisioning_status="ready")
+
+
+def _provisioning_model() -> MagicMock:
+    return MagicMock(provisioning_status="provisioning")
+
+
+def _failed_model() -> MagicMock:
+    return MagicMock(provisioning_status="failed")
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_creates_missing_target_catalog_bucket_free() -> None:
+    """When target_catalog does not exist yet, apply() creates it with
+    hints=frozenset({Hint.DEFER}) so no GCS bucket is provisioned for a
+    harvest-only catalog, then waits for it to reach 'ready' before
+    submitting the harvest job."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+    from dynastore.modules.storage.hints import Hint
+
+    catalogs = MagicMock()
+    # 1st call: existence check (absent). 2nd call: readiness poll (ready
+    # immediately — no need to actually sleep in this test).
+    catalogs.get_catalog_model = AsyncMock(side_effect=[None, _ready_model()])
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="fresh-harvest-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        return MagicMock(jobID="job-defer")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert catalogs.get_catalog_model.await_count == 2
+    for call in catalogs.get_catalog_model.await_args_list:
+        assert call.args == ("fresh-harvest-cat",)
+    catalogs.create_catalog.assert_awaited_once()
+    call = catalogs.create_catalog.await_args
+    assert call.args[0]["id"] == "fresh-harvest-cat"
+    assert call.kwargs["hints"] == frozenset({Hint.DEFER})
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_leaves_existing_target_catalog_untouched() -> None:
+    """When target_catalog already exists (and is ready), apply() must not
+    call create_catalog — an already-provisioned catalog's storage state is
+    never changed by this preset."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    catalogs = MagicMock()
+    catalogs.get_catalog_model = AsyncMock(return_value=_ready_model())  # already exists + ready
+    catalogs.create_catalog = AsyncMock()
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="existing-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        return MagicMock(jobID="job-existing")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    catalogs.create_catalog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_waits_for_catalog_ready_before_submitting_harvest() -> None:
+    """apply() must poll get_catalog_model until provisioning_status=='ready'
+    — and NOT submit the harvest job while the newly-created catalog's tenant
+    schema (catalog_core) is still an in-flight async task.  Regression guard
+    for the create/harvest race: a harvest that wins the race would otherwise
+    "succeed" silently with zero items."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    # absent -> still provisioning -> still provisioning -> ready.
+    catalogs.get_catalog_model = AsyncMock(
+        side_effect=[None, _provisioning_model(), _provisioning_model(), _ready_model()]
+    )
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="slow-provision-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="job-waited")
+
+    import dynastore.extensions.stac.presets.stac_harvester as harvester_mod
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ), patch.object(harvester_mod, "_CATALOG_READY_POLL_INTERVAL_S", 0.01):
+        await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    # 1 existence check + 3 readiness polls (provisioning, provisioning, ready).
+    assert catalogs.get_catalog_model.await_count == 4
+    assert execute_calls == ["stac_harvest"]  # only submitted once ready
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_raises_loudly_on_readiness_timeout() -> None:
+    """apply() must raise RuntimeError (not silently proceed) when the target
+    catalog never reaches 'ready' within the poll budget — never submits the
+    harvest job against a catalog whose tenant schema may not exist."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+    import dynastore.extensions.stac.presets.stac_harvester as harvester_mod
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    # Always absent-then-provisioning: existence check absent, then every
+    # readiness poll reports 'provisioning' forever.
+    catalogs.get_catalog_model = AsyncMock(
+        side_effect=[None] + [_provisioning_model() for _ in range(1000)]
+    )
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="never-ready-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="should-not-happen")
+
+    # Force the timeout branch to trip on the very first poll iteration
+    # instead of a real 60s wait.
+    with patch.object(harvester_mod, "_CATALOG_READY_TIMEOUT_S", -1.0), patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        with pytest.raises(RuntimeError, match="did not reach 'ready'"):
+            await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert execute_calls == []  # harvest must never be submitted
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_raises_loudly_when_catalog_provisioning_failed() -> None:
+    """apply() must raise RuntimeError immediately (no need to wait out the
+    full timeout) when the target catalog's provisioning reaches 'failed'."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    catalogs.get_catalog_model = AsyncMock(side_effect=[None, _failed_model()])
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="broken-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="should-not-happen")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        with pytest.raises(RuntimeError, match="provisioning failed"):
+            await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert execute_calls == []
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_continues_against_winner_on_concurrent_create_conflict() -> None:
+    """When create_catalog raises UniqueViolationError (a peer apply won the
+    create race for the same target_catalog), apply() must catch it, re-poll
+    for readiness against the peer's catalog, and still submit the harvest
+    job — never abort an idempotent apply on a benign create race."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+    from dynastore.modules.db_config.exceptions import UniqueViolationError
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    # Existence check: absent (race not yet visible to us). Readiness poll
+    # (after the conflict): the peer's catalog is already ready.
+    catalogs.get_catalog_model = AsyncMock(side_effect=[None, _ready_model()])
+    catalogs.create_catalog = AsyncMock(
+        side_effect=UniqueViolationError("Catalog 'raced-cat' already exists")
+    )
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="raced-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="job-raced")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        descriptor = await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    catalogs.create_catalog.assert_awaited_once()
+    assert execute_calls == ["stac_harvest"]
+    assert descriptor.payload["job_id"] == "job-raced"
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_skips_catalog_ensure_when_catalogs_protocol_absent() -> None:
+    """When PresetContext.catalogs is None (e.g. a caller that never wired the
+    catalogs service), apply() must still submit the harvest job — the
+    bucket-free-create step is best-effort, not a hard dependency."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    ctx = _make_ctx(catalogs=None)
+    params = StacHarvesterParams(url="https://example.test/stac")
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        return MagicMock(jobID="job-no-catalogs")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        descriptor = await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert descriptor.payload["job_id"] == "job-no-catalogs"
 
 
 def test_preset_params_rejects_non_http_url() -> None:
@@ -244,7 +523,8 @@ def test_preset_registered_in_registry() -> None:
 
 
 def test_preset_dry_run_returns_trigger_task_entry() -> None:
-    """dry_run() returns a PresetPlan with a trigger_task entry for stac_harvest."""
+    """dry_run() returns a PresetPlan with a trigger_task entry for stac_harvest,
+    plus a create_catalog entry disclosing the bucket-free-create side effect."""
     import asyncio
     from dynastore.extensions.stac.presets.stac_harvester import (
         STAC_HARVESTER_PRESET,
@@ -259,12 +539,17 @@ def test_preset_dry_run_returns_trigger_task_entry() -> None:
     )
 
     assert plan.preset_name == "stac_harvester"
-    assert len(plan.entries) == 1
-    entry = plan.entries[0]
-    assert entry.kind == "trigger_task"
-    assert entry.target == "stac_harvest"
-    assert entry.detail["inputs"]["catalog_url"] == "https://example.test/stac"
-    assert entry.detail["inputs"]["target_catalog"] == "test-cat"
+    assert len(plan.entries) == 2
+
+    create_entry = next(e for e in plan.entries if e.kind == "create_catalog")
+    assert create_entry.target == "test-cat"
+    assert create_entry.detail["if_absent"] is True
+    assert create_entry.detail["hints"] == ["defer"]
+
+    task_entry = next(e for e in plan.entries if e.kind == "trigger_task")
+    assert task_entry.target == "stac_harvest"
+    assert task_entry.detail["inputs"]["catalog_url"] == "https://example.test/stac"
+    assert task_entry.detail["inputs"]["target_catalog"] == "test-cat"
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +567,7 @@ def test_harvest_request_default_drivers_is_es() -> None:
         target_catalog="my-cat",
     )
     assert req.drivers == RoutingDrivers.ES
+    assert req.skip_empty_collections is False
 
 
 def test_harvest_request_legacy_storage_backend_maps_to_drivers() -> None:
@@ -304,6 +590,7 @@ def test_preset_params_default_drivers_is_es() -> None:
 
     p = StacHarvesterParams(url="https://example.test/stac")
     assert p.drivers == RoutingDrivers.ES
+    assert p.skip_empty_collections is False
 
 
 @pytest.mark.asyncio
@@ -355,10 +642,68 @@ def test_map_collection_normalises_id_and_sets_defaults() -> None:
 
     assert result["id"] == "mycollection", "id must be lowercased"
     assert "links" not in result, "links must be stripped"
-    assert "assets" not in result, "collection-level assets must be stripped"
+    assert result["assets"] == raw["assets"], "collection-level assets must round-trip"
     assert result["type"] == "Collection"
     assert "extent" in result
     assert "description" in result
+
+
+def test_map_collection_preserves_source_stac_metadata_fallbacks() -> None:
+    """Harvested source Collection metadata must survive generic catalog writes."""
+    from dynastore.tasks.stac_harvest.task import map_collection
+
+    source_extent = {
+        "spatial": {"bbox": [[10.0, 20.0, 30.0, 40.0]]},
+        "temporal": {"interval": [["2020-01-01T00:00:00Z", "2020-12-31T00:00:00Z"]]},
+    }
+    raw = {
+        "id": "AGERA5-RH12",
+        "type": "Collection",
+        "stac_version": "1.1.0",
+        "stac_extensions": [
+            "https://stac-extensions.github.io/datacube/v2.3.0/schema.json",
+            "https://stac-extensions.github.io/render/v2.0.0/schema.json",
+        ],
+        "description": "Relative humidity",
+        "extent": source_extent,
+        "license": "CC-BY-SA-4.0",
+        "assets": {"thumbnail": {"href": "https://example.test/thumb.png"}},
+        "providers": [{"name": "ECMWF", "roles": ["producer"]}],
+        "summaries": {"datetime": {"min": "2020-01-01", "max": "2020-12-31"}},
+        "cube:dimensions": {"time": {"type": "temporal", "extent": ["2020", "2020"]}},
+        "cube:variables": {"rh": {"type": "data", "unit": "%"}},
+        "sci:citation": None,
+        "supplemental_information": None,
+        "created": "2022-03-17T09:00:21.813722Z",
+        "updated": "2026-05-11T14:56:56.640574Z",
+        "links": [{"rel": "self", "href": "https://example.test"}],
+    }
+
+    result = map_collection(raw)
+
+    assert result["id"] == "agera5-rh12"
+    assert result["extent"] == source_extent
+    assert result["assets"] == raw["assets"]
+    assert result["providers"] == raw["providers"]
+    assert result["summaries"] == raw["summaries"]
+    extra = result.get("extra_metadata")
+    assert isinstance(extra, dict)
+    for key in (
+        "extent",
+        "stac_extensions",
+        "assets",
+        "providers",
+        "summaries",
+        "cube:dimensions",
+        "cube:variables",
+        "sci:citation",
+        "supplemental_information",
+        "created",
+        "updated",
+    ):
+        assert extra.get(key) == raw[key]
+    assert "links" not in result
+    assert "links" not in extra
 
 
 def test_map_collection_preserves_existing_extent() -> None:
@@ -375,15 +720,20 @@ def test_map_collection_preserves_existing_extent() -> None:
     assert result["extent"] == custom_extent
 
 
-def test_map_item_sets_collection_and_strips_links() -> None:
-    """map_item rewrites collection reference and drops navigation links."""
+def test_map_item_sets_collection_and_preserves_provider_links() -> None:
+    """map_item rewrites collection, drops nav links, keeps provider links."""
     from dynastore.tasks.stac_harvest.task import map_item
 
     raw = {
         "id": "item-001",
         "type": "Feature",
         "collection": "original-collection",
-        "links": [{"rel": "self", "href": "https://example.test/item-001"}],
+        "links": [
+            {"rel": "self", "href": "https://example.test/item-001"},
+            {"rel": "collection", "href": "https://example.test/collections/c1"},
+            {"rel": "sld", "href": "https://example.test/styles/item-001/sld"},
+            {"rel": "legend", "href": "https://example.test/styles/item-001/legend"},
+        ],
         "geometry": {"type": "Point", "coordinates": [12.0, 41.0]},
         "properties": {"datetime": "2024-01-01T00:00:00Z"},
         "assets": {
@@ -394,10 +744,59 @@ def test_map_item_sets_collection_and_strips_links() -> None:
 
     assert result["type"] == "Feature"
     assert result["collection"] == "target-collection", "collection must be rewritten"
-    assert "links" not in result, "links must be stripped"
+    assert result["links"] == [
+        {"rel": "sld", "href": "https://example.test/styles/item-001/sld"},
+        {"rel": "legend", "href": "https://example.test/styles/item-001/legend"},
+    ]
     # Assets are preserved on items.
     assert "assets" in result
     assert result["id"] == "item-001"
+
+
+def test_infer_collection_kind_explicit_wins() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    assert infer_collection_kind({}, explicit_kind="RASTER") == "RASTER"
+
+
+def test_infer_collection_kind_from_raster_extension() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    source_coll = {
+        "stac_extensions": [
+            "https://stac-extensions.github.io/raster/v1.1.0/schema.json"
+        ]
+    }
+
+    assert infer_collection_kind(source_coll) == "RASTER"
+
+
+def test_infer_collection_kind_from_first_item_cog_asset() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    first_item = {
+        "assets": {
+            "cog": {
+                "href": "https://example.test/cog.tif",
+                "type": "image/tiff; application=geotiff",
+                "roles": ["data"],
+            }
+        }
+    }
+
+    assert infer_collection_kind({}, first_item=first_item) == "RASTER"
+
+
+def test_infer_collection_kind_ignores_projection_extension_only() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    source_coll = {
+        "stac_extensions": [
+            "https://stac-extensions.github.io/projection/v2.0.0/schema.json"
+        ]
+    }
+
+    assert infer_collection_kind(source_coll) is None
 
 
 def test_virtual_assets_for_yields_raster_asset() -> None:
@@ -471,7 +870,11 @@ async def test_ensure_collection_creates_with_concrete_write_lang() -> None:
     catalogs.create_collection = AsyncMock(return_value=object())
     catalogs.update_collection = AsyncMock()
 
-    ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
+    with patch(
+        "dynastore.tasks.stac_harvest.task._upsert_collection_metadata_pg",
+        AsyncMock(),
+    ):
+        ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is True
     assert _WRITE_LANG != "*"
@@ -490,7 +893,11 @@ async def test_ensure_collection_updates_existing_with_concrete_write_lang() -> 
     catalogs.create_collection = AsyncMock()
     catalogs.update_collection = AsyncMock(return_value=object())
 
-    ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
+    with patch(
+        "dynastore.tasks.stac_harvest.task._upsert_collection_metadata_pg",
+        AsyncMock(),
+    ):
+        ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is True
     catalogs.update_collection.assert_awaited_once()
@@ -510,7 +917,11 @@ async def test_ensure_collection_resilient_when_write_raises_but_row_lands() -> 
     catalogs.create_collection = AsyncMock(side_effect=RuntimeError("indexer boom"))
     catalogs.update_collection = AsyncMock()
 
-    ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
+    with patch(
+        "dynastore.tasks.stac_harvest.task._upsert_collection_metadata_pg",
+        AsyncMock(),
+    ):
+        ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is True
     assert catalogs.get_collection.await_count == 2
@@ -529,6 +940,73 @@ async def test_ensure_collection_returns_false_when_row_absent_after_raise() -> 
     ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_upsert_collection_metadata_pg_uses_resolved_ids_and_preserves_extras() -> None:
+    from dynastore.tasks.stac_harvest.task import _upsert_collection_metadata_pg
+
+    writes: list[dict[str, Any]] = []
+
+    class _FakeCollectionPgDriver:
+        async def upsert_metadata(
+            self,
+            catalog_id: str,
+            collection_id: str,
+            metadata: dict[str, Any],
+            **_kw: Any,
+        ) -> None:
+            writes.append({
+                "catalog_id": catalog_id,
+                "collection_id": collection_id,
+                "metadata": metadata,
+            })
+
+    catalogs = MagicMock()
+    catalogs.resolve_catalog_id = AsyncMock(return_value="cat_internal")
+    catalogs.resolve_collection_id = AsyncMock(return_value="col_internal")
+
+    coll = {
+        "id": "agera5-rh12",
+        "title": "Relative humidity",
+        "stac_extensions": ["https://example.test/ext.json"],
+        "extent": {
+            "spatial": {"bbox": [[-180, -90, 180, 90]]},
+            "temporal": {"interval": [["1979-01-01T00:00:00Z", None]]},
+        },
+        "extra_metadata": {
+            "assets": {"thumbnail": {"href": "https://example.test/thumb.png"}},
+            "cube:dimensions": {"x": {"type": "spatial"}},
+            "sci:citation": None,
+            "supplemental_information": None,
+            "summaries": {},
+        },
+    }
+
+    with patch(
+        "dynastore.modules.storage.drivers.collection_postgresql.CollectionPostgresqlDriver",
+        return_value=_FakeCollectionPgDriver(),
+    ):
+        await _upsert_collection_metadata_pg(catalogs, "fao", "agera5-rh12", coll)
+
+    assert len(writes) == 1
+    assert writes[0]["catalog_id"] == "cat_internal"
+    assert writes[0]["collection_id"] == "col_internal"
+    metadata = writes[0]["metadata"]
+    assert metadata["stac_extensions"] == ["https://example.test/ext.json"]
+    assert metadata["extent"] == {
+        "spatial": {"bbox": [[-180.0, -90.0, 180.0, 90.0]]},
+        "temporal": {"interval": [["1979-01-01T00:00:00Z", None]]},
+    }
+    assert metadata["extra_metadata"]["en"]["assets"] == {
+        "thumbnail": {"href": "https://example.test/thumb.png"}
+    }
+    assert metadata["extra_metadata"]["en"]["cube:dimensions"] == {
+        "x": {"type": "spatial"}
+    }
+    assert metadata["extra_metadata"]["en"]["sci:citation"] is None
+    assert metadata["extra_metadata"]["en"]["supplemental_information"] is None
+    assert metadata["extra_metadata"]["en"]["summaries"] == {}
 
 
 # ---------------------------------------------------------------------------

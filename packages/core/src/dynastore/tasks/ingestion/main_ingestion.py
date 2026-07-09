@@ -16,20 +16,24 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import hashlib
+import json
 import logging
 import re
 import os
 import asyncio
 import itertools
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
 from dateutil import parser as _dateutil_parser
 
 from dynastore.modules.catalog.asset_service import Asset, VirtualAssetCreate
 from dynastore.modules.catalog.models import CoreAssetReferenceType
+from dynastore.models.query_builder import AssetFilter, FilterOperator
 
 from dynastore.modules.catalog.tools import recalculate_and_update_extents
+from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import DbEngine
 from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
 from dynastore.models.driver_context import DriverContext
@@ -56,6 +60,16 @@ class _IndexMissFailed(RuntimeError):
     ingestion failed, without triggering the generic ``except Exception``
     handler that would call ``task_finished("FAILED")`` a second time.
     Callers should treat this identically to RuntimeError.
+    """
+
+
+class _RejectionFailed(_IndexMissFailed):
+    """Sentinel raised after every row in the run was rejected by the upsert.
+
+    A subclass of ``_IndexMissFailed`` so it is caught by the same
+    ``except _IndexMissFailed`` guard below (task_finished("FAILED") was
+    already called before this is raised — the guard prevents a second,
+    conflicting FAILED notification from the generic exception handler).
     """
 
 
@@ -200,6 +214,18 @@ async def enqueue_collection_reindex_task(
         )
 
 
+# Cap on the per-indexer failure-detail sample carried across batches, and
+# the bounded merge itself, live in dynastore.models.protocols.indexer
+# (shared with the other two accumulation sites — IndexDispatcher's
+# per-chunk aggregation and item_service's per-batch aggregation — #2657).
+# Re-exported under the historical private name so existing call sites and
+# tests in this module are unaffected.
+from dynastore.models.protocols.indexer import (
+    MAX_ACCUMULATED_FAILURE_SAMPLES as _MAX_ACCUMULATED_FAILURE_SAMPLES,  # noqa: F401
+    merge_bulk_results as _merge_bulk_results,
+)
+
+
 def _merge_index_results(
     accumulated: Dict[str, Any],
     batch_results: Dict[str, Any],
@@ -207,16 +233,218 @@ def _merge_index_results(
     """Merge per-batch BulkResult entries into the running totals in-place."""
     for indexer_id, bulk_res in batch_results.items():
         if indexer_id in accumulated:
-            prev = accumulated[indexer_id]
-            from dynastore.models.protocols.indexer import BulkResult
-            accumulated[indexer_id] = BulkResult(
-                total=prev.total + bulk_res.total,
-                succeeded=prev.succeeded + bulk_res.succeeded,
-                failed=prev.failed + bulk_res.failed,
-                failures=prev.failures + bulk_res.failures,
-            )
+            accumulated[indexer_id] = _merge_bulk_results(accumulated[indexer_id], bulk_res)
         else:
             accumulated[indexer_id] = bulk_res
+
+
+async def _maybe_apply_ingest_backpressure() -> None:
+    """Cooperative backpressure before a batch flush (#2494 P1).
+
+    No-op unless ``TasksPluginConfig.items_secondary_via_storage_plane`` is
+    enabled — with the flag off, ingestion behaviour is unchanged. When the
+    flag is on and the aggregate tasks.storage/tasks.events outbox backlog
+    is high (``async_writer_backlog.backlog_is_high()``), sleeps for
+    ``TasksPluginConfig.ingest_backpressure_sleep_seconds`` before the
+    caller flushes the next batch, so the storage_drain worker gets room to
+    catch up instead of the backlog growing unbounded under a hot ingestion
+    job. Best-effort: never raises, never blocks ingestion on a config or
+    probe failure.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.async_writer_backlog import backlog_is_high
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        cfg = await config_mgr.get_config(TasksPluginConfig) if config_mgr else None
+        if not isinstance(cfg, TasksPluginConfig) or not cfg.items_secondary_via_storage_plane:
+            return
+        if await backlog_is_high():
+            logger.info(
+                "ingestion: storage-plane outbox backlog high — sleeping "
+                "%.1fs before the next batch flush.",
+                cfg.ingest_backpressure_sleep_seconds,
+            )
+            await asyncio.sleep(cfg.ingest_backpressure_sleep_seconds)
+    except Exception:  # noqa: BLE001 — backpressure is best-effort, never block ingestion
+        logger.debug(
+            "ingestion: backpressure check failed — proceeding without delay.",
+            exc_info=True,
+        )
+
+
+async def _persist_ingestion_cursor(
+    engine: DbEngine, task_id: str, next_offset: int,
+) -> None:
+    """Persist a committed-row cursor onto the task row after a batch commits (#2820).
+
+    Stamps ``inputs.ingestion_request.offset`` on the task's own DB row so a
+    retry picks up where the last successful batch left off instead of
+    replaying the whole source from scratch. ``fail_task(retry=True)`` (the
+    Cloud Run task-timeout / dispatcher retry path) resets ``status``/
+    ``owner_id`` but never touches ``inputs`` — and the next claim rebuilds
+    ``TaskIngestionRequest`` from that same ``inputs`` column (see
+    ``IngestionTask.run``), so stamping the offset here is sufficient to seed
+    the resumed run; no separate "seed on start" step is needed.
+
+    Called immediately after each batch's upsert returns successfully (both
+    the row-cap/memory-budget flush inside the read loop and the trailing
+    partial-batch flush). Best-effort: a write failure here only degrades to
+    the pre-#2820 behaviour (a retry restarts from the original offset) and
+    must never fail an otherwise-successful ingestion batch.
+    """
+    if not task_id:
+        return
+    try:
+        from dynastore.modules.tasks import tasks_module
+        import uuid as _uuid
+
+        task_uuid = _uuid.UUID(task_id) if isinstance(task_id, str) else task_id
+        await tasks_module.update_task_ingestion_offset(engine, task_uuid, next_offset)
+    except Exception:  # noqa: BLE001 — cursor persistence is best-effort
+        logger.warning(
+            "ingestion: failed to persist resume cursor (offset=%d) for task "
+            "%s — a retry will restart from the original offset.",
+            next_offset, task_id, exc_info=True,
+        )
+
+
+async def _resolve_items_secondary_via_storage_plane() -> bool:
+    """Best-effort read of ``TasksPluginConfig.items_secondary_via_storage_plane``.
+
+    Mirrors :func:`_maybe_apply_ingest_backpressure`'s config-read pattern.
+    Any failure (missing protocol, config error) resolves to ``False`` so a
+    completion never reports a secondary-indexing state it can't back with
+    data (#2897).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        cfg = await config_mgr.get_config(TasksPluginConfig) if config_mgr else None
+        return isinstance(cfg, TasksPluginConfig) and cfg.items_secondary_via_storage_plane
+    except Exception:  # noqa: BLE001 — config read is best-effort
+        logger.debug(
+            "ingestion: items_secondary_via_storage_plane read failed — "
+            "treating as off.",
+            exc_info=True,
+        )
+        return False
+
+
+async def _count_pending_secondary_index_ops(
+    engine, catalog_id: str, collection_id: str,
+) -> int:
+    """COUNT outstanding ``tasks.storage`` item ops for this collection.
+
+    Delegates to the shared counter in ``async_writer_backlog`` so the
+    write-side (this function) and the read-side convergence check
+    (``reconciliation.py``) can never drift on the query. Raises on failure —
+    callers treat this as best-effort and catch around the call.
+
+    ``engine`` is passed straight through to ``DQLQuery.execute`` (via
+    ``count_pending_item_ops``), which accepts either a bare engine or an
+    already-open connection — no explicit ``managed_transaction`` needed here.
+    """
+    from dynastore.modules.tasks.async_writer_backlog import count_pending_item_ops
+    from dynastore.modules.tasks.tasks_module import get_task_schema
+
+    return await count_pending_item_ops(
+        engine,
+        task_schema=get_task_schema(),
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+
+
+# Per-batch memory budgeting -------------------------------------------------
+#
+# A batch is flushed when EITHER an explicit row cap (database_batch_size) OR an
+# accumulated-geometry budget (max_batch_memory_mb) is reached — whichever comes
+# first. The memory budget keeps a handful of very large geometries (e.g.
+# administrative multipolygons) from exhausting the container before a fixed row
+# count is ever hit. Cost is dominated by geometry coordinates, so a feature's
+# footprint is approximated by counting its coordinate ordinates; each is carried
+# as a Python float (~24 bytes) inside nested lists, plus a flat per-feature
+# overhead for the properties dict.
+_FEATURE_BASE_BYTES = 512
+_BYTES_PER_COORD_ORDINATE = 24
+
+
+def _count_coordinate_ordinates(value: Any) -> int:
+    """Total scalar ordinates in a (possibly deeply nested) GeoJSON
+    ``coordinates`` array. Iterative to stay cheap on dense geometries."""
+    total = 0
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (list, tuple)):
+            if node and isinstance(node[0], (int, float)):
+                total += len(node)
+            else:
+                stack.extend(node)
+        elif isinstance(node, (int, float)):
+            total += 1
+    return total
+
+
+def _estimate_feature_bytes(feature: Any) -> int:
+    """Rough, geometry-dominated estimate of a prepared feature's in-memory
+    footprint, used to bound a batch by accumulated bytes so a few very large
+    geometries cannot blow the container's memory before the row-count cap."""
+    if not isinstance(feature, dict):
+        return _FEATURE_BASE_BYTES
+    geom = feature.get("geometry")
+    ordinates = 0
+    if isinstance(geom, dict):
+        if geom.get("type") == "GeometryCollection":
+            for g in geom.get("geometries") or ():
+                if isinstance(g, dict):
+                    ordinates += _count_coordinate_ordinates(g.get("coordinates"))
+        else:
+            ordinates += _count_coordinate_ordinates(geom.get("coordinates"))
+    return _FEATURE_BASE_BYTES + ordinates * _BYTES_PER_COORD_ORDINATE
+
+
+# Rows discarded between heartbeat log lines while skipping to ``offset``
+# for a reader that has no native seek (GeoID #2958) — frequent enough to
+# prove the skip phase is progressing, rare enough not to flood logs on a
+# multi-million-row resume.
+_OFFSET_SKIP_HEARTBEAT_INTERVAL = 50_000
+
+
+def _skip_to_offset_with_heartbeat(
+    records: Iterable[dict], offset: int,
+) -> Iterator[dict]:
+    """Discard the first *offset* records from *records*, logging progress
+    every ``_OFFSET_SKIP_HEARTBEAT_INTERVAL`` rows (GeoID #2958).
+
+    Fallback path for readers that don't advertise
+    ``SourceReaderProtocol.supports_offset_seek`` — i.e. can't position
+    themselves natively at ``offset``. Resuming a partial ingestion via
+    ``offset`` used to run this same discard loop via ``itertools.islice``
+    with zero log output until the first post-offset batch upserted; this
+    keeps the discard behaviour but makes a long skip phase observable.
+    """
+    if offset <= 0:
+        yield from records
+        return
+    skipped = 0
+    it = iter(records)
+    for _ in it:
+        skipped += 1
+        if skipped % _OFFSET_SKIP_HEARTBEAT_INTERVAL == 0:
+            logger.info(
+                "ingestion: resuming at offset=%d — skipped %d/%d rows so far",
+                offset, skipped, offset,
+            )
+        if skipped >= offset:
+            break
+    yield from it
 
 
 # Canonical items-schema data types that denote a temporal value. A property
@@ -465,6 +693,59 @@ def _resolve_source_content_type(asset: Asset) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Deterministic per-feature identity (#2709)
+# ---------------------------------------------------------------------------
+#
+# Re-running the same vector ingest must CONVERGE (upsert) rather than
+# duplicate every feature. ``prepare_record_for_upsert`` resolves the
+# GeoJSON-style ``feature["id"]`` through a three-tier precedence — each
+# tier only runs when the previous one produced nothing:
+#
+#   1. A configurable source field (``column_mapping.external_id``, e.g.
+#      GAUL's ``GAUL1_CODE``) or the source's own natural ``id``.
+#   2. The reader-surfaced OGR feature id (FID) — stable across re-reads of
+#      the SAME unmodified source (``GdalOsgeoReader`` now emits it as the
+#      record's top-level ``"id"``, so tier 1's "id" lookup already covers
+#      it when no explicit field is configured).
+#   3. A content hash of the feature (geometry + attributes) — the final
+#      safety net for sources where neither of the above resolved anything.
+#
+# ``feature["id"]`` then feeds ``ItemsWritePolicy.resolve_external_id`` (see
+# ``modules/storage/driver_config.py``), which falls back to the feature's
+# top-level ``id`` when no ``derive.external_id`` path is configured on the
+# collection — so no downstream write-path change is required here.
+
+
+def _resolve_raw_identity(raw: dict, ext_id_field: str) -> Any:
+    """Look up *ext_id_field* on a raw reader record.
+
+    Top-level key first, then ``properties[ext_id_field]`` — mirrors
+    ``prepare_record_for_upsert``'s private ``_get_raw_val`` for the
+    identity field specifically, factored out so tiers 1/2 of the #2709
+    identity precedence are unit-testable without a live reader or DB.
+    """
+    if not ext_id_field:
+        return None
+    return raw[ext_id_field] if ext_id_field in raw else raw.get("properties", {}).get(ext_id_field)
+
+
+def _content_hash_feature_id(geometry: Optional[dict], properties: dict) -> str:
+    """Tier-3 identity fallback (#2709): a stable hash of the feature.
+
+    Used only when neither a configured id field nor a natural id/OGR FID
+    resolved (tiers 1-2). Deterministic for byte-identical geometry +
+    properties, so a retried/re-run ingest of the SAME source converges on
+    the same external_id instead of appending a duplicate row.
+    """
+    canonical = json.dumps(
+        {"geometry": geometry, "properties": properties},
+        sort_keys=True,
+        default=str,
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def run_ingestion_task(
     engine: DbEngine,
     task_id: str,
@@ -472,7 +753,7 @@ async def run_ingestion_task(
     collection_id: str,
     task_request: TaskIngestionRequest,
     caller_id: Optional[str] = None,
-):
+) -> Optional[Dict[str, Any]]:
     from dynastore.tools.discovery import get_protocol
     from dynastore.models.protocols import CatalogsProtocol
 
@@ -525,6 +806,14 @@ async def run_ingestion_task(
     await catalog_module.ensure_collection_exists(
         catalog_id, collection_id, lang=task_request.lang, ctx=DriverContext(db_resource=engine)
     )
+
+    # Best-effort reap of orphaned extraction dirs left by prior crashed tasks
+    # on this shared temp volume.  A failure here must never abort ingestion.
+    try:
+        from dynastore.tasks.ingestion.temp_reaper import reap_orphan_task_dirs
+        await reap_orphan_task_dirs(engine)
+    except Exception:
+        logger.warning("temp_reaper: sweep failed — continuing ingestion", exc_info=True)
 
     logger.info(f"Task '{task_id}': Beginning main ingestion process.")
     try:
@@ -608,21 +897,38 @@ async def run_ingestion_task(
         asset_manager = catalog_module.assets
 
         # --- Resolve or Create the Asset ---
-        asset: Optional[Asset] = None
-        if req_asset.asset_id:
-            asset = await asset_manager.get_asset(
-                catalog_id, req_asset.asset_id, collection_id
+        # The lookup key is the caller-supplied asset_id, or — when omitted —
+        # the same deterministic derivation used at creation time. Computing
+        # it up front lets a resume always probe for a pre-existing asset
+        # before creating one, whether or not the request spelled out
+        # asset_id explicitly (a resume request that omits it previously
+        # skipped this check entirely and went straight to create_asset).
+        asset_id_for_lookup = req_asset.asset_id
+        if not asset_id_for_lookup and req_asset.uri:
+            asset_id_for_lookup = re.sub(
+                r"[^a-zA-Z0-9_\-]", "_", os.path.basename(req_asset.uri)
             )
-            if not asset and not req_asset.uri:
+
+        asset: Optional[Asset] = None
+        if asset_id_for_lookup:
+            # ctx=DriverContext(db_resource=engine) reads through the same
+            # connection the rest of this task uses instead of AssetService's
+            # own cached read path (get_asset_cached, 60s TTL) — a prior
+            # failed attempt on the same asset_id would otherwise leave a
+            # cached "not found" negative that a fast resume rides straight
+            # into another doomed create_asset call. Mirrors the ctx= usage
+            # on the create_asset call below.
+            asset = await asset_manager.get_asset(
+                catalog_id, asset_id_for_lookup, collection_id,
+                ctx=DriverContext(db_resource=engine),
+            )
+            if not asset and req_asset.asset_id and not req_asset.uri:
                 raise ValueError(
                     f"Asset with asset_id '{req_asset.asset_id}' not found and no URI provided."
                 )
 
         if not asset and req_asset.uri:
             logger.info(f"Creating asset from URI: {req_asset.uri}")
-            asset_id_for_creation = req_asset.asset_id or re.sub(
-                r"[^a-zA-Z0-9_\-]", "_", os.path.basename(req_asset.uri)
-            )
 
             # External-source ingestion: register as a virtual asset since we
             # don't manage the source bytes (the file lives in the caller's
@@ -630,13 +936,49 @@ async def run_ingestion_task(
             # variant; today we keep the `Asset.uri` field populated by
             # storing the raw URI as the virtual `href`.
             asset_payload = VirtualAssetCreate(
-                asset_id=asset_id_for_creation,
+                asset_id=asset_id_for_lookup,
                 href=req_asset.uri,
                 metadata=req_asset.metadata or {},
             )
-            asset = await asset_manager.create_asset(
-                catalog_id, asset_payload, collection_id, ctx=DriverContext(db_resource=engine)
-            )
+            try:
+                asset = await asset_manager.create_asset(
+                    catalog_id, asset_payload, collection_id, ctx=DriverContext(db_resource=engine)
+                )
+            except UniqueViolationError as exc:
+                # #3015: create_asset collided on the asset's (catalog_id,
+                # collection_id, href) uniqueness constraint even though the
+                # get_asset probe above (keyed on asset_id_for_lookup) found
+                # nothing. The probe wasn't wrong to miss — it was looking
+                # for the wrong identity: the href is already registered
+                # under a *different* asset_id than the one this resume
+                # derived (e.g. the asset was originally created with an
+                # explicit, operator-chosen asset_id — via direct upload or
+                # a request that supplied one — and this resume request
+                # omitted asset_id, so main_ingestion derived one from the
+                # URI basename that doesn't match). Re-probing by the same
+                # asset_id would just repeat the miss, so look the row up by
+                # href instead and reuse whatever asset_id it actually has.
+                if "_catalog_id_collection_id_href_idx" not in exc.details:
+                    raise
+                logger.warning(
+                    "Task '%s': create_asset hit a duplicate-key conflict on "
+                    "href %r for catalog=%s collection=%s — an asset with "
+                    "this href already exists under a different asset_id "
+                    "than %r; looking it up by href instead of failing the "
+                    "resume.",
+                    task_id, req_asset.uri, catalog_id, collection_id,
+                    asset_id_for_lookup,
+                )
+                existing = await asset_manager.search_assets(
+                    catalog_id,
+                    filters=[AssetFilter(field="href", op=FilterOperator.EQ, value=req_asset.uri)],
+                    collection_id=collection_id,
+                    limit=1,
+                    db_resource=engine,
+                )
+                if not existing:
+                    raise
+                asset = existing[0]
 
         if not asset:
             raise ValueError("Could not find or create an asset.")
@@ -719,26 +1061,55 @@ async def run_ingestion_task(
 
             _count_reader = resolve_reader(
                 source_file_path, content_type=source_content_type,
+                reader_id=task_request.reader,
             )()
             total_features = _count_reader.feature_count(
                 source_file_path, content_type=source_content_type,
             )
             if total_features is not None:
                 logger.info(f"Source file contains {total_features} features.")
+                # A resumed run (task_request.offset > 0, seeded from the
+                # cursor a prior attempt persisted — see
+                # ``_persist_ingestion_cursor``) starts progress reporting at
+                # its resume point rather than back at 0% (#2820).
                 await asyncio.gather(
-                    *(reporter.update_progress(0, total_features) for reporter in reporters)
+                    *(
+                        reporter.update_progress(task_request.offset, total_features)
+                        for reporter in reporters
+                    )
                 )
         except Exception as e:
             logger.warning(f"Could not determine total feature count: {e}")
 
-        batch_size = task_request.database_batch_size or 500
+        # Flush a batch on whichever limit is reached first: an explicit row cap
+        # (database_batch_size, default 50) or an accumulated-geometry memory
+        # budget (max_batch_memory_mb, default 32 MB). The memory budget is what
+        # auto-shrinks batches for geometry-heavy sources (e.g. admin
+        # multipolygons) so a fixed row count cannot exhaust the container; the
+        # lowered row-cap default keeps light-attribute sources (where the byte
+        # budget alone wouldn't trigger for a long time) from batching all the
+        # way up to a size that only made sense before dense collections like
+        # GAUL exposed the memory budget as the real constraint.
+        row_cap = task_request.database_batch_size or 50
+        mem_budget_bytes = max(1, task_request.max_batch_memory_mb) * 1024 * 1024
         current_batch = []
+        current_batch_bytes = 0
         rows_ingested = 0
+        # Rows actually persisted vs. rejected by the upsert (#2891) — distinct
+        # from rows_ingested, which counts every row PROCESSED (batch size) and
+        # gates progress/extent regardless of whether the upsert accepted it.
+        rows_persisted = 0
+        rows_rejected = 0
+        first_rejection_message: Optional[str] = None
         # Accumulate per-indexer BulkResult totals across all batches so we can
         # classify secondary-index health at the end of the loop.
         accumulated_index_results: Dict[str, Any] = {}
 
-        upsert_context = {"asset_id": asset_id}
+        # Defer tile-cache invalidation: the per-batch write path would enqueue
+        # one tiles_invalidate task per batch (hundreds for a large ingestion).
+        # We suppress that here and enqueue ONE coalesced invalidation for the
+        # whole ingested extent after the loop (see below).
+        upsert_context = {"asset_id": asset_id, "defer_tile_invalidation": True}
 
         def prepare_record_for_upsert(raw: dict, request: TaskIngestionRequest) -> dict:
             mapping = request.column_mapping
@@ -751,10 +1122,16 @@ async def run_ingestion_task(
                     raw.get(key) if key in raw else raw.get("properties", {}).get(key)
                 )
 
-            # 1. Identity
+            # 1. Identity — tiers 1 & 2 of the #2709 deterministic-identity
+            # precedence (see the module-level comment above
+            # ``_resolve_raw_identity``): a configured field wins, else the
+            # source's natural "id" (which GdalOsgeoReader now populates
+            # from the OGR FID when the source has no native id — tier 2).
+            # ``is not None`` — not truthy — so a legitimate FID/id of 0
+            # is not dropped.
             ext_id_field = mapping.external_id or "id"
-            ext_id = _get_raw_val(ext_id_field)
-            if ext_id:
+            ext_id = _resolve_raw_identity(raw, ext_id_field)
+            if ext_id is not None and ext_id != "":
                 feature["id"] = ext_id
 
             # 2. Geometry
@@ -876,6 +1253,16 @@ async def run_ingestion_task(
             if valid_to:
                 feature["valid_to"] = valid_to
 
+            # 5. Tier 3 of the #2709 deterministic-identity precedence:
+            # neither a configured field nor a natural id/OGR FID resolved
+            # in step 1 — hash the assembled feature so a retried/re-run
+            # ingest of the SAME source still converges instead of
+            # appending a duplicate row.
+            if "id" not in feature:
+                feature["id"] = _content_hash_feature_id(
+                    feature.get("geometry"), feature["properties"]
+                )
+
             return feature
 
         # Pluggable source reader.  ``ReaderRegistry.resolve`` picks the
@@ -889,32 +1276,80 @@ async def run_ingestion_task(
 
         reader_cls = resolve_reader(
             source_file_path, content_type=source_content_type,
+            reader_id=task_request.reader,
         )
         reader_inst = reader_cls()
         logger.info(
-            "ingestion: source %r (content_type=%r) → reader '%s'",
+            "ingestion: source %r (content_type=%r) → reader '%s'%s",
             source_file_path, source_content_type,
             reader_cls.reader_id or reader_cls.__name__,
+            " (explicit override)" if task_request.reader else "",
         )
 
-        with reader_inst.open(
-            source_file_path,
-            encoding=task_request.encoding,
-            content_type=source_content_type,
-        ) as reader:
-            sliced_reader = itertools.islice(
-                reader,
-                task_request.offset,
-                task_request.limit + task_request.offset
+        # #2958: readers that can position themselves at ``offset`` natively
+        # (PyogrioReader / GdalOsgeoReader, both via OGR's ``SetNextByIndex``
+        # under the hood) do so inside ``open()``; everything else falls
+        # back to the heartbeat-logged discard loop below so a large-offset
+        # resume is never silent.
+        reader_seeks_offset = bool(
+            getattr(reader_cls, "supports_offset_seek", False)
+        )
+
+        # Built as a dict (not passed as literal kwargs) so reader_options can
+        # cleanly override a default (e.g. read_batch_size) instead of colliding
+        # as a duplicate keyword argument.
+        open_kwargs: Dict[str, Any] = {
+            "encoding": task_request.encoding,
+            "content_type": source_content_type,
+            "task_id": task_id,
+            "task_schema": phys_schema,
+            "read_batch_size": task_request.read_batch_size,
+        }
+        if reader_seeks_offset:
+            open_kwargs["offset"] = task_request.offset
+        # task_id/task_schema/content_type/offset are the reader's own
+        # identity/plumbing/resume kwargs (e.g. used to name reaper-tracked
+        # scratch dirs, or to seek to the correct resume point) — a caller
+        # has no legitimate reason to override them via reader_options, so
+        # drop and warn on any collision instead of silently shadowing them.
+        reader_options = dict(task_request.reader_options or {})
+        shadowed_keys = [
+            key for key in ("task_id", "task_schema", "content_type", "offset")
+            if key in reader_options
+        ]
+        if shadowed_keys:
+            logger.warning(
+                "ingestion: reader_options attempted to override structural "
+                "kwarg(s) %s — ignoring, these are fixed by the ingestion "
+                "task itself and are not user-tunable",
+                shadowed_keys,
+            )
+            for key in shadowed_keys:
+                del reader_options[key]
+        open_kwargs.update(reader_options)
+
+        with reader_inst.open(source_file_path, **open_kwargs) as reader:
+            pre_offset_reader: Iterable[dict] = (
+                reader
+                if reader_seeks_offset
+                else _skip_to_offset_with_heartbeat(reader, task_request.offset)
+            )
+            sliced_reader = (
+                itertools.islice(pre_offset_reader, task_request.limit)
                 if task_request.limit
-                else None,
+                else pre_offset_reader
             )
 
             for idx, raw_record in enumerate(sliced_reader, start=task_request.offset):
                 feature = prepare_record_for_upsert(dict(raw_record), task_request)
                 current_batch.append(feature)
+                current_batch_bytes += _estimate_feature_bytes(feature)
 
-                if len(current_batch) >= batch_size:
+                if (
+                    len(current_batch) >= row_cap
+                    or current_batch_bytes >= mem_budget_bytes
+                ):
+                    await _maybe_apply_ingest_backpressure()
                     upsert_ctx = DriverContext(db_resource=engine)
                     upsert_result = await catalog_module.upsert(
                         catalog_id,
@@ -924,6 +1359,27 @@ async def run_ingestion_task(
                         processing_context=upsert_context,
                     )
                     rows_ingested += len(current_batch)
+                    # Batch durably committed — persist the resume cursor before
+                    # any other bookkeeping so a crash between here and the next
+                    # batch still leaves a retry able to skip everything this
+                    # batch just wrote (#2820).
+                    await _persist_ingestion_cursor(
+                        engine, task_id, task_request.offset + rows_ingested,
+                    )
+                    _batch_rejections = upsert_ctx.extensions.get("_rejections") or []
+                    _batch_persisted = (
+                        upsert_result
+                        if isinstance(upsert_result, list)
+                        else ([upsert_result] if upsert_result else [])
+                    )
+                    rows_persisted += len(_batch_persisted)
+                    rows_rejected += len(_batch_rejections)
+                    if first_rejection_message is None and _batch_rejections:
+                        first_rejection_message = (
+                            _batch_rejections[0].get("message")
+                            or _batch_rejections[0].get("reason")
+                            or "rejected"
+                        )
                     _merge_index_results(
                         accumulated_index_results,
                         upsert_ctx.extensions.get("_index_results") or {},
@@ -931,17 +1387,21 @@ async def run_ingestion_task(
                     await _broadcast_batch_outcome(
                         reporters, current_batch, upsert_result,
                         upsert_ctx.extensions.get("_generated_stats"),
-                        rejections=upsert_ctx.extensions.get("_rejections"),
+                        rejections=_batch_rejections,
                     )
                     await asyncio.gather(
                         *(
-                            reporter.update_progress(rows_ingested, total_features)
+                            reporter.update_progress(
+                                task_request.offset + rows_ingested, total_features,
+                            )
                             for reporter in reporters
                         )
                     )
                     current_batch = []
+                    current_batch_bytes = 0
 
             if current_batch:
+                await _maybe_apply_ingest_backpressure()
                 upsert_ctx = DriverContext(db_resource=engine)
                 upsert_result = await catalog_module.upsert(
                     catalog_id,
@@ -951,6 +1411,24 @@ async def run_ingestion_task(
                     processing_context=upsert_context,
                 )
                 rows_ingested += len(current_batch)
+                # Batch durably committed — persist the resume cursor (#2820).
+                await _persist_ingestion_cursor(
+                    engine, task_id, task_request.offset + rows_ingested,
+                )
+                _batch_rejections = upsert_ctx.extensions.get("_rejections") or []
+                _batch_persisted = (
+                    upsert_result
+                    if isinstance(upsert_result, list)
+                    else ([upsert_result] if upsert_result else [])
+                )
+                rows_persisted += len(_batch_persisted)
+                rows_rejected += len(_batch_rejections)
+                if first_rejection_message is None and _batch_rejections:
+                    first_rejection_message = (
+                        _batch_rejections[0].get("message")
+                        or _batch_rejections[0].get("reason")
+                        or "rejected"
+                    )
                 _merge_index_results(
                     accumulated_index_results,
                     upsert_ctx.extensions.get("_index_results") or {},
@@ -958,16 +1436,46 @@ async def run_ingestion_task(
                 await _broadcast_batch_outcome(
                     reporters, current_batch, upsert_result,
                     upsert_ctx.extensions.get("_generated_stats"),
-                    rejections=upsert_ctx.extensions.get("_rejections"),
+                    rejections=_batch_rejections,
                 )
                 await asyncio.gather(
                     *(
-                        reporter.update_progress(rows_ingested, total_features)
+                        reporter.update_progress(
+                            task_request.offset + rows_ingested, total_features,
+                        )
                         for reporter in reporters
                     )
                 )
 
-        await recalculate_and_update_extents(engine, catalog_id, collection_id)
+        ingested_extent = await recalculate_and_update_extents(
+            engine, catalog_id, collection_id
+        )
+
+        # Coalesced tile-cache invalidation (one task per ingestion, not per
+        # batch). Per-batch invalidation was suppressed via
+        # ``defer_tile_invalidation`` above; here we enqueue a SINGLE
+        # tiles_invalidate covering the whole ingested extent. Degrade-safe:
+        # capability-gated inside the enqueue and never fails the ingestion.
+        if rows_ingested > 0 and ingested_extent:
+            try:
+                from dynastore.modules.tiles.tile_cache_sync import (
+                    enqueue_tile_invalidation_task,
+                )
+
+                await enqueue_tile_invalidation_task(
+                    catalog_id,
+                    collection_id,
+                    [],
+                    engine=engine,
+                    schema=phys_schema,
+                    prior_bboxes=ingested_extent,
+                    caller_id=f"ingestion:{task_id}",
+                )
+            except Exception as inv_err:  # noqa: BLE001 — cache upkeep never breaks ingest
+                logger.warning(
+                    "Task '%s': coalesced tile invalidation failed for %s/%s: %s",
+                    task_id, catalog_id, collection_id, inv_err,
+                )
 
         # Register an informational reference: this asset feeds collection_id.
         # cascade_delete=True because the DB trigger (trg_asset_cleanup) already
@@ -988,13 +1496,54 @@ async def run_ingestion_task(
                 f"({asset.asset_id} → {collection_id}): {ref_err}"
             )
 
+        # --- Full-rejection gate (#2891) ---
+        # Every row the upsert saw was rejected (0 persisted, >0 rejected):
+        # the run wrote nothing, so report FAILED rather than falling into
+        # the index-health check below, which treats rows_written==0 as the
+        # trivial "nothing to index" COMPLETED case. Not an index miss (the
+        # rows never made it to the source store), so no restore task is
+        # enqueued here.
+        if rows_persisted == 0 and rows_rejected > 0:
+            rej_msg = (
+                f"All {rows_rejected} row(s) rejected; 0 persisted. "
+                f"First rejection: {first_rejection_message}"
+            )
+            logger.error(
+                "ingestion task %s: %s/%s — %s",
+                task_id, catalog_id, collection_id, rej_msg,
+            )
+            await asyncio.gather(
+                *(
+                    reporter.task_finished("FAILED", error_message=rej_msg)
+                    for reporter in reporters
+                )
+            )
+            if post_ops:
+                try:
+                    _cat = await catalog_module.get_catalog(
+                        catalog_id, ctx=DriverContext(db_resource=engine),
+                    )
+                    _coll = await catalog_module.get_collection(
+                        catalog_id, collection_id, ctx=DriverContext(db_resource=engine),
+                    )
+                    await run_post_operations(
+                        post_ops, _cat, _coll, asset, "FAILED",
+                        error_message=rej_msg,
+                    )
+                except Exception as _post_err:
+                    logger.warning(
+                        "Post-operations for FAILED (full rejection) errored: %s",
+                        _post_err,
+                    )
+            raise _RejectionFailed(rej_msg)
+
         # --- Secondary-index health check (FIX 2 + FIX 3) ---
         # Inspect the per-indexer BulkResult totals accumulated across all
         # batches.  A total miss (succeeded==0 on all indexers for a non-zero
         # write) marks the task FAILED and enqueues an automatic restore so a
         # retry self-heals.  A partial miss keeps COMPLETED but surfaces counts.
         final_status, index_msg = _check_index_health(
-            rows_written=rows_ingested,
+            rows_written=rows_persisted,
             index_results=accumulated_index_results,
         )
 
@@ -1064,6 +1613,54 @@ async def run_ingestion_task(
                 summary = {}
             summary["index_warning"] = index_msg
 
+        if rows_rejected > 0:
+            # Partial rejection: some rows persisted, some didn't (#2891).
+            # rows_persisted > 0 here — a full rejection already raised
+            # _RejectionFailed above — so this stays COMPLETED with counts.
+            if summary is None:
+                summary = {}
+            summary["rejection_summary"] = {
+                "persisted": rows_persisted,
+                "rejected": rows_rejected,
+                "first_message": first_rejection_message,
+            }
+
+        # --- Secondary-indexing honesty (#2897) ---
+        # With items_secondary_via_storage_plane on, the primary PG write above
+        # is synchronous but ES/secondary indexing is only an id-only
+        # obligation on tasks.storage until storage_drain converges it — a bare
+        # COMPLETED here would overstate what's actually searchable. Best-
+        # effort: a count failure omits the field entirely rather than
+        # guessing, and never fails the (already-successful) task.
+        secondary_indexing: Optional[Dict[str, Any]] = None
+        if await _resolve_items_secondary_via_storage_plane():
+            try:
+                queued = await _count_pending_secondary_index_ops(
+                    engine, catalog_id, collection_id,
+                )
+                secondary_indexing = (
+                    {
+                        "state": "pending",
+                        "queued": queued,
+                        "message": (
+                            f"primary write complete; {queued} entries "
+                            "pending asynchronous indexing"
+                        ),
+                    }
+                    if queued > 0
+                    else {"state": "converged", "queued": 0}
+                )
+            except Exception:  # noqa: BLE001 — count is best-effort, never fail the task
+                logger.warning(
+                    "ingestion task %s: secondary-index backlog count failed "
+                    "for %s/%s — omitting secondary_indexing from summary.",
+                    task_id, catalog_id, collection_id, exc_info=True,
+                )
+        if secondary_indexing is not None:
+            if summary is None:
+                summary = {}
+            summary["secondary_indexing"] = secondary_indexing
+
         await asyncio.gather(
             *(
                 reporter.task_finished("COMPLETED", summary=summary)
@@ -1078,6 +1675,8 @@ async def run_ingestion_task(
                 catalog_id, collection_id, ctx=DriverContext(db_resource=engine)
             )
             await run_post_operations(post_ops, catalog, collection, asset, "COMPLETED")
+
+        return secondary_indexing
 
     except _IndexMissFailed:
         # task_finished("FAILED") was already called in the FAILED branch above;

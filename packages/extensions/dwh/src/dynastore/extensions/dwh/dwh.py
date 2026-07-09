@@ -310,21 +310,42 @@ class DwhService(ExtensionProtocol):
         )
 
     def _register_routes(self):
-        self.router.add_api_route(
-            "/join", self.dwh_join, methods=["POST"], response_class=Response
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/join",
-            self.dwh_catalog_join,
-            methods=["POST"],
-            response_class=Response,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/tiles/{z}/{x}/{y}/join.{format}",
-            self.dwh_tiled_join,
-            methods=["POST"],
-            response_class=Response,
-        )
+        # (path, handler_name, methods, kwargs)
+        route_table = [
+            (
+                # Flat, unscoped path — catalog is buried in the request body
+                # instead of the URL, so it does not fit the
+                # platform/catalog/collection path convention. Kept for
+                # existing callers; use the catalog-scoped route below for
+                # new integrations.
+                "/join",
+                "dwh_join", ["POST"],
+                {
+                    "response_class": Response,
+                    "deprecated": True,
+                    "summary": "Data Warehouse join (deprecated). Use /dwh/catalogs/{catalog_id}/join instead.",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/join",
+                "dwh_catalog_join", ["POST"],
+                {
+                    "response_class": Response,
+                    "summary": "Data Warehouse join for a catalog (OGC aligned path)",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/tiles/{z}/{x}/{y}/join.{format}",
+                "dwh_tiled_join", ["POST"],
+                {
+                    "response_class": Response,
+                    "summary": "Tiled Data Warehouse join for a catalog (OGC aligned path)",
+                },
+            ),
+        ]
+
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     async def dwh_join(
         self,
@@ -333,7 +354,8 @@ class DwhService(ExtensionProtocol):
         conn: AsyncConnection = Depends(get_async_connection),
     ):
         """
-        Legacy endpoint: Retrieves features and streams the joined response.
+        Deprecated endpoint: catalog is read from the request body rather than
+        the URL. Use ``/dwh/catalogs/{catalog_id}/join`` instead.
         """
         return await self._dwh_join_impl(request, req, req.catalog, conn)
 
@@ -345,7 +367,8 @@ class DwhService(ExtensionProtocol):
         conn: AsyncConnection = Depends(get_async_connection),
     ):
         """
-        New endpoint: Retrieves features from a specific catalog and streams the joined response.
+        Retrieves features from a specific catalog and streams the joined
+        response (OGC aligned path: catalog scope in the URL).
         """
         return await self._dwh_join_impl(request, base_req, catalog_id, conn)
 

@@ -317,8 +317,7 @@ class TestCollectionMetadataRouting:
         phase commits the PG write, in the same TX it enqueues an
         outbox row for the ES sink, and a background drain task pumps
         the row through with retry.  Replaces the legacy per-item
-        listener pattern (``feedback_es_indexing_per_item_async_not_bulk.md``)
-        which lacked durability under restart.
+        listener pattern, which lacked durability under restart.
         """
         cfg = ItemsRoutingConfig()
         write = cfg.operations[Operation.WRITE]
@@ -337,9 +336,47 @@ class TestCollectionMetadataRouting:
         assert read[0].hints == {"geometry_simplified"}
         # PG's READ entry also pins Hint.TILES (added by #456 so tile
         # rendering routes through PG, which alone exposes schema/table
-        # identifiers).
+        # identifiers) and Hint.JOIN (declared on the PG entries so join
+        # surfaces route to PG — see the READ/SEARCH hints in
+        # routing_config's default ItemsRoutingConfig).
         from dynastore.modules.storage.hints import Hint
-        assert read[1].hints == {Hint.GEOMETRY_EXACT, Hint.TILES}
+        assert read[1].hints == {Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN}
+
+    def test_code_default_instance_has_empty_fields_set(self):
+        """ItemsRoutingConfig() built from default_factory has no
+        explicitly-set fields: model_fields_set is empty and
+        model_dump(exclude_unset=True) returns {}.
+
+        This is the root cause of #2435: _activate_collection called
+        get_config → received a bare cls() instance → called set_config →
+        _serialize_config_for_db persisted {} → the waterfall skips {} at
+        read time (falsy) → the collection-scope pin was a silent no-op.
+        """
+        cfg = ItemsRoutingConfig()
+        assert not cfg.model_fields_set, (
+            "code-default ItemsRoutingConfig must have empty model_fields_set; "
+            f"got {cfg.model_fields_set!r}"
+        )
+        assert cfg.model_dump(exclude_unset=True) == {}, (
+            "model_dump(exclude_unset=True) on a default-constructed instance "
+            "must return {} (the empty delta that is skipped by the waterfall)"
+        )
+
+    def test_explicitly_set_instance_has_nonempty_fields_set(self):
+        """When 'operations' is supplied at construction, it appears in
+        model_fields_set and model_dump(exclude_unset=True) is non-empty.
+        This is the signal _activate_collection now requires before writing
+        the collection-scope pin (#2435).
+        """
+        cfg = ItemsRoutingConfig(operations={
+            Operation.WRITE: [OperationDriverEntry(driver_ref="items_postgresql_driver")],
+        })
+        assert "operations" in cfg.model_fields_set, (
+            f"explicitly-set 'operations' missing from model_fields_set: {cfg.model_fields_set!r}"
+        )
+        assert cfg.model_dump(exclude_unset=True), (
+            "model_dump(exclude_unset=True) must be non-empty when 'operations' was supplied"
+        )
 
 
 class TestOperationEnum:

@@ -23,7 +23,7 @@ Durable task dispatcher and Janitor for the DynaStore task system.
 
 Uses a single global ``tasks.tasks`` table. No per-schema discovery is
 needed: the ``claim_next()`` query filters by runner-aware capability map
-types and returns the ``schema_name`` column so runners know which tenant
+types and returns the ``catalog_id`` column so runners know which tenant
 context to operate in.
 
 The Dispatcher:
@@ -46,10 +46,15 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 
 
 from dynastore.modules.tasks.durable.locks import stable_lock_id_blake2b as _stable_lock_id_blake2b
+from dynastore.tools.background_service import (
+    Leadership,
+    PodPolicy,
+    ServiceContext,
+)
 
 
 def _stable_advisory_lock_key(*parts: str) -> int:
@@ -284,6 +289,8 @@ def _log_task_terminal(
 
 # Cross-pod-stable lock namespace shared by reactive + proactive paths so
 # both serialize on the same ``pg_try_advisory_xact_lock`` key per capability.
+# Listed alongside every other static lock/lease key in
+# modules/tasks/durable/lock_registry.py.
 _REAPER_LOCK_NAMESPACE = "dynastore.idx_reaper"
 
 
@@ -399,7 +406,7 @@ async def _maybe_dlq_unclaimable(
     """
     from dynastore.modules.tasks.capability_oracle import is_capability_live
     from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+        DQLQuery, ResultHandler, background_managed_transaction,
     )
     from dynastore.modules.tasks.tasks_module import get_task_schema
 
@@ -417,7 +424,14 @@ async def _maybe_dlq_unclaimable(
         )
         schema = get_task_schema()
         error_message = _dead_capability_error_message(capability_id)
-        async with managed_transaction(engine) as conn:
+        # Gated (#2900): this reactive check runs inline in the dispatcher's
+        # per-task claim path, not a separate maintenance tick — routing it
+        # through the background semaphore keeps it from piling onto the
+        # pool alongside true maintenance work under throttling. On
+        # saturation the semaphore raises asyncio.TimeoutError, caught by
+        # the except-and-fail-safe below, which already falls through to
+        # the standard reset-to-pending back-off — no new failure mode.
+        async with background_managed_transaction(engine) as conn:
             got_lock = await DQLQuery(
                 "SELECT pg_try_advisory_xact_lock(:k) AS got",
                 result_handler=ResultHandler.ONE_DICT,
@@ -546,7 +560,7 @@ async def sweep_dead_capability_rows(
         is_capability_live,
     )
     from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+        DQLQuery, ResultHandler, background_managed_transaction,
     )
     from dynastore.modules.tasks.tasks_module import get_task_schema
 
@@ -564,7 +578,7 @@ async def sweep_dead_capability_rows(
         )
         schema = get_task_schema()
         error_message = _dead_capability_error_message(capability_id)
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
             got_lock = await DQLQuery(
                 "SELECT pg_try_advisory_xact_lock(:k) AS got",
                 result_handler=ResultHandler.ONE_DICT,
@@ -653,29 +667,27 @@ async def sweep_unclaimable_rows(
     transient owner gap during a deploy does not dead-letter freshly-enqueued
     work (mirrors the capability sweep's age floor).
 
-    When ``conn`` is supplied, both the registry SELECT and the DLQ UPDATE run
-    on that connection (avoids two extra pool acquires); callers without one
-    still work via the ``conn=None`` default.
+    ``conn`` is used for the registry SELECT when supplied (avoids an extra
+    pool acquire), and is REQUIRED for the DLQ UPDATE step below: the sole
+    caller (the mandatory backstop pass in ``ProactiveSweepService``) always
+    supplies one, already checked out through ``background_managed_transaction``
+    — a second, ungated pool acquire here would defeat that gating (#2900).
     """
     unclaimable = await _find_unclaimable_task_types(
         engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn,
     )
     if not unclaimable:
         return 0
+    assert conn is not None, (
+        "sweep_unclaimable_rows requires a pre-acquired, gated conn once "
+        "unclaimable rows are found"
+    )
     sql = _BACKSTOP_DLQ_SQL.format(schema=schema)
     err = _unclaimable_error(",".join(sorted(unclaimable)))
-    from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+    rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, err=err, task_types=unclaimable, min_age_s=min_age_s,
     )
-    if conn is not None:
-        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, err=err, task_types=unclaimable, min_age_s=min_age_s,
-        )
-    else:
-        async with managed_transaction(engine) as _conn:
-            rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-                _conn, err=err, task_types=unclaimable, min_age_s=min_age_s,
-            )
     n = len(rows or [])
     if n:
         logger.error("backstop: dead-lettered %d unclaimable row(s) types=%s", n, unclaimable)
@@ -798,11 +810,12 @@ async def run_dispatcher(
         f"async_types={capability_map.async_types}, "
         f"sync_types={capability_map.sync_types})."
     )
-    # In-process _run_janitor retired — stuck-task reaping is now handled by
-    # the pg_cron job ``dynastore-task-reaper`` (registered in TasksModule
-    # startup).  Single coordinated executor at the DB side; zero pod
-    # connections, zero leader-election.  See
-    # ``tasks_module.reap_stuck_tasks``.
+    # In-process _run_janitor retired — stuck-task reaping is now driven by
+    # MaintenanceSupervisor's JOB_TASK_REAPER job, which invokes the
+    # ``reap_stuck_tasks`` PL/pgSQL function on a leader-elected cadence
+    # (the old pg_cron job is unscheduled on startup). Single coordinated
+    # executor at the DB side; zero pod connections, zero leader-election
+    # in application code.
 
     heartbeat = BatchedHeartbeat(engine, visibility_timeout=visibility_timeout)
     await heartbeat.start()
@@ -874,8 +887,7 @@ async def run_dispatcher(
                     )
                     # Mirror to Valkey counter (#524 Signal A). Only emit
                     # when we have a real capability id; "-" rows are
-                    # routing rejections we already surface via
-                    # _warn_stuck_pending_tasks.
+                    # routing rejections surfaced by StuckPendingWarnerService.
                     if cap_id:
                         from dynastore.modules.tasks.capability_stats import (
                             bump_claim_rejected,
@@ -902,7 +914,7 @@ async def run_dispatcher(
                 inputs=row.get("inputs"),
                 caller_id=row.get("caller_id"),
                 collection_id=row.get("collection_id"),
-                schema=row.get("schema_name", "tasks"),
+                schema=row.get("catalog_id", "tasks"),
                 scope=row.get("scope"),
             )
 
@@ -1064,7 +1076,7 @@ async def run_dispatcher(
                 for row in rows:
                     logger.info(
                         f"Dispatcher: Claimed task {row['task_id']} ({row['task_type']}) "
-                        f"schema={row.get('schema_name')!r} "
+                        f"schema={row.get('catalog_id')!r} "
                         f"mode={row.get('execution_mode', 'ASYNC')}."
                     )
 
@@ -1117,3 +1129,22 @@ async def run_dispatcher(
 
     await heartbeat.stop()
     logger.info("Dispatcher: Stopped.")
+
+
+class DispatcherService:
+    """BackgroundService wrapper for the task dispatcher.
+
+    Runs on every pod (RUN_EVERYWHERE) — all long-lived pods participate in
+    claiming tasks; SKIP LOCKED in claim_batch provides the necessary
+    cross-pod deduplication. Skips ephemeral Cloud Run Job pods
+    (SKIP_EPHEMERAL) — they claim tasks directly via claim_for_execution and
+    never need the dispatcher loop. Resolves #2279 for this loop.
+    """
+
+    name = "dispatcher"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    lock_key: Optional[Union[int, str]] = None
+
+    async def run(self, ctx: ServiceContext) -> None:
+        await run_dispatcher(ctx.engine, None, ctx.shutdown)

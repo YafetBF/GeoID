@@ -33,14 +33,17 @@ _ = _bigquery_scope_gate  # silence pyright "unused" — load-bearing for SCOPE 
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, FrozenSet, Optional
+from datetime import datetime, timezone
+from typing import Annotated, Any, AsyncGenerator, Dict, FrozenSet, List, Optional
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse  # noqa: E402
 
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
-from dynastore.models.ogc import Feature
+from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.joins.bq_secondary import stream_bigquery_secondary
 from dynastore.modules.joins.executor import index_secondary, run_join
@@ -48,12 +51,61 @@ from dynastore.modules.joins.models import (
     BigQuerySecondarySpec,
     JoinRequest,
     NamedSecondarySpec,
+    PagingSpec,
     PrimaryFilterSpec,
 )
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.router import resolve_drivers
 
 logger = logging.getLogger(__name__)
+
+# Default and ceiling for a single /join page, mirroring OGC API - Features
+# `limit` semantics (Features Part 1 Core, /req/core/fc-limit-response-1: an
+# over-max ``limit`` is clamped by ``_resolve_paging`` below, never rejected).
+# PagingSpec's own ``limit`` field shares the same default (100).
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 10_000
+
+# Safety ceiling on the number of primary rows scanned per /join request.
+# The join executor streams the primary collection without a row-based pre-cap
+# (so sparse inner joins find their full quota of matched features); this
+# ceiling prevents runaway scans on very large collections. When hit, the
+# response still emits a `next` link so the client can continue paging.
+# Operators can observe ceiling hits via the `join_scan_ceiling_hit` warning.
+MAX_PRIMARY_SCAN_ROWS = 1_000_000
+
+# GeoJSON media type for join feature collections and pagination links.
+GEOJSON_MEDIA_TYPE = "application/geo+json"
+# Plain JSON alternative a client can request via `Accept` (see
+# `_negotiate_join_response`).
+JSON_MEDIA_TYPE = "application/json"
+
+
+class GeoJSONResponse(JSONResponse):
+    """JSON response served with the OGC GeoJSON media type.
+
+    The join FeatureCollection is GeoJSON, so it must be sent as
+    ``application/geo+json`` (OGC API - Features Part 1 §7.15.4 /
+    ``/req/core/fc-response``), not the FastAPI-default ``application/json``.
+    """
+
+    media_type = GEOJSON_MEDIA_TYPE
+
+
+def _negotiate_join_response(body: Dict[str, Any], accept_header: str):
+    """Honor `Accept: application/json` vs the OGC-default `geo+json`.
+
+    Mirrors the substring `Accept` check already used elsewhere in the catalog
+    for content negotiation (e.g. ``CRSService.get_crs``): the join
+    FeatureCollection defaults to ``application/geo+json`` (OGC API - Features
+    Part 1 §7.15.4 fc-response) for any other/absent/wildcard ``Accept``. Only
+    an explicit plain-JSON request gets an explicit ``JSONResponse`` here — the
+    default case returns ``body`` unwrapped and lets the route's
+    ``response_class=GeoJSONResponse`` serve it.
+    """
+    if JSON_MEDIA_TYPE in accept_header and GEOJSON_MEDIA_TYPE not in accept_header:
+        return JSONResponse(content=body)
+    return body
 
 
 async def _resolve_primary_driver(
@@ -89,7 +141,7 @@ async def _stream_primary_features(
     driver, *, catalog_id: str, collection_id: str,
     primary_column: str, limit: int = 100_000,
     query_request: Optional[QueryRequest] = None,
-) -> AsyncIterator[Feature]:
+) -> AsyncGenerator[Feature, None]:
     """Wrap any CollectionItemsStore driver's read_entities into the
     plain ``AsyncIterator[Feature]`` shape ``run_join`` expects.
 
@@ -125,6 +177,205 @@ def _build_primary_query_request(
     if primary_filter is not None:
         req.cql_filter = primary_filter.cql
     return req
+
+
+def _resolve_paging(
+    body: JoinRequest, *, limit: Optional[int], offset: Optional[int],
+) -> PagingSpec:
+    """Resolve the effective page from query params over body, bounded.
+
+    Query ``?limit=&offset=`` win over ``body.paging`` so a ``next`` link
+    (which can only carry a query string) is followable by replaying the same
+    POST body. Absent both, default to a bounded page (Features-style) rather
+    than an unbounded scan. The result is clamped to ``[1, MAX_PAGE_LIMIT]``.
+    """
+    eff_limit = (
+        limit if limit is not None
+        else body.paging.limit if body.paging is not None
+        else DEFAULT_PAGE_LIMIT
+    )
+    eff_offset = (
+        offset if offset is not None
+        else body.paging.offset if body.paging is not None
+        else 0
+    )
+    eff_limit = max(1, min(eff_limit, MAX_PAGE_LIMIT))
+    eff_offset = max(0, eff_offset)
+    return PagingSpec(limit=eff_limit, offset=eff_offset)
+
+
+def _with_paging_query(url: str, *, offset: int, limit: int) -> str:
+    """Return ``url`` with ``offset``/``limit`` set in the query string.
+
+    Preserves any other query params already present (e.g. ``?hints=``).
+    """
+    parts = urlsplit(url)
+    kept = [
+        (k, v)
+        for k, v in (
+            tuple(p.split("=", 1)) if "=" in p else (p, "")
+            for p in parts.query.split("&") if p
+        )
+        if k not in ("offset", "limit")
+    ]
+    kept.extend([("offset", str(offset)), ("limit", str(limit))])
+    return urlunsplit(parts._replace(query=urlencode(kept)))
+
+
+def _join_feature_collection(
+    joined: List[Feature], *, request: Request, paging: PagingSpec, has_next: bool,
+    number_matched: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build an OGC-conformant join FeatureCollection.
+
+    Carries the OGC API - Features response members (``links``, ``timeStamp``,
+    ``numberReturned``) instead of a non-standard ``_join_meta`` foreign member.
+    ``numberMatched`` is only set when the caller already knows the exact total
+    for free (see ``_execute_primary_join``: a terminal page reached after a
+    full, untruncated primary scan). The join otherwise streams an inner match
+    and never materializes the full matched set, so its total is not known
+    cheaply and stays omitted (Features Part 1 permits omitting it) rather than
+    paying for a separate count.
+
+    ``has_next`` is computed by the caller (``_execute_primary_join``) which
+    uses a match-bounded read: it requests ``limit+1`` matched features from
+    the join executor and emits ``next`` when the (limit+1)th match exists or
+    the primary-scan safety ceiling was reached before ``limit+1`` matches were
+    found. This is correct for both dense and sparse joins.
+
+    ``prev`` is emitted whenever ``paging.offset > 0``, mirroring how ``next``
+    is built (same ``_with_paging_query`` helper) — omitted on the first page.
+    """
+    features = [f.model_dump(by_alias=True, exclude_none=True) for f in joined]
+    self_href = str(request.url)
+    links: List[Dict[str, Any]] = [
+        {"rel": "self", "type": GEOJSON_MEDIA_TYPE, "href": self_href},
+    ]
+    if paging.offset > 0:
+        links.append({
+            "rel": "prev",
+            "type": GEOJSON_MEDIA_TYPE,
+            "href": _with_paging_query(
+                self_href,
+                offset=max(0, paging.offset - paging.limit),
+                limit=paging.limit,
+            ),
+        })
+    if has_next:
+        links.append({
+            "rel": "next",
+            "type": GEOJSON_MEDIA_TYPE,
+            "href": _with_paging_query(
+                self_href, offset=paging.offset + paging.limit, limit=paging.limit,
+            ),
+        })
+    result: Dict[str, Any] = {
+        "type": "FeatureCollection",
+        "features": features,
+        "numberReturned": len(features),
+        "timeStamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "links": links,
+    }
+    if number_matched is not None:
+        result["numberMatched"] = number_matched
+    return result
+
+
+async def _execute_primary_join(
+    primary_driver,
+    *,
+    catalog_id: str,
+    collection_id: str,
+    body: JoinRequest,
+    secondary_index: Dict[Any, Dict[str, Any]],
+    request: Request,
+) -> Dict[str, Any]:
+    """Stream primary features up to the safety ceiling, run the join, page results.
+
+    Uses a match-bounded read strategy: the primary stream is not pre-capped at
+    ``offset+limit`` rows. Instead it is scanned up to ``MAX_PRIMARY_SCAN_ROWS``
+    rows. The executor is asked for ``limit+1`` matched features; if the
+    (limit+1)th match is found, a ``next`` link is emitted. When the ceiling
+    truncates the scan before ``limit+1`` matches are found, a ``next`` link is
+    still emitted so the client does not stop early on a sparse join.
+
+    A key=value WARNING is logged when the ceiling is hit so sparse-scan
+    truncation is observable in production logs.
+
+    Raises:
+        ValueError: forwarded from the primary driver when a CQL2 expression
+            references an unknown column; the caller maps this to HTTP 400.
+    """
+    paging = body.paging
+    assert paging is not None  # _resolve_paging always sets body.paging before we're called
+
+    query_request = _build_primary_query_request(
+        body.primary_filter, limit=MAX_PRIMARY_SCAN_ROWS,
+    )
+
+    # Count primary rows emitted so we can detect ceiling hits after the join.
+    primary_rows_scanned = 0
+
+    async def _counted_primary() -> AsyncGenerator[Feature, None]:
+        nonlocal primary_rows_scanned
+        inner = _stream_primary_features(
+            primary_driver,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            primary_column=body.join.primary_column,
+            limit=MAX_PRIMARY_SCAN_ROWS,
+            query_request=query_request,
+        )
+        try:
+            async for feat in inner:
+                primary_rows_scanned += 1
+                yield feat
+        finally:
+            await inner.aclose()
+
+    # Request limit+1 matched features so the (limit+1)th item acts as a peek
+    # for the `next` link decision.  PagingSpec.model_construct bypasses field
+    # validation because this is an internal peek value (paging.limit is
+    # already clamped by `_resolve_paging`); the page exposed to the client
+    # is trimmed to paging.limit below.
+    peek_paging = PagingSpec.model_construct(
+        limit=paging.limit + 1, offset=paging.offset,
+    )
+    run_join_body = body.model_copy(update={"paging": peek_paging})
+
+    joined = [
+        feat async for feat in run_join(
+            run_join_body,
+            primary_stream=_counted_primary(),
+            secondary_index=secondary_index,
+        )
+    ]
+
+    ceiling_hit = primary_rows_scanned >= MAX_PRIMARY_SCAN_ROWS
+    if ceiling_hit and len(joined) < paging.limit + 1:
+        logger.warning(
+            "join_scan_ceiling_hit primary_rows=%d matches=%d "
+            "catalog=%s collection=%s",
+            primary_rows_scanned, len(joined), catalog_id, collection_id,
+        )
+
+    # A (limit+1)th match in `joined` proves more matches follow.
+    # A ceiling hit without limit+1 matches means the scan was truncated;
+    # conservatively emit `next` so the client does not stop prematurely.
+    has_next = len(joined) > paging.limit or ceiling_hit
+    joined = joined[: paging.limit]
+
+    # `numberMatched` for free: reaching a terminal page (`not has_next`) means
+    # the primary was scanned to completion without hitting the safety ceiling
+    # and no further match exists — so the total is exactly what's already
+    # been counted across pages (`offset` + this page's own count), with no
+    # extra query. Any other page keeps it omitted (see `_join_feature_collection`).
+    number_matched = None if has_next else paging.offset + len(joined)
+
+    return _join_feature_collection(
+        joined, request=request, paging=paging, has_next=has_next,
+        number_matched=number_matched,
+    )
 
 
 # Draft URIs — OGC API - Joins Part 1 0.0 (working draft).
@@ -167,14 +418,44 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         return build_contributions()
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/join",
-            self.describe_join, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/join",
-            self.execute_join, methods=["POST"],
-        )
+        # (path, handler_name, methods, kwargs)
+        route_table = [
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/join",
+                "describe_join", ["GET"], {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/join",
+                "execute_join", ["POST"],
+                {
+                    "response_class": GeoJSONResponse,
+                    # Doc-only response schema: the join FeatureCollection carries
+                    # arbitrary per-request properties/geometry that a real
+                    # `response_model=FeatureCollection` would re-validate on every
+                    # request (and reject legitimate `geometry: null` features, since
+                    # geojson_pydantic's `Feature.geometry` isn't itself nullable-
+                    # optional) — that's the join *semantics* this issue must not
+                    # touch. `responses=` documents the schema for the OpenAPI spec
+                    # without imposing runtime (re-)validation.
+                    "responses": {
+                        200: {
+                            "description": (
+                                "Joined FeatureCollection page, served as "
+                                f"`{GEOJSON_MEDIA_TYPE}` by default or `{JSON_MEDIA_TYPE}` "
+                                "when explicitly requested via `Accept`."
+                            ),
+                            "content": {
+                                GEOJSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
+                                JSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
+                            },
+                        },
+                    },
+                },
+            ),
+        ]
+
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     async def describe_join(
         self, catalog_id: str, collection_id: str, request: Request,
@@ -194,6 +475,19 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         self, catalog_id: str, collection_id: str, request: Request,
         body: JoinRequest = Body(...),
         request_hints: FrozenSet = Depends(parse_hints_param),
+        limit: Annotated[Optional[int], Query(
+            ge=1,
+            description=(
+                "Page size; overrides body.paging.limit when present. A "
+                "value above the configured maximum is clamped, not "
+                "rejected (OGC API - Features Part 1 Core "
+                "/req/core/fc-limit-response-1) — see ``_resolve_paging``."
+            ),
+        )] = None,
+        offset: Annotated[Optional[int], Query(
+            ge=0,
+            description="Start offset; overrides body.paging.offset when present.",
+        )] = None,
     ):
         """Execute the join.
 
@@ -204,10 +498,29 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         the baseline ``JOIN`` hint; omitting the parameter preserves the
         existing routing behaviour.
 
+        ``?limit=`` / ``?offset=`` override ``body.paging`` so the ``next``
+        link in the response is followable by replaying this POST body. The
+        response is an OGC API - Features-style FeatureCollection (``links``,
+        ``timeStamp``, ``numberReturned``).
+
+        Honors ``Accept: application/json`` for a plain-JSON response body;
+        any other (or absent/wildcard) ``Accept`` keeps the OGC-conformant
+        ``application/geo+json`` default.
+
         PR-3: BigQuerySecondarySpec runs the join end-to-end via the
         platform's driver registry for the primary side. NamedSecondarySpec
         stub remains until its own PR.
         """
+        accept_header = request.headers.get("Accept", GEOJSON_MEDIA_TYPE)
+
+        # Effective page: query params win over body, bounded to a sane page.
+        # The primary read is NOT pre-capped at offset+limit rows — that caused
+        # sparse inner joins to under-fill pages and suppress the `next` link
+        # prematurely. Instead, _execute_primary_join streams up to
+        # MAX_PRIMARY_SCAN_ROWS rows and asks the executor for limit+1 matched
+        # features so it can reliably decide whether a next page exists.
+        body.paging = _resolve_paging(body, limit=limit, offset=offset)
+
         if isinstance(body.secondary, BigQuerySecondarySpec):
             # Materialize secondary side via Phase 4a's BQ driver (inline target).
             secondary_index = await index_secondary(
@@ -229,35 +542,20 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                         "Configure a ItemsRoutingConfig before /join."
                     ),
                 )
-            limit = body.paging.limit if body.paging else 100_000
-            query_request = _build_primary_query_request(body.primary_filter, limit=limit)
             try:
-                primary_stream = _stream_primary_features(
+                result = await _execute_primary_join(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
-                    primary_column=body.join.primary_column,
-                    limit=limit,
-                    query_request=query_request,
+                    body=body,
+                    secondary_index=secondary_index,
+                    request=request,
                 )
-                joined = [
-                    feat async for feat in run_join(
-                        body, primary_stream=primary_stream,
-                        secondary_index=secondary_index,
-                    )
-                ]
             except ValueError as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
-            return {
-                "type": "FeatureCollection",
-                "features": [f.model_dump(by_alias=True, exclude_none=True) for f in joined],
-                "_join_meta": {
-                    "secondary_rows_materialized": len(secondary_index),
-                    "joined_features": len(joined),
-                },
-            }
+            return _negotiate_join_response(result, accept_header)
 
         if isinstance(body.secondary, NamedSecondarySpec):
             # Resolve secondary collection via the platform's driver registry.
@@ -295,36 +593,20 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                         f"{catalog_id}/{collection_id}."
                     ),
                 )
-            limit = body.paging.limit if body.paging else 100_000
-            query_request = _build_primary_query_request(body.primary_filter, limit=limit)
             try:
-                primary_stream = _stream_primary_features(
+                result = await _execute_primary_join(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
-                    primary_column=body.join.primary_column,
-                    limit=limit,
-                    query_request=query_request,
+                    body=body,
+                    secondary_index=secondary_index,
+                    request=request,
                 )
-                joined = [
-                    feat async for feat in run_join(
-                        body, primary_stream=primary_stream,
-                        secondary_index=secondary_index,
-                    )
-                ]
             except ValueError as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
-            return {
-                "type": "FeatureCollection",
-                "features": [f.model_dump(by_alias=True, exclude_none=True) for f in joined],
-                "_join_meta": {
-                    "secondary_rows_materialized": len(secondary_index),
-                    "joined_features": len(joined),
-                    "secondary_ref": body.secondary.ref,
-                },
-            }
+            return _negotiate_join_response(result, accept_header)
 
         raise HTTPException(
             status_code=400,

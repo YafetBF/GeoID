@@ -154,6 +154,14 @@ class Hint(StrEnum):
     METADATA = "metadata"
     ASSETS = "assets"
 
+    # Prefer a durable, transactionally-consistent store over an eventually-
+    # consistent object-storage backend. Used by tile-cache writer selection
+    # (modules/tiles/tiles_writers.select_tile_writer) to elevate the
+    # PG-table writer over a bucket-backed one when the caller has a reason
+    # to want strong consistency (e.g. immediate read-your-write after a
+    # preseed run) rather than the default first-available ordering.
+    DURABLE = "durable"
+
     # ── Cross-driver feature requests ─────────────────────────────────
     # Hints that signal participation in a specific feature surface.
     # ``JOIN`` opts the driver into OGC API - Joins dispatch (extensions/
@@ -167,6 +175,18 @@ class Hint(StrEnum):
     # vocabulary is one consolidated catalogue rather than scattered
     # asset-driver and storage-driver dialects.
     DEFAULT = "default"
+
+    # ── Lifecycle preferences ─────────────────────────────────────────
+    # Unlike the routing hints above (which steer driver selection),
+    # ``DEFER`` is a create-time lifecycle control: ``POST /catalogs?hints=defer``
+    # holds back the deferrable provisioners (GCP bucket/eventing/config) so a
+    # catalog is created core-only (tenant schema) and reaches ``ready``
+    # bucket-free. The catalog can then be configured — e.g.
+    # ``GcpCatalogBucketConfig.provision_enabled`` for a records-only catalog —
+    # before storage is provisioned by an explicit ``catalog_provision`` task
+    # (spawned via ``POST /task/catalogs/{id}``). Omitting the hint keeps the
+    # default behaviour: every active provisioner runs at creation time.
+    DEFER = "defer"
 
 
 # ---------------------------------------------------------------------------
@@ -183,31 +203,74 @@ class Hint(StrEnum):
 # changes to any call site that uses this constant.
 EXACT_READ_HINTS: frozenset = frozenset({Hint.GEOMETRY_EXACT})
 
+# ---------------------------------------------------------------------------
+# Parametric prefer hint support
+# ---------------------------------------------------------------------------
+
+#: Prefix that identifies a parametric driver-preference token in the
+#: ``?hints=`` query parameter.  A token of the form ``prefer:<driver>``
+#: (e.g. ``prefer:es``, ``prefer:pg``) pins a READ or SEARCH to a specific
+#: driver regardless of the declared hint surface.  It is the deterministic
+#: "read metadata from ES" selector.  The token is resolved tier-relative by
+#: the router against the operation's configured entries: exact
+#: ``driver_ref`` match wins; else an alias is expanded to a substring
+#: match against ``driver_ref`` (e.g. ``es`` → ``elasticsearch`` substring).
+PREFER_PREFIX: str = "prefer:"
+
+#: Short alias → full driver_ref substring mapping for ``prefer:<driver>``
+#: tokens.  An alias entry means the router will match any ``driver_ref``
+#: that **contains** the resolved needle as a substring.  Full snake_case
+#: ``driver_ref`` values (e.g. ``prefer:items_elasticsearch_driver``) are
+#: always accepted directly (exact match) without needing an alias entry.
+DRIVER_PREFER_ALIASES: dict = {
+    "es": "elasticsearch",
+    "pg": "postgresql",
+    "postgres": "postgresql",
+    "bq": "bigquery",
+    "duckdb": "duckdb",
+    "iceberg": "iceberg",
+}
+
 
 def parse_request_hints(values) -> frozenset:
-    """Parse caller-supplied hint tokens into a ``frozenset[Hint]``.
+    """Parse caller-supplied hint tokens into a ``frozenset``.
 
     Accepts the value of the ``?hints=`` query parameter in either repeated
     form (``?hints=geometry_exact&hints=tiles``) or comma-joined form
     (``?hints=geometry_exact,tiles``); ``values`` is therefore an iterable of
     strings (FastAPI hands a ``List[str]`` for a repeated param) or ``None``.
 
-    Tokens are matched case-insensitively against the canonical :class:`Hint`
-    vocabulary; unknown tokens are silently dropped so a typo or a hint this
-    deployment doesn't recognise simply has no effect (same tolerance the
-    routing matcher already applies to unrecognised ``supported_hints``).
+    Two token classes are accepted:
+
+    * **Canonical :class:`Hint` members** — matched case-insensitively against
+      the ``Hint`` vocabulary; unknown tokens are silently dropped so a typo or
+      a hint this deployment doesn't recognise simply has no effect.
+    * **Parametric ``prefer:<driver>`` tokens** — retained verbatim as plain
+      strings (e.g. ``"prefer:es"``) in the returned frozenset.  The router
+      resolves them tier-relative against the operation's configured driver
+      entries (exact ``driver_ref`` match, then alias → substring).  They are
+      stripped from the hint set before the overlap matcher so they never
+      interfere with declared ``Hint`` membership tests.
+
     Returns an empty frozenset when nothing valid is supplied, which keeps the
-    default (simplified / search-backend) read path byte-for-byte unchanged.
+    default read path byte-for-byte unchanged.
     """
     if not values:
         return frozenset()
     by_value = {h.value: h for h in Hint}
-    parsed = set()
+    parsed: set = set()
     for raw in values:
         if raw is None:
             continue
         for token in str(raw).split(","):
-            member = by_value.get(token.strip().lower())
+            tok = token.strip().lower()
+            if not tok:
+                continue
+            if tok.startswith(PREFER_PREFIX) and len(tok) > len(PREFER_PREFIX):
+                # Parametric prefer token — retain as plain string for the router.
+                parsed.add(tok)
+                continue
+            member = by_value.get(tok)
             if member is not None:
                 parsed.add(member)
     return frozenset(parsed)

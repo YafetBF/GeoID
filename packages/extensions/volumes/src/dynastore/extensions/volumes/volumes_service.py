@@ -47,7 +47,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -65,7 +64,7 @@ from dynastore.extensions.volumes.volumes_models import (
     _bbox_intersects,
     _parse_bbox,
 )
-from dynastore.extensions.web.decorators import expose_static, expose_web_page
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols.bounds_source import (
     BoundsSourceProtocol,
     EmptyBoundsSource,
@@ -84,6 +83,8 @@ from dynastore.modules.volumes.writers.b3dm import pack_b3dm
 from dynastore.modules.volumes.writers.glb import pack_glb
 from dynastore.modules.volumes.writers.tileset_json import write_tileset_json
 from dynastore.tools.discovery import get_protocol
+from dynastore.models.protocols.configs import ConfigsProtocol
+from dynastore.tools.cache import cached
 from dynastore.extensions.tools.url import get_url
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.response_i18n import resolve_localized
@@ -98,37 +99,6 @@ OGC_API_VOLUMES_URIS = [
     "http://www.opengis.net/spec/ogcapi-3d-geovolumes-1/0.0/conf/spatialquery",
 ]
 
-# Module-level BSP-tree cache: (catalog_id, collection_id) → (expires_at, tileset_dict)
-_TILESET_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
-_TILESET_CACHE_MAX = 256  # entries; evicts soonest-expiring when full
-
-
-def _cache_get(catalog_id: str, collection_id: str) -> Optional[Dict[str, Any]]:
-    key = (catalog_id, collection_id)
-    entry = _TILESET_CACHE.get(key)
-    if entry is None:
-        return None
-    if time.monotonic() >= entry[0]:
-        _TILESET_CACHE.pop(key, None)  # evict expired entry
-        return None
-    return entry[1]
-
-
-def _cache_set(
-    catalog_id: str,
-    collection_id: str,
-    tileset: Dict[str, Any],
-    ttl_s: int,
-) -> None:
-    if len(_TILESET_CACHE) >= _TILESET_CACHE_MAX:
-        # Evict the entry with the soonest expiry to bound memory usage.
-        oldest_key = min(_TILESET_CACHE, key=lambda k: _TILESET_CACHE[k][0])
-        _TILESET_CACHE.pop(oldest_key, None)
-    _TILESET_CACHE[(catalog_id, collection_id)] = (
-        time.monotonic() + ttl_s,
-        tileset,
-    )
-
 
 class VolumesService(ExtensionProtocol, OGCServiceMixin):
     """OGC API - 3D GeoVolumes extension."""
@@ -139,6 +109,10 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     prefix = "/volumes"
     protocol_title = "DynaStore OGC API - 3D GeoVolumes"
     protocol_description = "Access to 3D tile data via OGC API - 3D GeoVolumes"
+
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "volumes"
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -162,37 +136,53 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         yield
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tileset.json",
-            self.get_tileset_json, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.b3dm",
-            self.get_tile_b3dm, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.glb",
-            self.get_tile_glb, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/metadata",
-            self.get_volumes_metadata, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_3d_collections, methods=["GET"],
-            summary="List 3D container collections",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_3d_collection, methods=["GET"],
-            summary="Get a single 3D container",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/cityjsonseq",
-            self.stream_cityjsonseq, methods=["GET"],
-            summary="Stream CityJSONSeq for a 3D container collection",
-        )
+        self.register_ogc_standard_routes()
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tileset.json",
+                "get_tileset_json",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.b3dm",
+                "get_tile_b3dm",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.glb",
+                "get_tile_glb",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/metadata",
+                "get_volumes_metadata",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections",
+                "list_3d_collections",
+                ["GET"],
+                {"summary": "List 3D container collections"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}",
+                "get_3d_collection",
+                ["GET"],
+                {"summary": "Get a single 3D container"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/cityjsonseq",
+                "stream_cityjsonseq",
+                ["GET"],
+                {"summary": "Stream CityJSONSeq for a 3D container collection"},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Tileset index
@@ -268,7 +258,15 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     async def list_3d_collections(
         self,
         catalog_id: str,
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         bbox: Optional[str] = Query(None),
         language: str = Depends(get_language),
@@ -279,6 +277,13 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         the explicit marker ``geovolumes:enabled``. The optional ``bbox``
         parameter (4 or 6 comma-separated floats) filters by spatial extent.
         """
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cfg = await self._get_volumes_config(catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=cfg.default_limit, max_limit=cfg.max_limit,
+        )
+
         parsed_bbox: Optional[Tuple] = None
         if bbox is not None:
             try:
@@ -316,10 +321,9 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
 
         Returns 404 if the collection does not exist or is not 3D.
         """
-        catalogs_svc = await self._get_catalogs_service()
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
-        if coll is None:
-            raise HTTPException(status_code=404, detail="Collection not found.")
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id, detail="Collection not found.",
+        )
         if not _is_3d_collection(coll):
             raise HTTPException(
                 status_code=404,
@@ -332,7 +336,15 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         self,
         catalog_id: str,
         collection_id: str,
-        limit: int = Query(10000, ge=1, le=100000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to stream. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
     ) -> StreamingResponse:
         """Stream a CityJSONSeq response for all items in a 3D collection.
 
@@ -340,15 +352,23 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         Subsequent lines are individual CityJSONFeature objects (NDJSON).
         Media type: ``application/city+json``.
         """
-        catalogs_svc = await self._get_catalogs_service()
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
-        if coll is None:
-            raise HTTPException(status_code=404, detail="Collection not found.")
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id, detail="Collection not found.",
+        )
         if not _is_3d_collection(coll):
             raise HTTPException(
                 status_code=404,
                 detail="Collection is not a 3D GeoVolumes container.",
             )
+
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cfg = await self._get_volumes_config(catalog_id, collection_id)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=cfg.stream_default_limit,
+            max_limit=cfg.stream_max_limit,
+        )
 
         extras = _get_extras(coll)
         header = _build_cityjsonseq_header(extras)
@@ -358,6 +378,7 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         # Stream instead of materializing: each item carries the full
         # CityJSONFeature payload, so buffering the whole collection can
         # cost hundreds of MB at the default limit.
+        catalogs_svc = await self._get_catalogs_service()
         query_response = await catalogs_svc.stream_items(
             catalog_id, collection_id, QueryRequest(limit=limit), ctx=None
         )
@@ -377,32 +398,9 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
     # Web page contributions (globe browser)
     # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    @expose_static("volumes")
-    def provide_static_files(self) -> list:
-        """Exposes the static directory for the GeoVolumes globe browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        if os.path.isdir(static_dir):
-            for root, _, filenames in os.walk(static_dir):
-                for filename in filenames:
-                    files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="volumes_browser",
@@ -417,18 +415,6 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     async def provide_volumes_browser(self, request: Request):
         return await self._serve_page_template("volumes_browser.html")
 
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(
-                content=f.read().replace("{{VERSION}}", VERSION),
-                media_type="text/html",
-            )
-
     # ------------------------------------------------------------------
     # Internals — tileset pipeline
     # ------------------------------------------------------------------
@@ -436,7 +422,10 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     async def _get_volumes_config(
         self, catalog_id: str, collection_id: Optional[str] = None,
     ) -> VolumesConfig:
-        return VolumesConfig()
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return VolumesConfig()
+        return await configs.get_config(VolumesConfig, catalog_id, collection_id)
 
     async def _get_or_build_tileset(
         self,
@@ -445,35 +434,37 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         cfg: VolumesConfig,
         request: Request,
     ) -> Dict[str, Any]:
-        cached = _cache_get(catalog_id, collection_id)
-        if cached is not None:
-            return cached
+        base = get_url(request).rsplit("/", 1)[0]
+        primary_fmt = cfg.supported_formats[0] if cfg.supported_formats else "b3dm"
+        template = f"{base}/tiles/{{tile_id}}.{primary_fmt}"
+        return await self._build_tileset_cached(catalog_id, collection_id, template, cfg)
 
+    @staticmethod
+    @cached(
+        maxsize=256,
+        ttl=3600,
+        namespace="volumes_tileset",
+        distributed=True,
+    )
+    async def _build_tileset_cached(
+        catalog_id: str,
+        collection_id: str,
+        template: str,
+        cfg: VolumesConfig,
+    ) -> Dict[str, Any]:
         bounds_source: BoundsSourceProtocol = (
             get_protocol(BoundsSourceProtocol) or EmptyBoundsSource()
         )
         try:
             bounds = list(await bounds_source.get_bounds(catalog_id, collection_id))
         except Exception as exc:
-            # A collection without a geometries sidecar (e.g. an external 3D
-            # Tiles reference or a non-CityJSON collection) makes the bounds
-            # query fail; serve an empty tileset rather than a 500.
             logger.warning(
                 "volumes: bounds lookup failed for %s/%s (%s); serving empty tileset",
                 catalog_id, collection_id, exc,
             )
             bounds = []
 
-        # get_url honors FORCE_HTTPS so the b3dm content.uri matches the page
-        # scheme (https) behind the inner load balancer; otherwise the browser
-        # blocks the tile as mixed content and only the bounding box renders.
-        base = get_url(request).rsplit("/", 1)[0]
-        primary_fmt = cfg.supported_formats[0] if cfg.supported_formats else "b3dm"
-        template = f"{base}/tiles/{{tile_id}}.{primary_fmt}"
-
-        tileset = build_tileset(bounds, cfg, content_uri_template=template)
-        _cache_set(catalog_id, collection_id, tileset, cfg.on_demand_cache_ttl_s)
-        return tileset
+        return build_tileset(bounds, cfg, content_uri_template=template)
 
     async def _resolve_tile(
         self,

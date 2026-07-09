@@ -73,7 +73,7 @@ Quick reference
         print(r.ref_type, r.ref_id, "blocking:", not r.cascade_delete)
 """
 
-from typing import Protocol, Optional, List, runtime_checkable, TYPE_CHECKING
+from typing import Any, Protocol, Optional, List, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dynastore.modules.catalog.asset_service import (
@@ -105,6 +105,7 @@ class AssetsProtocol(Protocol):
         asset_id: str,
         catalog_id: str,
         collection_id: Optional[str] = None,
+        ctx: Optional["DriverContext"] = None,
     ) -> Optional["Asset"]:
         """
         Retrieves an asset by ID.
@@ -113,6 +114,12 @@ class AssetsProtocol(Protocol):
             asset_id: The asset ID to retrieve.
             catalog_id: The catalog ID containing the asset.
             collection_id: Optional collection ID for scoping.
+            ctx: Optional driver context — pass a caller-owned transactional
+                resource (e.g. ``DriverContext(db_resource=engine)``) so the
+                read rides the same connection as surrounding writes instead
+                of the service's own cached read path. Mirrors ``create_asset``'s
+                ``ctx`` parameter; intra-module callers may still use the
+                ``db_resource`` kwarg directly on the SQL-backed implementation.
 
         Returns:
             Asset model instance, or ``None`` if not found.
@@ -308,6 +315,7 @@ class AssetsProtocol(Protocol):
         offset: int = 0,
         collection_id: Optional[str] = None,
         all_collections: bool = False,
+        db_resource: Optional[Any] = None,
     ) -> List["Asset"]:
         """
         Searches for assets using a list of filters.
@@ -324,6 +332,9 @@ class AssetsProtocol(Protocol):
                 across all collections and the catalog tier; ``collection_id``
                 is ignored. When False (default), ``collection_id=None`` scopes
                 to catalog-tier assets only.
+            db_resource: Optional transactional resource (engine/connection)
+                for callers that already hold one open (mirrors the intra-module
+                ``db_resource`` kwarg on ``get_asset``/``create_asset``).
 
         Returns:
             List of matching Asset model instances.

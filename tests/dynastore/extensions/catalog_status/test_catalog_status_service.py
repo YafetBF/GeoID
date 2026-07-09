@@ -28,7 +28,8 @@ Covers:
 - Visibility 404 when resolve_catalog_listing_ids returns a frozenset NOT
   containing the catalog; None (IAM off) → unfiltered.
 - Collection status visibility 404 likewise.
-- Reprovision enqueues a gcp_provision_catalog task and returns 202 shape.
+- Reprovision enqueues the unified catalog_provision task (keyed on the
+  physical id) and returns 202 shape; empty checklist → noop.
 - Dead-letter list and requeue call the maintenance primitives with the
   resolved tenant schema.
 - Policies shape: catalog_status_admin gates mutation paths with
@@ -245,6 +246,12 @@ async def test_reprovision_catalog_enqueues_task():
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    # #2395: reprovision resolves the physical schema id and resets the
+    # to-be-rerun checklist steps before enqueuing the unified executor.
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys")
+    catalogs_mock.reset_checklist_for_reprovision = AsyncMock(
+        return_value={"gcp_eventing": "pending"}
+    )
 
     db_mock = SimpleNamespace(engine=MagicMock())
 
@@ -283,9 +290,62 @@ async def test_reprovision_catalog_enqueues_task():
         result = await handler("test-cat")
 
     create_task_mock.assert_awaited_once()
+    # Drives the unified executor (not the legacy gcp_provision_catalog) and
+    # keys it on the physical schema id, never the external id on the wire.
+    kwargs = create_task_mock.await_args.kwargs
+    assert kwargs["task_data"].task_type == "catalog_provision"
+    assert kwargs["task_data"].inputs["catalog_id"] == "c_phys"
+    assert kwargs["task_data"].inputs["operation"] == "provision"
+    assert kwargs["catalog_id"] == "c_phys"
+    catalogs_mock.reset_checklist_for_reprovision.assert_awaited_once()
     assert result["status"] == "queued"
-    assert result["catalog_id"] == "test-cat"
+    assert result["catalog_id"] == "test-cat"  # external id echoed back
+    assert result["provisioning_status"] == "provisioning"
     assert result["task_id"] == str(fake_task_id)
+
+
+async def test_reprovision_noop_when_no_active_provisioners():
+    """An empty checklist (on-prem / no provisioners) returns a noop without
+    enqueuing a task."""
+    fake_cat = _fake_catalog()
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys")
+    catalogs_mock.reset_checklist_for_reprovision = AsyncMock(return_value={})
+
+    db_mock = SimpleNamespace(engine=MagicMock())
+    create_task_mock = AsyncMock()
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return db_mock
+        return None
+
+    fake_tm = MagicMock()
+    fake_tm.create_task_for_catalog = create_task_mock
+
+    from dynastore.extensions.catalog_status.catalog_status_service import CatalogStatusService
+    handler = None
+    for route in CatalogStatusService.router.routes:
+        if "reprovision" in getattr(route, "path", ""):
+            handler = route.endpoint
+            break
+    assert handler is not None
+
+    with (
+        patch(_GET_PROTOCOL, side_effect=_proto),
+        patch("dynastore.modules.tasks.tasks_module", fake_tm),
+    ):
+        result = await handler("test-cat")
+
+    create_task_mock.assert_not_awaited()
+    assert result["status"] == "noop"
+    assert result["catalog_id"] == "test-cat"
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +410,256 @@ def test_catalog_status_read_bound_to_universal_base_role():
         f"(== {cfg.anonymous_role_name!r}), the universal base role every member "
         "carries; binding to a non-existent role name would reach no one"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. provisioning_checklist surfaced in CatalogStatusView
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_status_view_includes_provisioning_checklist_field():
+    """CatalogStatusView must declare a provisioning_checklist field that
+    defaults to an empty dict and accepts a string-to-string mapping."""
+    from dynastore.extensions.catalog_status.catalog_status_models import CatalogStatusView
+
+    # Default: empty dict when no checklist is present.
+    view_no_checklist = CatalogStatusView(
+        external_id="cat-1",
+        provisioning_status="ready",
+    )
+    assert view_no_checklist.provisioning_checklist == {}
+
+    # Populated: degraded eventing is visible to the operator.
+    view_with_checklist = CatalogStatusView(
+        external_id="cat-1",
+        provisioning_status="ready",
+        provisioning_checklist={"gcp_bucket": "complete", "gcp_eventing": "degraded"},
+    )
+    assert view_with_checklist.provisioning_checklist == {
+        "gcp_bucket": "complete",
+        "gcp_eventing": "degraded",
+    }
+
+
+def _get_catalog_status_handler():
+    from dynastore.extensions.catalog_status.catalog_status_service import CatalogStatusService
+    for route in CatalogStatusService.router.routes:
+        if getattr(route, "name", "") == "get_catalog_status":
+            return route.endpoint
+    raise AssertionError("get_catalog_status route not found")
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_populates_provisioning_checklist():
+    """get_catalog_status must read provisioning_checklist via the protocol
+    getter using the resolved physical id (not the external id from the URL
+    path) and forward it into the CatalogStatusView response."""
+    checklist = {"gcp_bucket": "complete", "gcp_eventing": "degraded"}
+    external_id = "cat-checklist"
+    physical_id = "c_phys_checklist"
+    fake_cat = SimpleNamespace(id=physical_id, provisioning_status="ready")
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    # resolve_physical_schema returns a physical id distinct from the external id.
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=physical_id)
+    # The service calls get_provisioning_checklist keyed on the physical id.
+    catalogs_mock.get_provisioning_checklist = AsyncMock(return_value=checklist)
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return None
+        return None
+
+    handler = _get_catalog_status_handler()
+
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+    ):
+        result = await handler(external_id)
+
+    # Must be called with the physical id, not the external id from the URL.
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with(physical_id)
+    assert result.provisioning_checklist == checklist
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_checklist_empty_when_getter_returns_empty():
+    """When get_provisioning_checklist returns {} (no checklist in PG),
+    the response must include an empty dict — not crash."""
+    fake_cat = SimpleNamespace(id="c_phys_old", provisioning_status="ready")
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys_old")
+    catalogs_mock.get_provisioning_checklist = AsyncMock(return_value={})
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return None
+        return None
+
+    handler = _get_catalog_status_handler()
+
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+    ):
+        result = await handler("cat-old")
+
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with("c_phys_old")
+    assert result.provisioning_checklist == {}
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_checklist_empty_on_getter_error():
+    """When get_provisioning_checklist raises (e.g. DB unavailable), the
+    endpoint must not 500 — it returns an empty checklist and logs a warning."""
+    fake_cat = SimpleNamespace(id="c_phys_err", provisioning_status="ready")
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    # physical_schema is non-None so the getter is actually invoked.
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="c_phys_err")
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        side_effect=RuntimeError("DB unavailable")
+    )
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return None
+        return None
+
+    handler = _get_catalog_status_handler()
+
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+    ):
+        result = await handler("cat-err")
+
+    # Getter was called with the physical id; error degrades gracefully to empty.
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with("c_phys_err")
+    assert result.provisioning_checklist == {}
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_checklist_uses_physical_id_not_external_id():
+    """When external_id differs from physical_id, get_provisioning_checklist
+    must be called with the physical_id (from resolve_physical_schema), not
+    the external_id from the URL path.  This guards the regression where
+    passing the external id to the query (WHERE id = :id on the physical pk)
+    silently matched nothing and returned {}."""
+    external_id = "my-catalog-external"
+    physical_id = "c_abc123physical"
+    checklist = {"catalog_core": "complete", "gcp_bucket": "complete"}
+
+    fake_cat = SimpleNamespace(id=physical_id, provisioning_status="ready")
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value=physical_id)
+    catalogs_mock.get_provisioning_checklist = AsyncMock(return_value=checklist)
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return None
+        return None
+
+    handler = _get_catalog_status_handler()
+
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+    ):
+        result = await handler(external_id)
+
+    # The physical id and external id must differ for this test to be meaningful.
+    assert physical_id != external_id
+    # Getter must be called with the physical id, not the external id.
+    catalogs_mock.get_provisioning_checklist.assert_awaited_once_with(physical_id)
+    assert result.provisioning_checklist == checklist
+
+
+@pytest.mark.asyncio
+async def test_get_catalog_status_surfaces_catalog_provision_task():
+    """A task of type 'catalog_provision' (the current type used by create_catalog
+    since #2329) must appear in the CatalogStatusView task field."""
+    import contextlib
+    from datetime import datetime
+
+    fake_cat = SimpleNamespace(id="cat-prov", provisioning_status="provisioning")
+    fake_tid = uuid.uuid4()
+    fake_task = SimpleNamespace(
+        jobID=fake_tid,
+        task_type="catalog_provision",
+        status=SimpleNamespace(value="ACTIVE"),
+        error_message=None,
+        retry_count=0,
+        max_retries=3,
+        timestamp=datetime(2026, 1, 1),
+        finished_at=None,
+    )
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=fake_cat)
+    catalogs_mock.resolve_physical_schema = AsyncMock(return_value="tenant_schema")
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"catalog_core": "complete"}
+    )
+
+    db_mock = SimpleNamespace(engine=MagicMock())
+
+    def _proto(proto):
+        from dynastore.models.protocols.catalogs import CatalogsProtocol
+        from dynastore.models.protocols import DatabaseProtocol
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is DatabaseProtocol:
+            return db_mock
+        return None
+
+    fake_tm = MagicMock()
+    fake_tm.list_tasks = AsyncMock(return_value=[fake_task])
+
+    @contextlib.asynccontextmanager
+    async def _noop_tx(engine):
+        yield MagicMock()
+
+    handler = _get_catalog_status_handler()
+
+    # managed_transaction is imported inside the handler body; patch it where
+    # the module looks it up (the query_executor module), not on catalog_status_service.
+    with (
+        patch(_RESOLVE_CATALOG, AsyncMock(return_value=None)),
+        patch(_GET_PROTOCOL, side_effect=_proto),
+        patch("dynastore.modules.tasks.tasks_module", fake_tm),
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+            _noop_tx,
+        ),
+    ):
+        result = await handler("cat-prov")
+
+    assert result.task is not None, "task must not be None for catalog_provision tasks"
+    assert str(result.task.task_id) == str(fake_tid)
+    assert result.provisioning_checklist == {"catalog_core": "complete"}
 
 
 def test_catalog_status_role_bindings_admin_mutation():

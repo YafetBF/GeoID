@@ -41,6 +41,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from dynastore.tools.db import qualify_table
+
 logger = logging.getLogger(__name__)
 
 # Default similarity threshold for the ``%`` operator. pg_trgm's session
@@ -87,8 +89,8 @@ def build_similarity_query(
         f"SELECT {code_expr} AS id, "
         f"{label_expr} AS name, "
         f"similarity({label_expr}, :q) AS score "
-        f'FROM "{schema}"."{table}" h '
-        f'JOIN "{schema}"."{attr_table}" s ON h.geoid = s.geoid '
+        f"FROM {qualify_table(schema, table)} h "
+        f"JOIN {qualify_table(schema, attr_table)} s ON h.geoid = s.geoid "
         f"WHERE h.deleted_at IS NULL "
         f"AND {label_expr} IS NOT NULL "
         f"AND {label_expr} % :q "
@@ -113,7 +115,7 @@ def build_index_ddl(schema: str, table: str, *, label_key: str = LABEL_KEY) -> s
     expr = f"((attributes->>'{label_key}'))"
     return (
         f'CREATE INDEX IF NOT EXISTS "{index_name}" '
-        f'ON "{schema}"."{attr_table}" '
+        f"ON {qualify_table(schema, attr_table)} "
         f"USING gin ({expr} gin_trgm_ops);"
     )
 
@@ -238,8 +240,16 @@ async def search_similar(
 
     sql, _ = build_similarity_query(schema, table)
 
+    # The GIN trigram index is provisioned at materialization time
+    # (``dimensions_extension.materialize_dimension``), not here: this
+    # function backs the public GET similarity search endpoint, and running
+    # `CREATE INDEX` DDL inline on that read path took a lock on the shared
+    # attributes sidecar table on every search request (#2831). ``%`` and
+    # ``similarity()`` do not require the index to produce correct results —
+    # a dimension materialized before this provisioning existed just runs an
+    # unindexed (slower) sequential scan until its next materialization run
+    # backfills the index.
     async with managed_transaction(engine) as conn:
-        await ensure_similarity_index(conn, schema, table)
         rows = await GeoDQLQuery(
             sql, result_handler=ResultHandler.ALL_DICTS,
         ).execute(conn, q=q, threshold=threshold, limit=limit)

@@ -16,7 +16,8 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""GdalOsgeoReader — primary reader, uses system libgdal via ``osgeo.ogr``.
+"""GdalOsgeoReader — broad-coverage fallback reader, uses system libgdal
+via ``osgeo.ogr``.
 
 Why this exists: PyPI GDAL wheels (``pyogrio``, like ``fiona`` before
 it) ship a bundled libgdal that omits the Arrow/Parquet driver.
@@ -25,6 +26,13 @@ comes with the
 ``ghcr.io/osgeo/gdal:ubuntu-full-3.13.0`` base image), which DOES
 include Parquet, FlatGeobuf, OpenFileGDB, …  Same osgeo binding the
 maps service uses successfully.
+
+Registered at ``priority=100`` — behind :class:`PyogrioReader`
+(``priority=10``) — because this reader iterates one OGR feature at a
+time via the Python API, which is far slower than pyogrio's vectorized
+chunked reads on the formats pyogrio also supports (GeoID #2964). It
+remains the reader of record for every format pyogrio's PyPI wheel
+doesn't declare (Parquet, FlatGeobuf, OpenFileGDB, KML, GML, MapInfo, …).
 
 Hard-imports ``osgeo`` at module load — when SCOPE excludes
 ``module_gdal`` the import fails and :class:`ReaderRegistry` skips
@@ -35,9 +43,13 @@ codebase).
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
 import logging
-from typing import Any, ClassVar, Iterable, Iterator, Tuple
+import os
+import shutil
+import zipfile
+from typing import Any, ClassVar, Generator, Iterable, Iterator, Tuple
 
 # Hard-import gates registration.  When module_gdal isn't installed
 # (most worker scopes), the ImportError prevents this module's
@@ -56,6 +68,28 @@ ogr.UseExceptions()
 gdal.UseExceptions()
 
 
+# Rows discarded between heartbeat log lines while skipping to an ingestion
+# resume ``offset`` on a layer that has no fast native seek (GeoID #2958) —
+# frequent enough to prove the skip phase is progressing, rare enough not
+# to flood logs on a multi-million-row resume.
+_OFFSET_SKIP_HEARTBEAT_INTERVAL = 50_000
+
+
+def _resolve_temp_dir():
+    """Return the registered ``TempDirProtocol`` implementation.
+
+    Falls back to ``DefaultTempDir`` when no implementation is registered so
+    the reader works out of the box on plain local disk and on-premise deployments.
+    """
+    try:
+        from dynastore.tools.protocol_helpers import resolve
+        from dynastore.models.protocols.temp_dir import TempDirProtocol
+        return resolve(TempDirProtocol)
+    except Exception:  # noqa: BLE001 — protocol is optional
+        from dynastore.models.protocols.temp_dir import DefaultTempDir
+        return DefaultTempDir()
+
+
 class GdalOsgeoReader(SourceReaderProtocol):
     """Universal reader backed by system libgdal.
 
@@ -66,14 +100,22 @@ class GdalOsgeoReader(SourceReaderProtocol):
     """
 
     reader_id: ClassVar[str] = "gdal_osgeo"
-    priority: ClassVar[int] = 10
+    priority: ClassVar[int] = 100
+
+    # Offset resume (GeoID #2958) is handled inside ``open()``/``_iter_features``
+    # via OGR's ``SetNextByIndex`` (native, O(1) for drivers advertising
+    # ``OLCFastSetNextByIndex`` — GeoPackage/SQLite among them) with a
+    # heartbeat-logged discard-iterate fallback for drivers that don't.
+    supports_offset_seek: ClassVar[bool] = True
 
     # Empty extension tuple means "match anything" — see can_read override.
     extensions: ClassVar[Tuple[str, ...]] = ()
 
-    # Drivers we explicitly know GDAL can open from /vsigs/ + a small
-    # extension hint set so the registry's *priority* ordering still
-    # picks us over the pyogrio fallback reader for common formats.
+    # Drivers we explicitly know GDAL can open from /vsigs/. For any
+    # extension PyogrioReader also declares (priority=10), pyogrio wins
+    # and this reader is only reached as its fallback; for everything
+    # else in this list (Parquet, FlatGeobuf, KML, GML, MapInfo, …) this
+    # is the sole/first match.
     KNOWN_EXT: ClassVar[Tuple[str, ...]] = (
         ".parquet", ".geoparquet",
         ".fgb",
@@ -114,7 +156,9 @@ class GdalOsgeoReader(SourceReaderProtocol):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _to_gdal_uri(uri: str, *, is_zip: bool | None = None) -> str:
+    def _to_gdal_uri(
+        uri: str, *, is_zip: bool | None = None, use_vsicache: bool = False,
+    ) -> str:
         """Normalize the URI for GDAL.  Translates ``gs://`` and wraps
         zipped shapefiles with ``/vsizip/`` when needed.
 
@@ -122,6 +166,11 @@ class GdalOsgeoReader(SourceReaderProtocol):
         URI itself lacks the ``.zip`` suffix (e.g. an asset uploaded
         with a bare filename, where the caller knows the content_type
         is ``application/zip``).
+
+        *use_vsicache* wraps the non-zip path with GDAL's ``/vsicached/``
+        local block-cache VSI (see ``_to_vsigs``) — not applied to the zip
+        branch since archives are already staged to local disk before
+        feature iteration (see ``_extract_archive_to_local``).
 
         When the underlying object's path lacks a recognised archive
         extension we use GDAL's curly-brace notation
@@ -133,7 +182,7 @@ class GdalOsgeoReader(SourceReaderProtocol):
         if is_zip is None:
             is_zip = out.lower().endswith(".zip")
         if not is_zip:
-            return out
+            return _to_vsigs(uri, use_vsicache=use_vsicache) if use_vsicache else out
         # GDAL autodetects the archive boundary on these extensions.
         if out.lower().endswith((".zip", ".kmz", ".ods", ".xlsx")):
             return "/vsizip/" + out
@@ -171,16 +220,45 @@ class GdalOsgeoReader(SourceReaderProtocol):
         *,
         encoding: str = "utf-8",
         content_type: str | None = None,
+        offset: int = 0,
         **opts: Any,
-    ) -> Iterator[Iterable[dict]]:
+    ) -> Generator[Iterable[dict], None, None]:
         from dynastore.tools.mime import ext_from_content_type
+        use_vsicache = bool(opts.get("use_vsicache", False))
         is_zip = (ext_from_content_type(content_type) or "").lower() == ".zip"
-        path = self._to_gdal_uri(uri, is_zip=is_zip or None)
+        if is_zip is None or not is_zip:
+            is_zip = _to_vsigs(uri).lower().endswith(".zip")
+
         # OGR doesn't honour `encoding=` directly — set via config option.
         # Most modern drivers (Parquet, FGB, GeoJSON, GPKG) are UTF-8 by
         # spec; this only matters for shapefile dbf / CSV.
         prev_enc = gdal.GetConfigOption("SHAPE_ENCODING")
         gdal.SetConfigOption("SHAPE_ENCODING", encoding.upper())
+        try:
+            # A zipped shapefile read in-place over ``/vsizip//vsigs/`` forces
+            # GDAL to decompress the archive member into memory and keep it
+            # resident for the random access the .shx index drives — so reading
+            # a large layer grows RSS with the read progress and OOMs the worker
+            # mid-stream. Instead extract the archive ONCE to the local temp
+            # disk, so feature iteration does bounded range reads.
+            if is_zip:
+                task_id: str | None = opts.get("task_id")
+                task_schema: str | None = opts.get("task_schema")
+                with self._extract_archive_to_local(
+                    uri, task_id=task_id, task_schema=task_schema
+                ) as local_dir:
+                    path = self._find_local_dataset(local_dir)
+                    yield from self._open_path_and_iter(path, offset=offset)
+            else:
+                path = self._to_gdal_uri(uri, is_zip=False, use_vsicache=use_vsicache)
+                yield from self._open_path_and_iter(path, offset=offset)
+        finally:
+            if prev_enc is None:
+                gdal.SetConfigOption("SHAPE_ENCODING", "")
+            else:
+                gdal.SetConfigOption("SHAPE_ENCODING", prev_enc)
+
+    def _open_path_and_iter(self, path: str, *, offset: int = 0) -> Iterator[Iterable[dict]]:
         ds = ogr.Open(path)
         if ds is None:
             raise RuntimeError(
@@ -193,28 +271,211 @@ class GdalOsgeoReader(SourceReaderProtocol):
                 "GdalOsgeoReader: opened %r via driver=%s, layers=%d",
                 path, ds.GetDriver().GetName(), ds.GetLayerCount(),
             )
-            yield self._iter_features(ds)
+            yield self._iter_features(ds, offset=offset)
         finally:
             ds = None  # noqa: F841 — release the dataset / file handle
-            if prev_enc is None:
-                gdal.SetConfigOption("SHAPE_ENCODING", "")
-            else:
-                gdal.SetConfigOption("SHAPE_ENCODING", prev_enc)
+
+    @contextlib.contextmanager
+    def _extract_archive_to_local(
+        self,
+        uri: str,
+        *,
+        task_id: str | None = None,
+        task_schema: str | None = None,
+    ) -> Generator[str, None, None]:
+        """Stream a (possibly remote) zip archive to the local temp disk and
+        extract it, yielding the extraction directory.
+
+        The scratch directory is allocated via ``TempDirProtocol.mkdtemp()``
+        so the root and the naming convention are controlled by the deployment
+        (GCSFuse mount, NFS share, or plain local disk on-premise).  The
+        protocol's ``TASK_DIR_PREFIX`` ensures the reaper can glob all task
+        scratch dirs regardless of which task type created them.
+
+        A ``.owner`` JSON sidecar is written immediately after the directory
+        is created so a liveness-aware reaper can decide whether to reclaim
+        an abandoned directory.  The directory is always cleaned up on exit.
+        """
+        src = _to_vsigs(uri)
+        tmp_provider = _resolve_temp_dir()
+        work_dir = tmp_provider.mkdtemp(task_id=task_id, task_schema=task_schema)
+        try:
+            # Write the owner sidecar before any heavy I/O so an OOM mid-copy
+            # still leaves an attributable directory for the reaper.
+            try:
+                owner_path = os.path.join(work_dir, ".owner")
+                with open(owner_path, "w") as _f:
+                    json.dump({"task_id": task_id, "schema": task_schema}, _f)
+            except Exception:  # noqa: BLE001
+                pass  # sidecar is best-effort; extraction must not fail here
+
+            local_zip = os.path.join(work_dir, "source.zip")
+            self._vsi_copy(src, local_zip)
+            extract_dir = os.path.join(work_dir, "extracted")
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(local_zip) as zf:
+                self._safe_extractall(zf, extract_dir)
+            # The archive copy is no longer needed once expanded — drop it so it
+            # does not occupy the temp volume during the (long) read.
+            try:
+                os.remove(local_zip)
+            except OSError:
+                pass
+            logger.info(
+                "GdalOsgeoReader: extracted %r → %s (in-memory /vsizip avoided)",
+                src, extract_dir,
+            )
+            yield extract_dir
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     @staticmethod
-    def _iter_features(ds: Any) -> Iterator[dict]:
+    def _safe_extractall(zf: zipfile.ZipFile, dest: str) -> None:
+        """Extract every member of *zf* into *dest*, rejecting any entry whose
+        path would escape *dest* (Zip-Slip / path traversal). Source archives
+        are operator/uploaded content, so a crafted ``../`` member must not be
+        allowed to write outside the extraction directory.
+        """
+        dest_abs = os.path.abspath(dest)
+        for member in zf.infolist():
+            target = os.path.abspath(os.path.join(dest, member.filename))
+            if target != dest_abs and not target.startswith(dest_abs + os.sep):
+                raise RuntimeError(
+                    "GdalOsgeoReader: refusing archive entry that escapes the "
+                    f"extraction directory (possible Zip-Slip): {member.filename!r}"
+                )
+        zf.extractall(dest)
+
+    @staticmethod
+    def _vsi_copy(src_vsi: str, dst_path: str, chunk: int = 8 * 1024 * 1024) -> None:
+        """Copy a GDAL-VSI-readable source to a local path in bounded chunks."""
+        fh = gdal.VSIFOpenL(src_vsi, "rb")
+        if fh is None:
+            raise RuntimeError(
+                f"GdalOsgeoReader: cannot open source {src_vsi!r} to stage locally."
+            )
+        try:
+            with open(dst_path, "wb") as out:
+                while True:
+                    buf = gdal.VSIFReadL(1, chunk, fh)
+                    if not buf:
+                        break
+                    out.write(buf)
+        finally:
+            gdal.VSIFCloseL(fh)
+
+    @staticmethod
+    def _find_local_dataset(extract_dir: str) -> str:
+        """Locate the openable vector dataset inside an extracted archive.
+
+        Prefers an explicit geospatial file (shapefile first — the common
+        archived format), searching nested directories. Falls back to the
+        directory itself so OGR's shapefile driver can introspect it.
+        """
+        for pat in (
+            "*.shp", "*.gpkg", "*.geojson", "*.json",
+            "*.fgb", "*.gml", "*.tab", "*.gdb",
+        ):
+            hits = sorted(
+                glob.glob(os.path.join(extract_dir, "**", pat), recursive=True)
+            )
+            if hits:
+                return hits[0]
+        return extract_dir
+
+    @staticmethod
+    def _skip_layer_to_offset(layer: Any, remaining: int) -> int:
+        """Advance *layer* (already ``ResetReading()``-ed) past its first
+        *remaining* features, honoring an ingestion resume ``offset``
+        (GeoID #2958). Returns the rows still left to skip afterwards
+        (only >0 when *remaining* exceeds this layer's total feature
+        count, so the caller can carry the surplus into the next layer of
+        a multi-layer dataset).
+
+        Prefers a native ``SetNextByIndex`` seek — O(1) for drivers that
+        report ``OLCFastSetNextByIndex`` (GeoPackage/SQLite among them) —
+        used only once *remaining* is confirmed to land inside this layer
+        (a known, non-negative ``GetFeatureCount()``). Otherwise falls
+        back to a manual discard-iterate loop with a periodic heartbeat
+        log, so a slow skip is still visible instead of going completely
+        silent for the whole resume.
+        """
+        try:
+            feature_count = layer.GetFeatureCount()
+        except Exception:  # noqa: BLE001 — treat as unknown, use the safe path
+            feature_count = -1
+
+        if feature_count is not None and feature_count >= 0:
+            if remaining >= feature_count:
+                # The whole layer sits inside the already-ingested range —
+                # skip it without touching a single feature.
+                return remaining - feature_count
+            try:
+                if layer.TestCapability(ogr.OLCFastSetNextByIndex):
+                    layer.SetNextByIndex(remaining)
+                    logger.info(
+                        "GdalOsgeoReader: offset resume — native seek to row "
+                        "%d of %d (layer=%s, OLCFastSetNextByIndex)",
+                        remaining, feature_count, layer.GetName(),
+                    )
+                    return 0
+            except Exception:  # noqa: BLE001 — fall through to discard-iterate
+                logger.warning(
+                    "GdalOsgeoReader: native SetNextByIndex(%d) failed on "
+                    "layer=%s; falling back to discard-iterate",
+                    remaining, layer.GetName(),
+                )
+                layer.ResetReading()
+
+        # Deliberately NOT ``for _feat in layer:`` — OGR's ``Layer.__iter__``
+        # calls ``ResetReading()`` on every fresh ``for`` loop, which would
+        # silently rewind a subsequent read back to feature 0. Driving
+        # ``GetNextFeature()`` by hand here keeps the cursor exactly where
+        # this discard loop leaves it for the caller's own read loop.
+        skipped = 0
+        while skipped < remaining:
+            feat = layer.GetNextFeature()
+            if feat is None:
+                break
+            skipped += 1
+            if skipped % _OFFSET_SKIP_HEARTBEAT_INTERVAL == 0:
+                logger.info(
+                    "GdalOsgeoReader: offset resume — skipped %d/%d rows so "
+                    "far (layer=%s, no fast native seek)",
+                    skipped, remaining, layer.GetName(),
+                )
+        return max(0, remaining - skipped)
+
+    @staticmethod
+    def _iter_features(ds: Any, *, offset: int = 0) -> Iterator[dict]:
+        remaining_skip = offset
         for li in range(ds.GetLayerCount()):
             layer = ds.GetLayer(li)
             if layer is None:
                 continue
             layer.ResetReading()
+            if remaining_skip > 0:
+                remaining_skip = GdalOsgeoReader._skip_layer_to_offset(
+                    layer, remaining_skip,
+                )
+                if remaining_skip > 0:
+                    # Offset extends past this whole layer — nothing to
+                    # yield here, carry the remainder to the next layer.
+                    continue
             field_names = [
                 layer.GetLayerDefn().GetFieldDefn(i).GetName()
                 for i in range(layer.GetLayerDefn().GetFieldCount())
             ]
-            for feat in layer:
+            # Deliberately NOT ``for feat in layer:`` — OGR's
+            # ``Layer.__iter__`` calls ``ResetReading()`` on every fresh
+            # ``for`` loop, which would silently rewind an offset-seeked
+            # cursor back to feature 0 (GeoID #2958). ``GetNextFeature()``
+            # driven by hand continues from wherever ``_skip_layer_to_offset``
+            # (native seek or discard-iterate) left the cursor.
+            while True:
+                feat = layer.GetNextFeature()
                 if feat is None:
-                    continue
+                    break
                 props: dict = {}
                 for fname in field_names:
                     try:
@@ -233,17 +494,30 @@ class GdalOsgeoReader(SourceReaderProtocol):
                         geom_wkb = bytes(geom.ExportToWkb())
                     except Exception:  # noqa: BLE001 — feature still yields; caller decides
                         pass
+                # Stable per-row identity fallback (#2709): the OGR feature id
+                # is deterministic across re-reads of the SAME unmodified
+                # source (row order on disk), so surfacing it as the GeoJSON
+                # top-level "id" lets a re-run converge instead of appending a
+                # duplicate copy when no column_mapping.external_id is
+                # configured. -1 means "no FID" (some drivers never assign
+                # one) — left out entirely so downstream identity resolution
+                # falls through to its next fallback rather than colliding
+                # every FID-less feature onto the same id.
+                fid = feat.GetFID()
                 # Emit the GeoJSON Feature record shape (`{"properties": …,
                 # "geometry": …}`) so call sites that deconstruct reader
                 # records don't need to branch per reader.  Add ``geometry_wkb``
                 # as a convenience so column_mapping=geometry_wkb just
                 # works for STAC items.
-                yield {
+                record: dict = {
                     "type": "Feature",
                     "properties": props,
                     "geometry": geom_geojson,
                     "geometry_wkb": geom_wkb,
                 }
+                if fid is not None and fid >= 0:
+                    record["id"] = fid
+                yield record
 
 
 register_reader(GdalOsgeoReader)

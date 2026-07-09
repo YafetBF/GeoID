@@ -380,6 +380,41 @@ class CountingCacheBackend(CacheBackend, Protocol):
         ...
 
 
+@runtime_checkable
+class ListCacheBackend(CacheBackend, Protocol):
+    """For backends supporting list primitives (Redis/Valkey RPUSH/LPOP/LTRIM).
+
+    Rides on the same shared client every other Valkey-backed capability in
+    this codebase uses (:class:`CountingCacheBackend` is the sibling
+    pattern) — no parallel connection. Used by the log producer/drainer
+    (#2833) to buffer a bounded FIFO across pods instead of every pod
+    dispatching to the log backend(s) directly.
+    """
+
+    async def rpush_trimmed(
+        self,
+        key: str,
+        values: List[bytes],
+        *,
+        max_len: int,
+    ) -> int:
+        """Push ``values`` onto the tail of the list, then trim to ``max_len``.
+
+        Drop-oldest posture: if the push grows the list past ``max_len``,
+        the oldest entries are trimmed away. Returns the number of entries
+        dropped by the trim (``0`` if the list stayed within bound).
+        """
+        ...
+
+    async def lpop_many(self, key: str, count: int) -> List[bytes]:
+        """Pop up to ``count`` entries from the head of the list (FIFO order).
+
+        Returns fewer than ``count`` (or an empty list) once the list is
+        shorter than requested.
+        """
+        ...
+
+
 # ---------------------------------------------------------------------------
 #  High-level Cache protocol (typed values, for application code)
 # ---------------------------------------------------------------------------
@@ -442,12 +477,17 @@ class Cache(Protocol):
         *,
         ttl: Optional[Union[timedelta, float]] = None,
         namespace: Optional[str] = None,
+        stale_grace: Optional[Union[timedelta, float]] = None,
     ) -> Any:
         """Stampede-safe get-or-create.
 
         If the key exists, return cached value.  Otherwise, acquire a lock,
         call ``factory()`` exactly once, cache the result, and return it.
         Other concurrent callers wait for the result.
+
+        The slow path (lock wait + ``factory()``) is bounded; on timeout or
+        a ``factory()`` exception, a value still within ``stale_grace`` of
+        its logical TTL is served instead of propagating (#2902).
 
         Inspired by dogpile ``get_or_create``, .NET ``GetOrCreate``,
         and cashews ``get_or_set``.

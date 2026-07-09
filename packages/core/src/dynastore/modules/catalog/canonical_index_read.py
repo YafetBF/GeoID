@@ -26,8 +26,9 @@ The result feeds :func:`~dynastore.modules.elasticsearch.canonical_doc.build_can
 at the ES write boundary so the indexed document has the correct canonical
 envelope shape.
 
-Internal seams (_fetch_raw_rows, _resolve_sidecars_for, _get_col_config)
-are kept module-private but importable for test-injection via ``patch``.
+Internal seams (_fetch_raw_rows, _resolve_sidecars_for, _get_col_config,
+_resolve_collection_type) are kept module-private but importable for
+test-injection via ``patch``.
 """
 
 from __future__ import annotations
@@ -37,6 +38,33 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# shapely is an optional dependency elsewhere in this codebase (SCOPE-trimmed
+# deployments may omit it) — guard the same way
+# ``dynastore.tools.geometry_normalize`` does so a missing bbox on a
+# database-free feature (:func:`canonical_input_from_feature`) degrades to
+# ``None`` instead of an ImportError.
+try:
+    from shapely.geometry import shape as _shapely_shape
+
+    _SHAPELY_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only without shapely
+    _SHAPELY_AVAILABLE = False
+
+
+def _bbox_from_geometry(geometry: Optional[Dict[str, Any]]) -> Optional[List[float]]:
+    """Best-effort ``[minx, miny, maxx, maxy]`` bbox from a GeoJSON geometry.
+
+    Returns ``None`` when *geometry* is falsy, unparseable, or shapely is
+    unavailable — callers treat ``None`` as "no bbox available", the same
+    degrade-safe contract the rest of this module uses.
+    """
+    if not geometry or not _SHAPELY_AVAILABLE:
+        return None
+    try:
+        return list(_shapely_shape(geometry).bounds)
+    except Exception:
+        return None
 
 
 def _get_db_engine() -> Optional[Any]:
@@ -146,22 +174,38 @@ async def _get_col_config(
         return None
 
 
-def _resolve_sidecars_for(col_config: Any, catalog_id: str, collection_id: str) -> List[Any]:
+async def _resolve_sidecars_for(col_config: Any, catalog_id: str, collection_id: str) -> List[Any]:
     """Return the ordered list of resolved sidecar instances for a collection.
 
     Uses the same ``_effective_sidecars`` + ``SidecarRegistry.get_sidecar``
     path as :meth:`ItemService.map_row_to_feature` — without running the
     pipeline so we can share the resolved list independently of a Feature.
+
+    #2655: resolves the real ``CollectionInfo.kind`` / ``allow_geometry``
+    (same lookup ``ItemsPostgresqlDriver._get_effective_driver_config`` and
+    ``collection_has_geometry()`` use) so a RECORDS collection's resolved
+    sidecar list correctly omits the geometry sidecar here too, instead of
+    relying on ``_effective_sidecars``'s "VECTOR" fallback default.
     """
     try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.catalog.catalog_config import CollectionInfo
         from dynastore.modules.storage.drivers.pg_sidecars import (
             SidecarRegistry,
             _effective_sidecars,
         )
+        from dynastore.tools.discovery import get_protocol
+
+        configs = get_protocol(ConfigsProtocol)
+        ct = await configs.get_config(
+            CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
+        ) if configs else CollectionInfo()
         sidecar_configs = _effective_sidecars(
             col_config,
             catalog_id=catalog_id,
             collection_id=collection_id,
+            collection_type=ct.kind.value,
+            context={"allow_geometry": ct.allow_geometry},
         )
         resolved: List[Any] = []
         for sc_config in sidecar_configs:
@@ -175,6 +219,36 @@ def _resolve_sidecars_for(col_config: Any, catalog_id: str, collection_id: str) 
             catalog_id, collection_id, exc,
         )
         return []
+
+
+async def _resolve_collection_type(
+    catalog_id: str, collection_id: str,
+) -> tuple[Optional[str], Optional[bool]]:
+    """Resolve ``(CollectionInfo.kind, allow_geometry)`` for a collection.
+
+    #2655: same lookup ``_resolve_sidecars_for`` and
+    ``ItemsPostgresqlDriver._get_effective_driver_config`` already use.
+    Kept separate from ``_resolve_sidecars_for`` (rather than folding the
+    tuple into its return value) so that value's existing ``List[Any]``
+    contract — relied on by test mocks — stays unchanged. ``ConfigsProtocol``
+    caches ``CollectionInfo`` lookups, so this second fetch is cheap.
+    """
+    try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.catalog.catalog_config import CollectionInfo
+        from dynastore.tools.discovery import get_protocol
+
+        configs = get_protocol(ConfigsProtocol)
+        ct = await configs.get_config(
+            CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
+        ) if configs else CollectionInfo()
+        return ct.kind.value, ct.allow_geometry
+    except Exception as exc:
+        logger.warning(
+            "canonical_index_read._resolve_collection_type: %s/%s: %s",
+            catalog_id, collection_id, exc,
+        )
+        return None, None
 
 
 async def _fetch_raw_rows(
@@ -191,94 +265,87 @@ async def _fetch_raw_rows(
     single ``WHERE geoid = ANY(:ids)`` query for the whole batch, avoiding
     N+1 round-trips on ``index_bulk`` calls.
 
-    Rows that are missing (deleted or never written) are simply absent from
-    the returned dict — callers skip those geoids.
+    A geoid absent from the returned dict because the query ran and simply
+    found no matching row (deleted or never written) is the ONLY legitimate
+    "missing" outcome — callers skip those geoids. Anything that prevents the
+    query from running at all (no DB engine, unresolved physical table,
+    connection/mapping errors) is a failure, not an absence, and propagates
+    as an exception (#2731): swallowing it here made every row in the batch
+    look identical to a deleted item, which silently dropped ~5200 items from
+    the ES index on 2026-07-02 when the re-read hit a transient error.
     """
     if not geoids:
         return {}
 
-    try:
-        from sqlalchemy import text as _sa_text
+    from sqlalchemy import text as _sa_text
 
-        from dynastore.modules.catalog.item_service import ItemService
-        from dynastore.modules.db_config.query_executor import managed_transaction
-        from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
-        from dynastore.models.query_builder import FieldSelection, QueryRequest
-        from dynastore.tools.db import validate_sql_identifier
+    from dynastore.modules.catalog.item_service import ItemService
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
+    from dynastore.models.query_builder import FieldSelection, QueryRequest
+    from dynastore.tools.db import validate_sql_identifier
 
-        validate_sql_identifier(catalog_id)
-        validate_sql_identifier(collection_id)
+    validate_sql_identifier(catalog_id)
+    validate_sql_identifier(collection_id)
 
-        item_svc = ItemService()
-        # Resolve the engine to use: prefer the explicitly-passed db_resource,
-        # then the engine on the locally-constructed ItemService (available in
-        # the API process where ItemService is registered with a live pool),
-        # then fall back to the process-wide DatabaseProtocol engine (available
-        # in Cloud Run JOB/worker processes where no ItemService engine is wired).
-        # If none of these yield an engine, managed_transaction raises ValueError
-        # which is caught by the outer except block and returns {} safely.
-        effective_resource = db_resource or item_svc.engine or _get_db_engine()
-        if effective_resource is None:
-            logger.warning(
-                "canonical_index_read._fetch_raw_rows: no DB engine available "
-                "for %s/%s — returning empty result. Ensure DatabaseProtocol is "
-                "registered in this process.",
-                catalog_id, collection_id,
+    item_svc = ItemService()
+    # Resolve the engine to use: prefer the explicitly-passed db_resource,
+    # then the engine on the locally-constructed ItemService (available in
+    # the API process where ItemService is registered with a live pool),
+    # then fall back to the process-wide DatabaseProtocol engine (available
+    # in Cloud Run JOB/worker processes where no ItemService engine is wired).
+    effective_resource = db_resource or item_svc.engine or _get_db_engine()
+    if effective_resource is None:
+        raise RuntimeError(
+            f"canonical_index_read._fetch_raw_rows: no DB engine available for "
+            f"{catalog_id}/{collection_id} — DatabaseProtocol is not registered "
+            f"in this process."
+        )
+    async with managed_transaction(effective_resource) as conn:
+        phys_schema = await item_svc._resolve_physical_schema(
+            catalog_id, db_resource=conn,
+        )
+        phys_table = await item_svc._resolve_physical_table(
+            catalog_id, collection_id, db_resource=conn,
+        )
+        if not phys_schema or not phys_table:
+            raise RuntimeError(
+                f"canonical_index_read._fetch_raw_rows: cannot resolve physical "
+                f"table for {catalog_id}/{collection_id}"
             )
-            return {}
-        async with managed_transaction(effective_resource) as conn:
-            phys_schema = await item_svc._resolve_physical_schema(
-                catalog_id, db_resource=conn,
-            )
-            phys_table = await item_svc._resolve_physical_table(
+
+        if col_config is None:
+            col_config = await item_svc._get_collection_config(
                 catalog_id, collection_id, db_resource=conn,
             )
-            if not phys_schema or not phys_table:
-                logger.warning(
-                    "canonical_index_read: cannot resolve physical table for %s/%s",
-                    catalog_id, collection_id,
-                )
-                return {}
 
-            if col_config is None:
-                col_config = await item_svc._get_collection_config(
-                    catalog_id, collection_id, db_resource=conn,
-                )
-
-            request = QueryRequest(
-                item_ids=[str(g) for g in geoids],
-                limit=len(geoids),
-                select=[FieldSelection(field="*")],
-            )
-            query_ctx: Dict[str, Any] = {
-                "catalog_id": catalog_id,
-                "collection_id": collection_id,
-                "col_config": col_config,
-            }
-            sql, params = await item_svc._apply_query_transformations(
-                request, query_ctx, catalog_id, collection_id, col_config,
-                db_resource=conn, consumer=ConsumerType.GENERIC,
-            )
-            import inspect as _inspect
-
-            result = conn.execute(_sa_text(sql), params or {})
-            if _inspect.isawaitable(result):
-                result = await result
-
-            rows: Dict[str, Dict[str, Any]] = {}
-            for raw in result.mappings():
-                row_dict = dict(raw)
-                geoid = row_dict.get("geoid")
-                if geoid:
-                    rows[str(geoid)] = row_dict
-            return rows
-
-    except Exception as exc:
-        logger.warning(
-            "canonical_index_read._fetch_raw_rows: %s/%s: %s",
-            catalog_id, collection_id, exc,
+        request = QueryRequest(
+            item_ids=[str(g) for g in geoids],
+            limit=len(geoids),
+            select=[FieldSelection(field="*")],
         )
-        return {}
+        query_ctx: Dict[str, Any] = {
+            "catalog_id": catalog_id,
+            "collection_id": collection_id,
+            "col_config": col_config,
+        }
+        sql, params = await item_svc._apply_query_transformations(
+            request, query_ctx, catalog_id, collection_id, col_config,
+            db_resource=conn, consumer=ConsumerType.GENERIC,
+        )
+        import inspect as _inspect
+
+        result = conn.execute(_sa_text(sql), params or {})
+        if _inspect.isawaitable(result):
+            result = await result
+
+        rows: Dict[str, Dict[str, Any]] = {}
+        for raw in result.mappings():
+            row_dict = dict(raw)
+            geoid = row_dict.get("geoid")
+            if geoid:
+                rows[str(geoid)] = row_dict
+        return rows
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +364,11 @@ async def read_canonical_index_inputs(
 
     Returns a dict mapping geoid → :class:`CanonicalIndexInput`.  Geoids
     that are absent in PG (deleted or race) are silently omitted — the
-    caller (ES write boundary) should skip those ops.
+    caller (ES write boundary) should skip those ops. That omission is only
+    ever a legitimate "queried and found nothing" outcome (#2731): any
+    failure to run the underlying query (missing DB engine, unresolved
+    physical table, connection error) raises instead of being folded into
+    the same empty result — see :func:`_fetch_raw_rows`.
 
     No ``ItemsReadPolicy`` is applied: ``id`` in the returned row is always
     the geoid; ``external_id_as_feature_id`` is never flipped; ``expose``
@@ -312,12 +383,18 @@ async def read_canonical_index_inputs(
 
     Returns:
         Dict mapping each found geoid to its :class:`CanonicalIndexInput`.
+
+    Raises:
+        Exception: propagated unchanged when the underlying re-read fails
+            (see :func:`_fetch_raw_rows`) — callers must treat this as
+            "unknown state, retry", never as "rows deleted".
     """
     if not geoids:
         return {}
 
     col_config = await _get_col_config(catalog_id, collection_id, db_resource=db_resource)
-    resolved_sidecars = _resolve_sidecars_for(col_config, catalog_id, collection_id)
+    resolved_sidecars = await _resolve_sidecars_for(col_config, catalog_id, collection_id)
+    collection_type, allow_geometry = await _resolve_collection_type(catalog_id, collection_id)
     raw_rows = await _fetch_raw_rows(
         catalog_id, collection_id, geoids, col_config, db_resource=db_resource,
     )
@@ -326,6 +403,7 @@ async def read_canonical_index_inputs(
     for geoid, row in raw_rows.items():
         geometry, bbox, user_properties, stac_reserved_members = _extract_feature_parts(
             row, col_config, resolved_sidecars, catalog_id, collection_id,
+            collection_type=collection_type, allow_geometry=allow_geometry,
         )
         result[geoid] = CanonicalIndexInput(
             row=row,
@@ -340,6 +418,83 @@ async def read_canonical_index_inputs(
     return result
 
 
+async def has_canonical_source(catalog_id: str, collection_id: str) -> bool:
+    """Does this collection's WRITE fan-out include a driver capable of
+    supplying canonical inputs (i.e. one :func:`read_canonical_index_inputs`
+    can actually read from)?
+
+    Routing-based signal only: capability here means "a driver in the fan-out
+    implements ``resolve_physical_table``" — it says nothing about whether
+    that driver's storage has been *provisioned* yet (see
+    :func:`ensure_canonical_source_ready`). Callers building an ES/search
+    document use this to decide between hydrating from the canonical read
+    or falling back to a feature-derived doc (:func:`canonical_input_from_feature`).
+
+    Degrade-safe: any routing-resolution failure is treated as "no canonical
+    source" — a resolution error here must not block the caller's write, it
+    just means the write falls back to the feature-derived doc.
+    """
+    try:
+        from dynastore.modules.storage.router import get_write_drivers
+        write_drivers = await get_write_drivers(catalog_id, collection_id)
+    except Exception:
+        return False
+    return any(
+        hasattr(resolved.driver, "resolve_physical_table")
+        for resolved in write_drivers
+    )
+
+
+async def ensure_canonical_source_ready(
+    catalog_id: str, collection_id: str, *, db_resource: Optional[Any] = None,
+) -> None:
+    """Lazily activate a pending collection via ``CatalogsProtocol``.
+
+    ``has_canonical_source`` only checks routing config — it says nothing
+    about whether the resolved driver's storage has actually been
+    provisioned yet. A collection whose first-ever write reaches
+    :func:`read_canonical_index_inputs` without going through
+    ``ItemService.upsert``'s own lazy-activation gate (e.g. a bulk harvester
+    writing through a non-PG-primary path) would otherwise stay pending
+    forever: every batch would hit :func:`_fetch_raw_rows`'s "cannot resolve
+    physical table" RuntimeError, since nothing ever calls
+    ``activate_collection`` (#3046).
+
+    Mirrors ``ItemService.upsert``'s own gate (``ensure_alive`` →
+    ``is_active`` → ``activate_collection``) and is equally driver-agnostic:
+    ``activate_collection`` provisions whichever driver this collection's
+    WRITE routing resolves to.
+
+    Degrade-safe like ``has_canonical_source``: no ``CatalogsProtocol``
+    registered is a no-op, and any failure of the activation sequence itself
+    (e.g. ``ensure_alive`` raising ``CollectionNotAliveError`` for a
+    collection still in its ``PROVISIONING`` window, or a transient lookup
+    error) is swallowed rather than propagated. Unlike ``ItemService.upsert``
+    — the primary REST write path, where that error is meant to surface as an
+    HTTP 409 for the client to retry — this helper backs the ES driver's
+    secondary-index write path, which has no client to hand a 409 to; the
+    caller's fallback is to skip canonical hydration and use the
+    feature-derived doc instead.
+    """
+    from dynastore.models.protocols import CatalogsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        return
+    try:
+        await catalogs.ensure_alive(catalog_id, collection_id, db_resource=db_resource)
+        if not await catalogs.is_active(catalog_id, collection_id, db_resource=db_resource):
+            from dynastore.models.driver_context import DriverContext
+
+            await catalogs.activate_collection(
+                catalog_id, collection_id,
+                ctx=DriverContext(db_resource=db_resource),
+            )
+    except Exception:
+        return
+
+
 # ---------------------------------------------------------------------------
 # Feature-part extraction (no read policy)
 # ---------------------------------------------------------------------------
@@ -351,6 +506,9 @@ def _extract_feature_parts(
     resolved_sidecars: List[Any],
     catalog_id: str,
     collection_id: str,
+    *,
+    collection_type: Optional[str] = None,
+    allow_geometry: Optional[bool] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[List[float]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Extract geometry, bbox, user-only properties, and STAC reserved members from a raw PG row.
 
@@ -368,6 +526,14 @@ def _extract_feature_parts(
        in the canonical doc, not in ``properties``.
     3. Also exclude known sidecar internal columns that may have leaked
        into properties via the JSONB fallback loop in the attributes sidecar.
+
+    ``collection_type`` / ``allow_geometry`` (#2655, both optional) thread
+    the real ``CollectionInfo.kind`` resolved by the caller into
+    ``ItemService.map_row_to_feature`` — same resolution
+    ``_resolve_sidecars_for`` above already uses — so a RECORDS row is
+    mapped without resolving a geometry sidecar. Harmless either way: the
+    geometry sidecar only acts when ``"geom"`` is present in ``row``, and
+    the SELECT that produced ``row`` never projects it for RECORDS.
 
     Geometry is converted to a plain dict (no Pydantic type info).
     """
@@ -399,6 +565,7 @@ def _extract_feature_parts(
     # read_policy=None → no id-flip, no expose filtering.
     feature = item_svc.map_row_to_feature(
         row, col_config, read_policy=None,
+        collection_type=collection_type, allow_geometry=allow_geometry,
     )
 
     # Geometry: convert from Pydantic geometry to plain dict.
@@ -525,7 +692,13 @@ def canonical_input_from_feature(
     geom = feature.get("geometry")
     geometry = geom if isinstance(geom, dict) else None
     bbox_val = feature.get("bbox")
-    bbox = list(bbox_val) if bbox_val is not None else None
+    # Fall back to a shapely-computed bbox when the feature doesn't carry one
+    # explicitly (#2864) — ES spatial filtering/sort relies on ``bbox`` being
+    # present, and a PG-hydrated canonical doc always has one (PG sidecar
+    # computes it), so the feature-only path must not silently omit it.
+    bbox = (
+        list(bbox_val) if bbox_val is not None else _bbox_from_geometry(geometry)
+    )
 
     row: Dict[str, Any] = {"geoid": geoid}
     if external_id is not None:

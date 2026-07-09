@@ -48,15 +48,13 @@ Architecture contract
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Any, ClassVar, Optional, Tuple
+from typing import ClassVar, Optional, Tuple, Union
 
 from pydantic import Field
 
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
-from dynastore.modules.db_config.locking_tools import pg_advisory_leadership
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
@@ -65,14 +63,22 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.catalog.collection_service import (
     _invalidate_collection_lifecycle_caches,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    LIFECYCLE_REAPER_ADVISORY_LOCK_KEY as _LIFECYCLE_REAPER_ADVISORY_LOCK_KEY,
+)
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key — must not collide with SoftDeleteReaper (0x5D3A7E1F_C2B84961)
-# or MaintenanceSupervisor (0x4D41494E_54454E41).
-_LIFECYCLE_REAPER_ADVISORY_LOCK_KEY = 0x4C494643_52454150  # "LIFECREAP"
+# Advisory lock key — see modules/tasks/durable/lock_registry.py, the
+# central registry of every leader-elected loop's key.
 
 
 class LifecycleReaperConfig(PluginConfig):
@@ -126,10 +132,10 @@ class LifecycleReaperConfig(PluginConfig):
 # ---------------------------------------------------------------------------
 
 # Find collections stuck in PROVISIONING past the threshold, across all active
-# tenant schemas.  Returns (catalog_id, physical_schema) pairs so we can
+# tenant schemas.  Returns catalog ids (schema name = catalog id) so we can
 # enumerate per-tenant.
 _ACTIVE_CATALOG_SCHEMAS_SQL = (
-    "SELECT id, physical_schema FROM catalog.catalogs "
+    "SELECT id FROM catalog.catalogs "
     "WHERE deleted_at IS NULL ORDER BY id"
 )
 
@@ -168,58 +174,27 @@ _CLEAR_PROVISIONING_SQL = (
 # ---------------------------------------------------------------------------
 
 
-class LifecycleReaper:
+class LifecycleReaper(PeriodicService):
     """Periodic reaper that reconciles collections stuck in transitional states.
 
-    Call ``start(shutdown_event)`` from a module lifespan to launch the
-    background loop.  Only one instance should run per process; leader
-    election via a pg advisory lock ensures exactly one instance runs
-    fleet-wide.
+    Implements ``PeriodicService``: ``BackgroundSupervisor`` handles leadership
+    election via ``_LIFECYCLE_REAPER_ADVISORY_LOCK_KEY`` and the configured
+    cadence.  Each tick calls ``run_once()`` which scans for collections stuck
+    in PROVISIONING or DELETING past the threshold and reconciles them.
     """
+
+    name = "lifecycle_reaper"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
 
     def __init__(self, config: LifecycleReaperConfig) -> None:
         self._config = config
-        self._task: Optional[asyncio.Task[Any]] = None
+        self.cadence_seconds = config.reaper_interval_seconds
+        self.lock_key: Optional[Union[int, str]] = _LIFECYCLE_REAPER_ADVISORY_LOCK_KEY
 
-    def start(self, shutdown_event: asyncio.Event) -> None:
-        """Schedule the reaper loop as an asyncio background task."""
-        self._task = asyncio.create_task(
-            self._loop(shutdown_event),
-            name="lifecycle_reaper",
-        )
-
-    async def stop(self) -> None:
-        """Cancel and await the background task."""
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
-
-    async def _loop(self, shutdown_event: asyncio.Event) -> None:
-        """Leader-elected outer loop — exits when shutdown_event is set."""
-        from dynastore.tools.async_utils import run_leader_loop
-
-        def _acquire_leadership():
-            return pg_advisory_leadership(
-                get_engine(),
-                _LIFECYCLE_REAPER_ADVISORY_LOCK_KEY,
-                name="LifecycleReaper",
-            )
-
-        async def _on_leader() -> None:
-            await self.run_once()
-            await asyncio.sleep(self._config.reaper_interval_seconds)
-
-        await run_leader_loop(
-            acquire_leadership=_acquire_leadership,
-            on_leader=_on_leader,
-            name="LifecycleReaper",
-            cadence_seconds=self._config.reaper_interval_seconds,
-            is_shutdown=shutdown_event.is_set,
-        )
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One full scan for stuck PROVISIONING and DELETING collections."""
+        await self.run_once()
 
     async def run_once(self) -> None:
         """Perform one full scan for stuck PROVISIONING and DELETING collections.
@@ -239,20 +214,20 @@ class LifecycleReaper:
             logger.debug("lifecycle_reaper: no active catalogs; skipping scan.")
             return
 
-        for catalog_id, physical_schema in catalog_ids:
+        for catalog_id in catalog_ids:
             await self._reap_provisioning_in_schema(
-                catalog_id, physical_schema, threshold, limit
+                catalog_id, catalog_id, threshold, limit
             )
             await self._reap_deleting_in_schema(
-                catalog_id, physical_schema, threshold, limit
+                catalog_id, catalog_id, threshold, limit
             )
 
     # ------------------------------------------------------------------
     # Catalog enumeration
     # ------------------------------------------------------------------
 
-    async def _list_active_catalogs(self) -> list[tuple[str, str]]:
-        """Return (catalog_id, physical_schema) for all non-deleted catalogs."""
+    async def _list_active_catalogs(self) -> list[str]:
+        """Return catalog ids (= schema names) for all non-deleted catalogs."""
         engine = get_engine()
         if engine is None:
             logger.warning(
@@ -272,7 +247,7 @@ class LifecycleReaper:
             )
             return []
 
-        return [(r[0], r[1]) for r in rows] if rows else []
+        return [r[0] for r in rows] if rows else []
 
     # ------------------------------------------------------------------
     # PROVISIONING reap: clear overlay back to NULL (→ ACTIVE)
@@ -281,7 +256,7 @@ class LifecycleReaper:
     async def _reap_provisioning_in_schema(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         threshold_seconds: int,
         limit: int,
     ) -> None:
@@ -290,7 +265,7 @@ class LifecycleReaper:
         if engine is None:
             return
 
-        query_sql = _STUCK_PROVISIONING_SQL.format(schema=physical_schema)
+        query_sql = _STUCK_PROVISIONING_SQL.format(schema=schema)
         try:
             async with managed_transaction(engine) as conn:
                 rows = await DQLQuery(
@@ -301,7 +276,7 @@ class LifecycleReaper:
             logger.warning(
                 "lifecycle_reaper: failed to query stuck PROVISIONING collections "
                 "in schema %r (catalog %r): %s",
-                physical_schema, catalog_id, exc,
+                schema, catalog_id, exc,
             )
             return
 
@@ -317,13 +292,13 @@ class LifecycleReaper:
 
         for collection_id in collection_ids:
             await self._clear_provisioning(
-                catalog_id, physical_schema, collection_id
+                catalog_id, schema, collection_id
             )
 
     async def _clear_provisioning(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         collection_id: str,
     ) -> None:
         """Clear the PROVISIONING overlay for one collection (→ ACTIVE).
@@ -336,7 +311,7 @@ class LifecycleReaper:
         if engine is None:
             return
 
-        update_sql = _CLEAR_PROVISIONING_SQL.format(schema=physical_schema)
+        update_sql = _CLEAR_PROVISIONING_SQL.format(schema=schema)
         try:
             async with managed_transaction(engine) as conn:
                 rows = await DQLQuery(
@@ -386,7 +361,7 @@ class LifecycleReaper:
     async def _reap_deleting_in_schema(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         threshold_seconds: int,
         limit: int,
     ) -> None:
@@ -395,7 +370,7 @@ class LifecycleReaper:
         if engine is None:
             return
 
-        query_sql = _STUCK_DELETING_SQL.format(schema=physical_schema)
+        query_sql = _STUCK_DELETING_SQL.format(schema=schema)
         try:
             async with managed_transaction(engine) as conn:
                 rows = await DQLQuery(
@@ -406,7 +381,7 @@ class LifecycleReaper:
             logger.warning(
                 "lifecycle_reaper: failed to query stuck DELETING collections "
                 "in schema %r (catalog %r): %s",
-                physical_schema, catalog_id, exc,
+                schema, catalog_id, exc,
             )
             return
 

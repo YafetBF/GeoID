@@ -128,6 +128,19 @@ class DataSeed:
     # per-collection routing. When None the collection inherits the ambient
     # catalog/platform routing (#1285 / #2241).
     items_routing: Optional["ItemsRoutingConfig"] = None
+    # When True the catalog is created with Hint.DEFER so its deferrable
+    # storage-backend (GCP bucket/eventing) provisioning is held back: a
+    # records/feature-only seed catalog reaches ``ready`` bucket-free. Storage,
+    # if ever needed, is provisioned later via an explicit catalog_provision
+    # task. Defaults to False (catalog provisions normally at creation).
+    defer_provisioning: bool = False
+    # Optional virtual assets (href-based, no GCS bucket) registered on this
+    # seed's catalog/collection after the items are upserted. Each entry is the
+    # kwargs dict for ``VirtualAssetCreate`` (at minimum ``asset_id`` and
+    # ``href``). This lets a bucket-free seed catalog
+    # (``defer_provisioning=True``) still expose an asset by referencing data in
+    # its original bucket/URL rather than uploading bytes. Default: none.
+    virtual_assets: Tuple[Dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)

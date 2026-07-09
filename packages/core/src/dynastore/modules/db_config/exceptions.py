@@ -55,6 +55,18 @@ class ConfigValidationError(ValueError):
     """Raised when a configuration body fails Pydantic validation."""
     pass
 
+class ConfigVersionConflictError(ValueError):
+    """Raised by a compare-and-set ``set_config(..., expected_version=...)``
+    write when the stored row's version no longer matches ``expected_version``
+    (a concurrent writer changed or removed it since it was read).
+
+    Maps to HTTP 409, same idiom as ``ImmutableConfigError``. The caller
+    should re-read the config (and its fresh version, via
+    ``get_config_versioned``) and retry rather than treating this as a
+    hard failure — see #2707.
+    """
+    pass
+
 class ConfigResolutionError(DatabaseError):
     """Raised when the config waterfall cannot produce a usable default.
 
@@ -97,6 +109,68 @@ class DatabaseConnectionError(DatabaseError):
     """Raised when the connection to the database cannot be established or is lost."""
     pass
 
+
+class PoolSaturationError(DatabaseError):
+    """Raised when the bounded pool-acquire wait elapses before a connection
+    frees up (#1894).
+
+    ``engine.connect()`` blocks for at most ``DBConfig.pool_acquire_timeout``
+    (default 30s) before SQLAlchemy raises a bare ``sqlalchemy.exc.TimeoutError``
+    on a saturated pool. Left unmapped, that exception falls through the HTTP
+    boundary's exception-handler registry as an opaque 500. This typed
+    wrapper carries a ``retry_after`` hint (seconds, read from the
+    hot-reloadable ``ConnectionHealthConfig.pool_saturation_retry_after_seconds``
+    at raise time) so ``extensions/tools/exception_handlers.py`` can map it to
+    a clean HTTP 503 + Retry-After instead — telling the client "the pool is
+    momentarily saturated, back off and retry" rather than "something broke."
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        original_exception: Exception | None = None,
+        retry_after: int = 5,
+    ) -> None:
+        super().__init__(message, original_exception=original_exception)
+        self.retry_after = retry_after
+
+
+class EngineCacheBudgetExceededError(DatabaseError):
+    """Raised when creating a new ``EngineInstanceCache`` entry would push the
+    fleet-wide connection budget past its configured ceiling (#2963).
+
+    ``PostgresqlEngineConfig.pool_size`` allows up to 200 connections per
+    engine, and the cache holds one live pool per DISTINCT ``engine_ref`` --
+    but until now nothing summed those pools against the shared database's
+    real connection ceiling. That was harmless while every deployment ran a
+    single default engine per kind; it stops being harmless once ref-keyed
+    driver-config storage (#2913) lets operators register many refs (e.g. one
+    per catalog), each pinning its own pool.
+
+    ``EngineInstanceCache`` tracks a running total of
+    ``EngineConfig.connection_budget_units()`` across every live entry and
+    raises this instead of silently instantiating past ``pool_budget``. The
+    caller can retry after evicting an idle engine (frees its share of the
+    budget) or after an operator raises the cache's configured budget.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        engine_ref: str,
+        requested_units: int,
+        allocated_units: int,
+        pool_budget: int,
+    ) -> None:
+        super().__init__(message)
+        self.engine_ref = engine_ref
+        self.requested_units = requested_units
+        self.allocated_units = allocated_units
+        self.pool_budget = pool_budget
+
+
 # --- Specific PostgreSQL Errors based on pgcode ---
 
 class TableNotFoundError(DatabaseError):
@@ -125,6 +199,28 @@ class PermissionDeniedError(DatabaseError):
 class UniqueViolationError(DatabaseError):
     """Raised on violation of a unique constraint (pgcode: 23505)."""
     pass
+
+
+class CatalogRenameConflictError(DatabaseError):
+    """Raised when a catalog rename target external_id is already taken by a live catalog."""
+
+    def __init__(self, new_external_id: str) -> None:
+        super().__init__(
+            f"Cannot rename: catalog external_id '{new_external_id}' is already in use"
+        )
+        self.new_external_id = new_external_id
+
+
+class CollectionRenameConflictError(DatabaseError):
+    """Raised when a collection rename target external_id is already taken within the same catalog."""
+
+    def __init__(self, catalog_id: str, new_external_id: str) -> None:
+        super().__init__(
+            f"Cannot rename: collection external_id '{new_external_id}' "
+            f"is already in use in catalog '{catalog_id}'"
+        )
+        self.catalog_id = catalog_id
+        self.new_external_id = new_external_id
 
 
 class ForeignKeyViolationError(DatabaseError):

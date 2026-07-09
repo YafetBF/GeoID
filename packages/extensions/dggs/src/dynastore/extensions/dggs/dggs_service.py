@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from typing import FrozenSet, Optional, Set
 
 # Dependency-free helper (no h3/s2sphere): safe to import before the SCOPE gate.
-from dynastore.modules.dggs.bbox import parse_bbox
+from dynastore.tools.geospatial import parse_bbox_string, BboxDimensionality
 
 import h3 as _h3_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires h3
 import s2sphere as _s2sphere_scope_gate  # noqa: F401  # SCOPE gate: extension_dggs requires s2sphere
@@ -49,8 +49,6 @@ from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 from dynastore.extensions.dggs.config import DGGSConfig
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
-from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.shared_models import Link
 from dynastore.modules.dggs import h3_indexer, s2_indexer
@@ -155,65 +153,32 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
     async def lifespan(self, app: FastAPI):
         yield
 
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
     # ------------------------------------------------------------------
     # Route registration
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/dggs-list",
-            self.get_dggrs_list,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/dggs-list/{dggsId}",
-            self.get_dggrs,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/collections",
-            self.get_collections,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/dggs",
-            self.get_dggs_data,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/dggs/{zoneId}",
-            self.get_dggs_zone,
-            methods=["GET"],
-        )
-
-    # ------------------------------------------------------------------
-    # Landing page & conformance
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> JSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request):
-        return await self.ogc_conformance_handler(request)
+        self.register_ogc_standard_routes()
+        # (path, handler_name, methods, kwargs)
+        route_table: list[tuple[str, str, list[str], dict]] = [
+            ("/dggs-list", "get_dggrs_list", ["GET"], {}),
+            ("/dggs-list/{dggsId}", "get_dggrs", ["GET"], {}),
+            ("/collections", "get_collections", ["GET"], {}),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/dggs",
+                "get_dggs_data",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/dggs/{zoneId}",
+                "get_dggs_zone",
+                ["GET"],
+                {},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # DGGRS discovery endpoints
@@ -280,16 +245,23 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
             # list_catalogs may return Catalog models or dicts depending on
             # the protocol implementation — handle both.
             catalog_id = (
+                getattr(catalog, "external_id", None)
+                or getattr(catalog, "id", None)
+                or (catalog.get("id", "") if isinstance(catalog, dict) else "")
+            )
+            # Use internal id for routing (list_collections expects it)
+            _catalog_internal_id = (
                 getattr(catalog, "id", None)
                 or (catalog.get("id", "") if isinstance(catalog, dict) else "")
             )
             try:
-                collections = await catalogs_svc.list_collections(catalog_id)
+                collections = await catalogs_svc.list_collections(_catalog_internal_id)
             except Exception:
                 continue
             for col in collections or []:
                 col_id = (
-                    getattr(col, "id", None)
+                    getattr(col, "external_id", None)
+                    or getattr(col, "id", None)
                     or (col.get("id", "") if isinstance(col, dict) else "")
                 )
                 result.append(
@@ -375,7 +347,12 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
         bbox_tuple = None
         if bbox:
             try:
-                bbox_tuple = parse_bbox(bbox)
+                bbox_tuple = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    allow_none=True,
+                    validate_geometry=True,
+                )
             except ValueError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)

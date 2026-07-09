@@ -58,7 +58,7 @@ INSERT INTO {task_schema}.events (
     event_id,
     day,
     shard,
-    schema_name,
+    catalog_id,
     scope,
     event_type,
     payload
@@ -66,7 +66,7 @@ INSERT INTO {task_schema}.events (
     CAST(:event_id AS uuid),
     CURRENT_DATE,
     :shard,
-    :schema_name,
+    :catalog_id,
     :scope,
     :event_type,
     CAST(:payload AS jsonb)
@@ -100,8 +100,16 @@ def _events_insert_query(task_schema: str) -> "DQLQuery":
     return query
 
 
-async def _enqueue_event_drain_trigger(conn: Any) -> None:
+async def _enqueue_event_drain_trigger(
+    conn: Any, *, wedge_grace_seconds: Optional[float] = None,
+    dedup_key: str = "event_drain",
+) -> int:
     """Insert one global dedup'd ``event_drain`` PENDING task on ``conn``.
+    Returns the number of rows inserted (1 on success, 0 when the dedup
+    guard blocked the insert or the tasks table was unavailable) so a
+    caller relying on this trigger for forward progress (#2887,
+    ``EventDrainTask._handoff_to_offload_job``) can observe a self-blocked
+    no-op instead of it passing silently.
 
     Co-transactional: the drain row commits if and only if the caller's event
     row commits.  A single global dedup key coalesces high event volume to one
@@ -111,14 +119,40 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
 
     Degrades gracefully when the tasks table is absent (e.g. test environments
     that only provision ``tasks.events``): the INSERT is SAVEPOINT-isolated via
-    ``conn.begin_nested()`` so a missing table cannot abort the outer PG
+    :func:`best_effort_savepoint` so a missing table cannot abort the outer PG
     transaction carrying the event row, and any failure is logged at DEBUG and
     swallowed.  The event row still commits; the drain runs on its next
     scheduled tick even without this NOTIFY.
+
+    ``wedge_grace_seconds`` (#2715): shared by both callers — the hot
+    co-transactional write path above (always ``None``) and the leader-side
+    recovery tick (``dynastore.modules.tasks.drain_spawner``, which passes a
+    configured float). Mirrors ``storage_emit._enqueue_drain_trigger``'s
+    parameter exactly:
+
+    * ``None`` (default): unchanged behaviour — ANY existing non-terminal
+      (PENDING/ACTIVE/CREATED) ``event_drain`` row blocks a fresh enqueue.
+    * A float: additionally tolerates a WEDGED existing row — a PENDING row
+      older than ``wedge_grace_seconds`` or an ACTIVE row whose lease
+      (``locked_until``) has already expired. A live row still blocks,
+      exactly as before.
+
+    ``dedup_key`` (#2887): defaults to ``"event_drain"`` — unchanged behaviour
+    for the hot co-transactional path and the recovery tick above.
+    ``EventDrainTask._handoff_to_offload_job`` passes a distinct value (e.g.
+    ``"event_drain_handoff"``) instead, so it can enqueue a fresh execution
+    while the currently-running row is still non-terminal (ACTIVE) without
+    being blocked by that very row's own dedup guard. The ``task_type`` stays
+    ``"event_drain"`` in every case — unlike storage's offload variant, there
+    is no separate offload task type: ``EventDrainTask`` already carries the
+    async-write workclass marker and always prefers an offload-capable runner
+    when one is deployed, so a handoff is simply a fresh execution of the
+    same task.
     """
     from dynastore.modules.db_config.query_executor import (  # noqa: PLC0415
         DQLQuery,
         ResultHandler,
+        best_effort_savepoint,
     )
     from dynastore.modules.tasks.tasks_module import get_task_schema  # noqa: PLC0415
     from dynastore.tools.caller import current_caller_id  # noqa: PLC0415
@@ -134,48 +168,66 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
     # a NULL here would crash dispatch before the drain ever runs.
     caller_id = current_caller_id()
 
+    # See storage_emit._enqueue_drain_trigger's docstring for the identical
+    # wedge-tolerance rationale.
+    wedge_tolerant_clause = (
+        ""
+        if wedge_grace_seconds is None
+        else (
+            " AND ("
+            "     (status = 'PENDING' AND timestamp > now() - make_interval(secs => :wedge_grace_seconds))"
+            "  OR (status = 'ACTIVE' AND locked_until > now())"
+            "  OR status NOT IN ('PENDING', 'ACTIVE')"
+            " )"
+        )
+    )
+
     insert_sql = (
         f"INSERT INTO {task_schema}.tasks"
-        f" (task_id, schema_name, scope, caller_id, task_type, type,"
+        f" (task_id, catalog_id, scope, caller_id, task_type, type,"
         f"  execution_mode, inputs, timestamp, status, dedup_key)"
         f" SELECT :task_id, 'platform', 'platform', :caller_id, 'event_drain',"
         f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
-        f"        'event_drain'"
+        f"        :dedup_key"
         f" WHERE NOT EXISTS ("
         f"     SELECT 1 FROM {task_schema}.tasks"
-        f"     WHERE dedup_key = 'event_drain'"
-        f"       AND schema_name = 'platform'"
+        # A distinct bind name from the SELECT target-list :dedup_key above —
+        # asyncpg raises AmbiguousParameterError when the SAME named
+        # parameter is reused across an untyped SELECT target position and a
+        # column-comparison position, even though both bind the same Python
+        # value here (mirrors storage_emit._enqueue_drain_trigger).
+        f"     WHERE dedup_key = :dedup_key_filter"
+        f"       AND catalog_id = 'platform'"
         # Terminal set matches the dispatcher's claim query: a terminal-state
         # drain task (incl. DISMISSED) must NOT block a fresh enqueue, or the
         # co-transactional NOTIFY stays silenced until manual cleanup.
         f"       AND status NOT IN ('COMPLETED', 'FAILED', 'DISMISSED', 'DEAD_LETTER')"
+        f"{wedge_tolerant_clause}"
         f" )"
     )
-    try:
-        begin_nested = getattr(conn, "begin_nested", None)
-        if begin_nested is not None:
-            try:
-                async with begin_nested():
-                    await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                        conn, task_id=generate_uuidv7(), caller_id=caller_id
-                    )
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "event_drain: drain trigger skipped — tasks table not "
-                    "available in schema %r (normal during staged rollout).",
-                    task_schema,
-                    exc_info=True,
-                )
-        else:
-            await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                conn, task_id=generate_uuidv7(), caller_id=caller_id
-            )
-    except Exception:  # noqa: BLE001
+    params: Dict[str, Any] = {
+        "task_id": generate_uuidv7(),
+        "caller_id": caller_id,
+        "dedup_key": dedup_key,
+        "dedup_key_filter": dedup_key,
+    }
+    if wedge_grace_seconds is not None:
+        params["wedge_grace_seconds"] = wedge_grace_seconds
+
+    inserted = 0
+    async with best_effort_savepoint(conn) as outcome:
+        inserted = await DQLQuery(
+            insert_sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, **params)
+    if outcome.error is not None:
         logger.debug(
-            "event_drain: drain trigger failed for schema %r.",
+            "event_drain: drain trigger skipped — tasks table not "
+            "available in schema %r (normal during staged rollout).",
             task_schema,
-            exc_info=True,
+            exc_info=outcome.error,
         )
+        return 0
+    return inserted or 0
 
 
 async def emit_event_row(
@@ -183,7 +235,6 @@ async def emit_event_row(
     *,
     event_type: str,
     scope: str,
-    schema_name: Optional[str],
     catalog_id: Optional[str],
     collection_id: Optional[str],
     identity_id: Optional[str],
@@ -208,10 +259,9 @@ async def emit_event_row(
         The event scope as the caller provides it (e.g. ``"PLATFORM"``).
         Lowercased before the INSERT to satisfy the ``tasks.events`` CHECK
         constraint (``scope = lower(scope)``).
-    schema_name:
-        Tenant schema name; ``None`` means platform-wide.
     catalog_id:
-        Catalog identifier, or ``None``.
+        Catalog internal id (after identity collapse, the physical PG schema
+        name equals the catalog internal id); ``None`` means platform-wide.
     collection_id:
         Collection identifier, or ``None``; stored in ``payload`` if needed
         by listeners — the ``tasks.events`` schema does not have a dedicated
@@ -239,7 +289,7 @@ async def emit_event_row(
         conn,
         event_id=event_id,
         shard=shard,
-        schema_name=schema_name,
+        catalog_id=catalog_id,
         scope=scope_lower,
         event_type=event_type,
         payload=payload_str,

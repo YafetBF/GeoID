@@ -67,6 +67,30 @@ def test_engine_configs_satisfy_engine_instance_protocol(cls):
     assert isinstance(cfg, EngineInstanceProtocol)
 
 
+@pytest.mark.parametrize(
+    "cls,expected",
+    [
+        (ElasticsearchEngineConfig, 0),
+        (DuckdbEngineConfig, 0),
+        (IcebergEngineConfig, 0),
+    ],
+)
+def test_non_postgresql_engines_charge_zero_connection_budget(cls, expected):
+    """Only PostgresqlEngineConfig holds real DB connections (#2963) — every
+    other engine kind reports 0 units against EngineInstanceCache's budget,
+    including DuckDB whose own ``pool_size`` governs an in-process
+    connection pool that never opens PostgreSQL connections."""
+    assert cls().connection_budget_units() == expected
+
+
+def test_postgresql_engine_charges_its_pool_size_as_connection_budget():
+    """PostgresqlEngineConfig's real asyncpg pool opens up to ``pool_size``
+    connections, so that is exactly what it charges against
+    EngineInstanceCache's fleet-wide budget (#2963)."""
+    cfg = PostgresqlEngineConfig(pool_size=42)
+    assert cfg.connection_budget_units() == 42
+
+
 # ---------------------------------------------------------------------------
 # PostgresqlEngineConfig
 # ---------------------------------------------------------------------------
@@ -89,12 +113,16 @@ async def test_postgresql_engine_init_uses_dbconfig_fallback():
         instance = await cfg.engine_init()
 
     assert instance is fake_pool
-    fake_create.assert_awaited_once_with(
-        dsn="postgresql://u:p@h:5432/db",
-        min_size=1,
-        max_size=7,
-        timeout=11,
-    )
+    kwargs = fake_create.await_args.kwargs
+    assert kwargs["dsn"] == "postgresql://u:p@h:5432/db"
+    assert kwargs["min_size"] == 1
+    assert kwargs["max_size"] == 7
+    assert kwargs["timeout"] == 11
+    # #2898: every per-catalog physical engine now carries the same
+    # lock-safety + clamped statement_timeout server_settings as the shared
+    # serving engine (see test_postgresql_engine_server_settings.py for the
+    # dedicated regression cover).
+    assert "server_settings" in kwargs
 
 
 @pytest.mark.asyncio

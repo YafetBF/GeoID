@@ -53,25 +53,36 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Union
+
+if TYPE_CHECKING:
+    from dynastore.models.scaling import ScalingSignal
 
 from dynastore.modules.db_config.locking_tools import (
     held_advisory_locks,
-    pg_advisory_leadership,
 )
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
     managed_transaction,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    CONTENTION_MONITOR_LOCK_KEY as _CONTENTION_MONITOR_LOCK_KEY,
+)
+from dynastore.tools.background_service import (
+    Leadership,
+    LeaseRenewalMode,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key for leader election — must not collide with other loops
-# (supervisor 0x4D41494E_54454E41, reaper 0x5D3A7E1F_C2B84961, lifecycle reaper).
-# ASCII "LOCKMONI"; a deterministic constant inside the signed bigint range.
-_CONTENTION_MONITOR_LOCK_KEY = 0x4C4F434B_4D4F4E49
+# Advisory lock key for leader election — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# leader-elected loop's key.
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -186,52 +197,62 @@ LIMIT :limit
 """
 
 
-class DbContentionMonitor:
+class DbContentionMonitor(PeriodicService):
     """Leader-elected periodic sampler of DB lock / slow-query contention.
 
-    Call ``start(shutdown_event)`` from a module lifespan. Only one instance
-    runs fleet-wide (advisory-lock leader election). Read-only.
+    Implements ``PeriodicService``: ``BackgroundSupervisor`` handles leadership
+    election via ``_CONTENTION_MONITOR_LOCK_KEY`` and the configured cadence.
+    Each tick calls ``run_once()`` which takes a read-only snapshot of
+    ``pg_stat_activity`` / ``pg_locks`` and logs the result.
     """
+
+    name = "db_contention_monitor"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+    # Default cadence equals the lease TTL, so per-tick acquire/release
+    # would re-elect essentially every cycle. Heartbeat mode holds tenure
+    # across ticks and renews on its own cadence instead (#2900) -- useful
+    # here in particular, since this monitor should stay stably leader-elected
+    # through the very DB-contention episodes it exists to observe.
+    lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
 
     def __init__(self, config: DbContentionMonitorConfig) -> None:
         self._config = config
-        self._task: Optional[asyncio.Task[Any]] = None
+        self.cadence_seconds = float(config.interval_seconds)
+        self.lock_key: Optional[Union[int, str]] = _CONTENTION_MONITOR_LOCK_KEY
+        # Last conn_pressure computed by _emit(), for ScalingSignalProtocol.
+        # None until this pod has actually run a tick as the elected leader —
+        # a non-leader pod's instance has nothing fresh to contribute.
+        self._last_conn_pressure: Optional[float] = None
+        self._last_conn_pressure_ts: Optional[float] = None
 
-    def start(self, shutdown_event: asyncio.Event) -> None:
-        self._task = asyncio.create_task(
-            self._loop(shutdown_event), name="db_contention_monitor"
-        )
+    async def tick(self, ctx: ServiceContext) -> None:
+        """Take one snapshot and log it."""
+        await self.run_once()
 
-    async def stop(self) -> None:
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
+    def scaling_signals(self) -> List["ScalingSignal"]:
+        """``ScalingSignalProtocol``: fleet-wide DB connection pressure.
 
-    async def _loop(self, shutdown_event: asyncio.Event) -> None:
-        from dynastore.tools.async_utils import run_leader_loop
+        ``scope="global"`` — the value is the same for every pod, computed
+        from ``pg_stat_activity`` which sees all connections, not just this
+        pod's. Reuses the value already computed by ``_emit()`` on this
+        pod's most recent leader tick; never re-queries. Returns an empty
+        list when this pod hasn't run a leader tick yet (a non-leader pod
+        has nothing fresh to contribute).
+        """
+        if self._last_conn_pressure is None or self._last_conn_pressure_ts is None:
+            return []
+        from dynastore.models.scaling import ScalingSignal
 
-        def _acquire_leadership():
-            return pg_advisory_leadership(
-                get_engine(),
-                _CONTENTION_MONITOR_LOCK_KEY,
-                name="DbContentionMonitor",
+        return [
+            ScalingSignal(
+                source="db_contention_monitor",
+                metric="conn_pressure",
+                value=max(0.0, min(1.0, self._last_conn_pressure)),
+                scope="global",
+                ts=self._last_conn_pressure_ts,
             )
-
-        async def _on_leader() -> None:
-            await self.run_once()
-            await asyncio.sleep(self._config.interval_seconds)
-
-        await run_leader_loop(
-            acquire_leadership=_acquire_leadership,
-            on_leader=_on_leader,
-            name="DbContentionMonitor",
-            cadence_seconds=self._config.interval_seconds,
-            is_shutdown=shutdown_event.is_set,
-        )
+        ]
 
     async def run_once(self) -> Optional[dict]:
         """Take one snapshot and log it. Returns the snapshot dict (or None).
@@ -311,6 +332,8 @@ class DbContentionMonitor:
 
         cfg = self._config
         conn_pressure = (total / max_conns) if max_conns else 0.0
+        self._last_conn_pressure = conn_pressure
+        self._last_conn_pressure_ts = time.time()
         contended = bool(
             blocked
             or slow

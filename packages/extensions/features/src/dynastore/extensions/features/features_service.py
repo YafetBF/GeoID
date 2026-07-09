@@ -69,8 +69,12 @@ from dynastore.extensions.tools.response_i18n import (  # noqa: E402
 )
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
-from dynastore.extensions.web.decorators import expose_web_page, expose_static
-from dynastore.extensions.tools.db import get_async_connection, get_async_engine
+from dynastore.extensions.web.decorators import expose_web_page
+from dynastore.extensions.tools.db import (
+    get_async_connection,
+    get_async_connection_bounded,
+    get_async_engine,
+)
 from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
 import re
 from dynastore.extensions.tools.formatters import OutputFormatEnum
@@ -161,6 +165,11 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         "OGC API Features (Parts 1-4) with CQL2 filtering, multi-CRS support, "
         "queryables, sorting, and full CRUD transactions."
     )
+    landing_response_model = ogc_models.LandingPage
+
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "features"
 
     def configure_app(self, app: FastAPI):
         """Early configuration for the Features extension."""
@@ -192,141 +201,78 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
     def _register_routes(self):
         """Registers all OGC API Features routes."""
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-            response_model=ogc_models.LandingPage,
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-            response_model=ogc_models.Conformance,
-        )
-        self.router.add_api_route(
-            "/functions",
-            self.get_supported_functions,
-            methods=["GET"],
-            response_model=FunctionsResponse,
-        )
-
-        # --- Catalog Endpoints ---
-        self.router.add_api_route(
-            "/catalogs",
-            self.list_catalogs,
-            methods=["GET"],
-            response_model=ogc_models.Catalogs,
-        )
-        self.router.add_api_route(
-            "/catalogs",
-            self.create_catalog,
-            methods=["POST"],
-            response_model=Catalog,
-            status_code=status.HTTP_201_CREATED,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.get_catalog,
-            methods=["GET"],
-            response_model=Catalog,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.replace_catalog,
-            methods=["PUT"],
-            response_model=Catalog,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.update_catalog,
-            methods=["PATCH"],
-            response_model=Catalog,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.delete_catalog,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-
-        # --- Collection Endpoints ---
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_collections_in_catalog,
-            methods=["GET"],
-            response_model=ogc_models.Collections,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.create_collection,
-            methods=["POST"],
-            response_model=ogc_models.OGCCollection,
-            status_code=status.HTTP_201_CREATED,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_collection,
-            methods=["GET"],
-            response_model=ogc_models.OGCCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.replace_collection,
-            methods=["PUT"],
-            response_model=ogc_models.OGCCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.update_collection,
-            methods=["PATCH"],
-            response_model=ogc_models.OGCCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.delete_collection,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/queryables",
-            self.get_queryables,
-            methods=["GET"],
-            response_model=ogc_models.Queryables,
-        )
-
-        # --- Item Endpoints ---
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.get_items,
-            methods=["GET"],
-            response_model=ogc_models.FeatureCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.add_item,
-            methods=["POST"],
-            response_model=Union[ogc_models.Feature, ogc_models.BulkCreationResponse],
-            status_code=status.HTTP_201_CREATED,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
-            self.get_item,
-            methods=["GET"],
-            response_model=ogc_models.Feature,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
-            self.replace_item,
-            methods=["PUT"],
-            response_model=ogc_models.Feature,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
-            self.delete_item,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
+        self.register_ogc_standard_routes()
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            ("/functions", "get_supported_functions", ["GET"], {"response_model": FunctionsResponse}),
+            # --- Catalog Endpoints ---
+            ("/catalogs", "list_catalogs", ["GET"], {"response_model": ogc_models.Catalogs}),
+            ("/catalogs", "create_catalog", ["POST"], {"response_model": Catalog}),
+            ("/catalogs/{catalog_id}", "get_catalog", ["GET"], {"response_model": Catalog}),
+            ("/catalogs/{catalog_id}", "replace_catalog", ["PUT"], {"response_model": Catalog}),
+            ("/catalogs/{catalog_id}", "update_catalog", ["PATCH"], {"response_model": Catalog}),
+            (
+                "/catalogs/{catalog_id}", "delete_catalog", ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+            # --- Collection Endpoints ---
+            (
+                "/catalogs/{catalog_id}/collections", "list_collections_in_catalog", ["GET"],
+                {"response_model": ogc_models.Collections},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections", "create_collection", ["POST"],
+                {
+                    "response_model": ogc_models.OGCCollection,
+                    "status_code": status.HTTP_201_CREATED,
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "get_collection", ["GET"],
+                {"response_model": ogc_models.OGCCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "replace_collection", ["PUT"],
+                {"response_model": ogc_models.OGCCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "update_collection", ["PATCH"],
+                {"response_model": ogc_models.OGCCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "delete_collection", ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/queryables", "get_queryables", ["GET"],
+                {"response_model": ogc_models.Queryables},
+            ),
+            # --- Item Endpoints ---
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items", "get_items", ["GET"],
+                {"response_model": ogc_models.FeatureCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items", "add_item", ["POST"],
+                {
+                    "response_model": Union[ogc_models.Feature, ogc_models.BulkCreationResponse],
+                    "status_code": status.HTTP_201_CREATED,
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "get_item", ["GET"],
+                {"response_model": ogc_models.Feature},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "replace_item", ["PUT"],
+                {"response_model": ogc_models.Feature},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "delete_item", ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -334,16 +280,8 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         logger.info("OGCFeaturesService: policies registered.")
         yield
 
-    # NotebookContributorProtocol — opt-in surface picked up by
-    # NotebooksModule via discovery. Returning an empty list when
-    # NotebookContribution can't be imported keeps the extension
-    # usable in SCOPEs that don't load the notebooks module.
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
+    # get_notebooks is provided by OGCServiceMixin (delegates to
+    # dynastore.extensions.features.notebooks.build_contributions).
 
     async def _resolve_crs_srid(
         self, conn: DbResource, catalog_id: str, crs_uri: Optional[str]
@@ -369,44 +307,32 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
     ) -> set:
         """Return the set of valid property names for a collection.
 
-        Reuses :pymeth:`ItemsProtocol.get_collection_fields` (the same source
-        the Queryables endpoint consumes) so the ``properties`` query
-        parameter is validated against exactly the catalogue's published
-        queryable surface — no parallel validator. Each field's exposed name
-        is its ``alias`` (preferred) or ``name``.
-
-        Returns an empty set when the protocol is unavailable; the caller
-        treats that as "permissive" and skips validation rather than failing
-        every request when the introspection backend is offline.
+        Thin wrapper around the shared
+        :func:`dynastore.extensions.tools.query.resolve_queryable_property_names`
+        — the SSOT also used to validate the ad-hoc ``?{property}={value}``
+        filter shorthand below and the STAC items endpoint's equivalent
+        filter validation — kept as an instance method so existing callers
+        (and tests that patch it) are unaffected.
         """
-        items_svc = get_protocol(ItemsProtocol)
-        if items_svc is None:
-            return set()
-        try:
-            all_fields = await items_svc.get_collection_fields(
-                catalog_id, collection_id
-            )
-        except Exception:
-            return set()
-        names: set = set()
-        for fd in all_fields.values():
-            if not getattr(fd, "expose", True):
-                continue
-            final_name = getattr(fd, "alias", None) or getattr(fd, "name", None)
-            if not final_name or final_name in ("geoid", "geom"):
-                continue
-            names.add(final_name)
-        return names
+        from dynastore.extensions.tools.query import (
+            resolve_queryable_property_names,
+        )
 
-    async def get_landing_page(
+        return await resolve_queryable_property_names(catalog_id, collection_id)
+
+    async def ogc_landing_page_handler(
         self, request: Request, language: str = Depends(get_language)
-    ):
+    ) -> JSONResponse:
+        """Features landing page: overrides OGCServiceMixin's generic landing page.
+
+        ``ogc_generator.create_landing_page`` adds an extra ``rel=catalogs``
+        link to ``/features/catalogs`` that no other OGC extension exposes,
+        so Features keeps its own body rather than the mixin default.
+        """
         landing_page = ogc_generator.create_landing_page(request, language=language)
         return JSONResponse(content=localize_model(landing_page, language))
 
-    async def get_conformance(self, request: Request):
-        """Returns the list of conformance classes (Part 1)."""
-        return await self.ogc_conformance_handler(request)
+    # get_conformance is delegated to OGCServiceMixin via register_ogc_standard_routes.
 
     # --- Catalog Endpoints ---
     async def list_catalogs(
@@ -427,13 +353,16 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         result_catalogs = []
         for catalog in catalogs:
             catalog_dict, _ = catalog.localize(language)
+            # catalog_dict["id"] is the public external label (projected by
+            # _serialize_public_id via model_dump inside localize()).
+            cat_pub = catalog_dict["id"]
             # Add links to each catalog
             catalog_dict["links"] = [
                 Link(
-                    href=f"{self_url}/{catalog.id}", rel="self", type="application/json"
+                    href=f"{self_url}/{cat_pub}", rel="self", type="application/json"
                 ).model_dump(),
                 Link(
-                    href=f"{self_url}/{catalog.id}/collections",
+                    href=f"{self_url}/{cat_pub}/collections",
                     rel="items",
                     type="application/json",
                 ).model_dump(),
@@ -447,6 +376,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         definition: ogc_models.CatalogDefinition,
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Creates a new catalog, its data schema, and required table partitions."""
         try:
@@ -459,7 +389,10 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 "extra_metadata": definition.extra_metadata,
             }
             input_dump = definition.model_dump(exclude_unset=True)
-            return await self._ogc_create_catalog(catalog_data, input_dump, language, conn)
+            # ``?hints=defer`` defers GCP storage provisioning (see Hint.DEFER).
+            return await self._ogc_create_catalog(
+                catalog_data, input_dump, language, conn, hints=request_hints
+            )
         except Exception as e:
             return handle_or_raise(
                 e,
@@ -471,12 +404,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
     async def get_catalog(
         self, catalog_id: str, request: Request, language: str = Depends(get_language)
     ):
-        catalogs_svc = await self._get_catalogs_service()
-        catalog = await catalogs_svc.get_catalog(catalog_id, lang=language)
-        if not catalog:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        catalog = await self._resolve_catalog_or_404(catalog_id, lang=language)
 
         catalog_dict, languages = catalog.localize(language)
         self_url = get_url(request)
@@ -497,46 +425,58 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         self,
         catalog_id: str,
         definition: ogc_models.CatalogDefinition,
+        request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
     ):
         """OGC API Features Part 4 — replace the whole catalog (PUT).
 
-        ``CatalogDefinition`` enforces required fields (id/title/...) so
-        partial bodies are rejected by Pydantic before the handler runs.
+        Per OGC API Features Part 4 Req 11, a body ``id`` that differs from the
+        path parameter is silently ignored and the path-addressed resource is
+        replaced (on_id_mismatch="ignore").  To rename instead, send
+        ``Prefer: handling=move``; the catalog is then renamed to the body id
+        and the response carries ``Content-Location``, ``Link: rel=canonical``,
+        and ``Preference-Applied: handling=move``.
         """
         from dynastore.models.localization import normalize_i18n_for_replace
 
-        if definition.id != catalog_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({definition.id!r}) must match path catalog_id "
-                    f"({catalog_id!r})."
-                ),
-            )
+        body_id = definition.id
         catalog_dict = definition.model_dump(exclude_unset=False)
         catalog_dict = normalize_i18n_for_replace(catalog_dict, language)
-        return await self._ogc_replace_catalog(catalog_id, catalog_dict, language, conn)
+        return await self._ogc_replace_catalog(
+            catalog_id, catalog_dict, language, conn,
+            request=request, body_id=body_id, on_id_mismatch="ignore",
+        )
 
     async def update_catalog(
         self,
         catalog_id: str,
         definition: ogc_models.CatalogDefinition,
+        request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
     ):
-        """Updates an existing catalog."""
+        """OGC API Features Part 4 — partial update of a catalog (PATCH).
+
+        A body ``id`` that differs from the path parameter is silently ignored
+        per OGC API Features Part 4 Req 11.  Send ``Prefer: handling=move`` to
+        rename instead.
+        """
         catalog_dict = definition.model_dump(exclude_unset=True)
-        return await self._ogc_update_catalog(catalog_id, catalog_dict, language, conn)
+        body_id: Optional[str] = catalog_dict.get("id")
+        return await self._ogc_update_catalog(
+            catalog_id, catalog_dict, language, conn,
+            body_id=body_id, request=request, on_id_mismatch="ignore",
+        )
 
     async def delete_catalog(
         self,
         catalog_id: str,
+        request: Request,
         force: bool = Query(False),
         conn: AsyncConnection = Depends(get_async_connection),
     ):
-        return await self._ogc_delete_catalog(catalog_id, force, conn)
+        return await self._ogc_delete_catalog(catalog_id, force, conn, request=request)
 
     # --- Collection Endpoints ---
     async def list_collections_in_catalog(
@@ -546,10 +486,11 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         limit: int = Query(10, ge=1),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalogs_svc = await self._get_catalogs_service()
         collections = await catalogs_svc.list_collections(
-            catalog_id, lang=language, limit=limit, offset=offset
+            catalog_id, lang=language, limit=limit, offset=offset, hints=request_hints,
         )
         # Convert returned models to OGCCollection models and add links
         ogc_collections = [
@@ -623,13 +564,17 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalog_id: str,
         collection_def: ogc_models.CollectionDefinition,
         language: str = Depends(get_language),
-        conn: AsyncConnection = Depends(get_async_connection),
     ):
         """Creates a new collection in a catalog."""
         try:
             collection_dict = collection_def.model_dump(exclude_unset=True)
+            # Pass None, not a request-scoped connection: `_ogc_create_collection`
+            # / `create_collection` provision the collection's own partitions
+            # internally and must do so on their own short-lived connection,
+            # the same way STAC's create_stac_collection already does — not
+            # under the caller's request transaction (#2831).
             return await self._ogc_create_collection(
-                catalog_id, collection_dict, language, conn
+                catalog_id, collection_dict, language, None
             )
         except Exception as e:
             return handle_or_raise(
@@ -645,13 +590,13 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         collection_id: str,
         request: Request,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
-        catalogs_svc = await self._get_catalogs_service()
-        collection = await catalogs_svc.get_collection(
-            catalog_id, collection_id, lang=language
+        collection = await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail="Collection not found",
+            lang=language, hints=request_hints,
         )
-        if not collection:
-            raise HTTPException(status_code=404, detail="Collection not found")
 
         # We need to construct the OGC response wrapper
         collection_dict, languages = collection.localize(language)
@@ -702,27 +647,26 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalog_id: str,
         collection_id: str,
         collection_def: ogc_models.CollectionDefinition,
+        request: Request,
         language: str = Depends(get_language),
     ):
         """OGC API Features Part 4 — replace the whole collection (PUT).
 
-        ``CollectionDefinition`` enforces required fields, so a partial
-        body returns 422 before the handler runs.
+        Per OGC API Features Part 4 Req 11, a body ``id`` that differs from the
+        path parameter is silently ignored and the path-addressed resource is
+        replaced (on_id_mismatch="ignore").  To rename instead, send
+        ``Prefer: handling=move``; the collection is then renamed to the body id
+        and the response carries ``Content-Location``, ``Link: rel=canonical``,
+        and ``Preference-Applied: handling=move``.
         """
         from dynastore.models.localization import normalize_i18n_for_replace
 
-        if collection_def.id != collection_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Body 'id' ({collection_def.id!r}) must match path "
-                    f"collection_id ({collection_id!r})."
-                ),
-            )
+        body_id = collection_def.id
         updates_dict = collection_def.model_dump(exclude_unset=False)
         updates_dict = normalize_i18n_for_replace(updates_dict, language)
         return await self._ogc_replace_collection(
-            catalog_id, collection_id, updates_dict, language
+            catalog_id, collection_id, updates_dict, language,
+            request=request, body_id=body_id, on_id_mismatch="ignore",
         )
 
     async def update_collection(
@@ -730,11 +674,21 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalog_id: str,
         collection_id: str,
         collection_def: ogc_models.CollectionDefinition,
+        request: Request,
         language: str = Depends(get_language),
     ):
-        """Updates an existing collection's metadata."""
+        """OGC API Features Part 4 — partial update of a collection (PATCH).
+
+        A body ``id`` that differs from the path parameter is silently ignored
+        per OGC API Features Part 4 Req 11.  Send ``Prefer: handling=move`` to
+        rename instead.
+        """
         updates_dict = collection_def.model_dump(exclude_unset=True)
-        return await self._ogc_update_collection(catalog_id, collection_id, updates_dict, language)
+        body_id: Optional[str] = updates_dict.get("id")
+        return await self._ogc_update_collection(
+            catalog_id, collection_id, updates_dict, language, request,
+            body_id=body_id, on_id_mismatch="ignore",
+        )
 
     async def delete_collection(
         self,
@@ -752,9 +706,17 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         request: Request,
         catalog_id: str,
         collection_id: str,
-        conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(
-            10, ge=1, le=1000, description="The maximum number of features to return."
+        # Bounded, fail-fast pool acquire (#2933/#2948) — see get_item.
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "The maximum number of features to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (OGC API - Features Part 1 "
+                "Core /req/core/fc-limit-response-1)."
+            ),
         ),
         offset: int = Query(
             0, ge=0, description="The offset of the first feature to return."
@@ -847,22 +809,31 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         configs_svc = await self._get_configs_service()
         storage_svc = await self._get_storage_service()
 
-        collection_metadata = await catalogs_svc.get_collection(
-            catalog_id, collection_id, lang="en"
-        )  # Default language for internal check
-        if not collection_metadata:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection '{collection_id}' not found or logically deleted.",
-            )
+        # Default language for internal check
+        await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail=f"Collection '{collection_id}' not found or logically deleted.",
+            lang="en",
+        )
 
         # --- Caching Support ---
 
         _pc = await configs_svc.get_config(
-            FeaturesPluginConfig, catalog_id=catalog_id, ctx=DriverContext(db_resource=conn
+            FeaturesPluginConfig, catalog_id=catalog_id, collection_id=collection_id,
+            ctx=DriverContext(db_resource=conn
         ))
         assert isinstance(_pc, FeaturesPluginConfig)
         plugin_config: FeaturesPluginConfig = _pc
+
+        # Resolve default/clamp the page size against the configured policy
+        # (OGC API - Features Part 1 Core /req/core/fc-limit-response-1): an
+        # over-max ``limit`` is capped, never rejected.
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+        limit = resolve_page_limit(
+            limit,
+            default_limit=plugin_config.default_limit,
+            max_limit=plugin_config.max_limit,
+        )
 
         if plugin_config.cache_on_demand:
             cached = await ondemand_cache_lookup(
@@ -899,35 +870,24 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             # empty list, which the post-fetch projection honours.
             select_fields: Optional[List[str]] = None
             project_only_mandatory = False
+            requested_properties: List[str] = []
             if isinstance(properties, str):
-                requested = [p.strip() for p in properties.split(",") if p.strip()]
-                if properties == "" or not requested:
+                requested_properties = [
+                    p.strip() for p in properties.split(",") if p.strip()
+                ]
+                if properties == "" or not requested_properties:
                     project_only_mandatory = True
                     select_fields = []
                 else:
-                    valid = await self._resolve_property_names(
-                        catalog_id, collection_id
-                    )
-                    if valid:
-                        unknown = [p for p in requested if p not in valid]
-                        if unknown:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=(
-                                    f"Unknown properties: {', '.join(sorted(unknown))}. "
-                                    f"Available: {', '.join(sorted(valid))}."
-                                ),
-                            )
-                    select_fields = requested
+                    select_fields = requested_properties
 
             # Single-field equality shorthand: any query parameter that is not a
             # reserved OGC parameter is treated as a `?{property}={value}` filter
-            # on the collection's attributes. The property name is validated
-            # against the collection's queryable fields downstream (unknown →
-            # 400) and the value is bound as a query parameter — never
-            # interpolated into SQL.
+            # on the collection's attributes. The value is bound as a query
+            # parameter — never interpolated into SQL.
             from dynastore.extensions.tools.query import (
                 OGC_RESERVED_QUERY_PARAMS,
+                reject_unknown_filter_params,
             )
 
             extra_filters = {
@@ -935,6 +895,28 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 for key, value in request.query_params.items()
                 if key not in OGC_RESERVED_QUERY_PARAMS and value != ""
             }
+
+            # Validate ``properties`` names and the ad-hoc ``?{property}=``
+            # filter names against the same queryable surface, resolved once
+            # and shared by both checks. An unknown filter name must 400
+            # here — before any driver dispatch — so ``numberMatched`` and
+            # the returned features always describe the same selection;
+            # resolving it downstream in the CQL/driver layer let the PG
+            # path 400 while a SEARCH driver silently dropped the unmapped
+            # predicate and served an unfiltered listing (#2682).
+            if requested_properties or extra_filters:
+                valid = await self._resolve_property_names(catalog_id, collection_id)
+                if valid and requested_properties:
+                    unknown = [p for p in requested_properties if p not in valid]
+                    if unknown:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Unknown properties: {', '.join(sorted(unknown))}. "
+                                f"Available: {', '.join(sorted(valid))}."
+                            ),
+                        )
+                reject_unknown_filter_params(extra_filters, valid)
 
             # OGC Features /items prefers exact, full-precision geometry. The
             # routing hint EXACT_READ_HINTS passed to dispatch_or_stream_items
@@ -1028,44 +1010,54 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 _projection_set = set(select_fields)
 
             async def _ogc_post_process(items):
-                async for feature in items:
-                    if feature.properties:
-                        # Map validity → start_datetime / end_datetime
-                        _map_validity_to_ogc(feature.properties)
-                        feature.properties.pop("_total_count", None)
+                # ``finally`` propagates an early close (e.g. the response
+                # byte-budget cutoff in ``_stream_ogc_json``, #2681) down to
+                # ``items`` — the raw driver stream — so its underlying DB
+                # connection/transaction is released promptly instead of
+                # waiting on garbage collection. ``async for`` alone does not
+                # close the iterable it wraps on an early ``aclose()``.
+                try:
+                    async for feature in items:
+                        if feature.properties:
+                            # Map validity → start_datetime / end_datetime
+                            _map_validity_to_ogc(feature.properties)
 
-                        # Per-feature property projection — applied uniformly
-                        # regardless of which driver served the listing.
-                        if _projection_set is not None:
-                            for key in list(feature.properties.keys()):
-                                if key not in _projection_set:
-                                    feature.properties.pop(key, None)
+                            # Per-feature property projection — applied uniformly
+                            # regardless of which driver served the listing.
+                            if _projection_set is not None:
+                                for key in list(feature.properties.keys()):
+                                    if key not in _projection_set:
+                                        feature.properties.pop(key, None)
 
-                    # ``skipGeometry`` normalises Feature.geometry to ``null``
-                    # at the service boundary. PG already drops the SELECT and
-                    # ES adds ``geometry`` to ``_source.excludes``, so this is
-                    # the safety net for hits that arrived from any path that
-                    # missed the push-down (multi-driver pipelines, mocks, or
-                    # cached/legacy index shapes). RFC 7946 explicitly permits
-                    # ``"geometry": null`` on a Feature.
-                    if skip_geom_bool:
-                        feature.geometry = None
+                        # ``skipGeometry`` normalises Feature.geometry to ``null``
+                        # at the service boundary. PG already drops the SELECT and
+                        # ES adds ``geometry`` to ``_source.excludes``, so this is
+                        # the safety net for hits that arrived from any path that
+                        # missed the push-down (multi-driver pipelines, mocks, or
+                        # cached/legacy index shapes). RFC 7946 explicitly permits
+                        # ``"geometry": null`` on a Feature.
+                        if skip_geom_bool:
+                            feature.geometry = None
 
-                    # Add OGC self/collection links
-                    feature_id = feature.id
-                    feature.links = [
-                        Link(
-                            href=f"{collection_url}/items/{feature_id}",
-                            rel="self",
-                            type="application/geo+json",
-                        ),
-                        Link(
-                            href=collection_url,
-                            rel="collection",
-                            type="application/json",
-                        ),
-                    ]
-                    yield feature
+                        # Add OGC self/collection links
+                        feature_id = feature.id
+                        feature.links = [
+                            Link(
+                                href=f"{collection_url}/items/{feature_id}",
+                                rel="self",
+                                type="application/geo+json",
+                            ),
+                            Link(
+                                href=collection_url,
+                                rel="collection",
+                                type="application/json",
+                            ),
+                        ]
+                        yield feature
+                finally:
+                    aclose = getattr(items, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
 
             query_response.items = _ogc_post_process(query_response.items)
 
@@ -1079,6 +1071,8 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 target_srid=target_crs_srid or 4326,
                 links=links,
                 language=language,
+                offset=offset,
+                max_response_bytes=plugin_config.max_response_bytes,
             )
         except Exception as e:
             return handle_or_raise(
@@ -1094,7 +1088,12 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         collection_id: str,
         item_id: str,
         request: Request,
-        conn: AsyncConnection = Depends(get_async_connection),
+        # Bounded, fail-fast pool acquire (#2933/#2948): under pool
+        # saturation this returns 503 well before the request risks
+        # riding the Cloud Run ceiling, instead of queuing for the
+        # engine's full pool_timeout — same guard as STAC's item
+        # GET-by-id / item search (#2947).
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
         language: str = Depends(get_language),
     ):
         catalogs_svc = await self._get_catalogs_service()
@@ -1239,27 +1238,9 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 caller_id=self._principal_caller_id(request),
             )
 
-    # ------------------------------------------------------------------
-    # Web page contribution (WebPageContributor / StaticAssetProvider)
-    # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    @expose_static("features")
-    def provide_static_files(self) -> list:
-        """Exposes the internal static directory for the Features browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="features_browser",
@@ -1273,11 +1254,3 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
     )
     async def provide_features_browser(self, request: Request):
         return await self._serve_page_template("features_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")

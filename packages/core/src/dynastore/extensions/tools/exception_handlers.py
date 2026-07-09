@@ -190,6 +190,169 @@ class DatabaseInputExceptionHandler(ExceptionHandler):
         )
 
 
+def _extract_pgcode(exception: Exception) -> Optional[str]:
+    """Extract the raw PostgreSQL error code from a DatabaseError without leaking str(exception).
+
+    Walks the ``original_exception`` chain the same way ``get_conflict_context``
+    does, but avoids calling ``str()`` on any exception along the path so no
+    physical schema/table names are touched.
+    """
+    original = getattr(exception, "original_exception", None)
+    if original is None:
+        return None
+    # asyncpg: ``pgcode`` / ``sqlstate`` on the raw error object
+    pgcode = getattr(original, "pgcode", None) or getattr(original, "sqlstate", None)
+    if pgcode:
+        return str(pgcode)
+    # SQLAlchemy wraps asyncpg/psycopg2 as ``.orig``
+    orig_inner = getattr(original, "orig", None)
+    if orig_inner is not None:
+        pgcode = getattr(orig_inner, "pgcode", None) or getattr(orig_inner, "sqlstate", None)
+        if pgcode:
+            return str(pgcode)
+    return None
+
+
+class TableNotFoundExceptionHandler(ExceptionHandler):
+    """Maps ``TableNotFoundError`` (pgcode 42P01) to a clean HTTP 404.
+
+    A collection can be fully registered in the catalog/STAC index (served
+    from Elasticsearch) while its PostgreSQL feature table was never
+    persisted — e.g. an ingest job that OOM-crashed and rolled back before
+    the table-create transaction committed. Read surfaces that query the
+    PG hub table directly (maps render, vector tiles) then hit a raw
+    ``UndefinedTableError`` from asyncpg. Without this handler that bubbles
+    to the generic ``DatabaseErrorHandler`` below as an opaque 500.
+
+    The missing table means "nothing to render yet for this collection",
+    not a server malfunction, so this is surfaced as 404 with an actionable
+    message instead. Registered ahead of ``DatabaseErrorHandler`` so this
+    more specific mapping wins.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import TableNotFoundError
+
+        return isinstance(exception, TableNotFoundError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.tools.correlation import get_correlation_id
+
+        context = context or {}
+        collection_id = context.get("collection_id") or context.get("resource_id")
+        catalog_id = context.get("catalog_id")
+        cid = get_correlation_id() or "(no correlation id)"
+
+        # Full exception (may embed the physical table name) logged server-side only.
+        logger.error(
+            "Missing PostgreSQL feature table (catalog=%s, collection=%s, "
+            "correlation_id=%s): %s",
+            catalog_id, collection_id, cid, str(exception), exc_info=True,
+        )
+
+        if collection_id:
+            detail = (
+                f"Collection '{collection_id}' has no PostgreSQL feature table; "
+                f"ingest has not populated a renderable store."
+            )
+        else:
+            detail = (
+                "The requested collection has no PostgreSQL feature table; "
+                "ingest has not populated a renderable store."
+            )
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
+class PoolSaturationExceptionHandler(ExceptionHandler):
+    """Maps ``PoolSaturationError`` (DB pool-acquire timeout) to HTTP 503.
+
+    Raised by ``query_executor._acquire_async_engine_connection`` when the
+    bounded pool-acquire wait (``DBConfig.pool_acquire_timeout``, #1894)
+    elapses before a free connection becomes available. Without this
+    handler the exception falls through to the generic ``DatabaseErrorHandler``
+    below as an opaque 500. Instead this maps it to HTTP 503 + Retry-After —
+    "the pool is momentarily saturated, back off and retry" rather than
+    "something broke". Registered ahead of ``DatabaseErrorHandler`` so this
+    more specific mapping wins.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import PoolSaturationError
+
+        return isinstance(exception, PoolSaturationError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.modules.db_config.exceptions import PoolSaturationError
+
+        assert isinstance(exception, PoolSaturationError)
+        logger.warning("Database pool saturated: %s", exception)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection pool saturated, try again shortly.",
+            headers={"Retry-After": str(exception.retry_after)},
+        )
+
+
+class DatabaseErrorHandler(ExceptionHandler):
+    """Handles database errors with a sanitized HTTP response.
+
+    Logs the full ``str(exception)`` (which may embed raw asyncpg/psycopg2
+    messages containing internal physical schema/table names such as
+    ``c_<hash>`` and ``items_<hash>``) server-side only.  The HTTP 500 detail
+    is limited to: the exception type name (a safe error category), the bare
+    PostgreSQL error code when available (a standard identifier with no physical
+    names), and the correlation-id so operators can cross-reference the server
+    log for the full message.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        # Import locally to avoid circular dependencies
+        from dynastore.modules.db_config.exceptions import DatabaseError
+        return isinstance(exception, DatabaseError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.tools.correlation import get_correlation_id
+
+        context = context or {}
+        resource_name = context.get("resource_name", "Resource")
+        operation = context.get("operation", "operation")
+        resource_id = context.get("resource_id")
+
+        cid = get_correlation_id() or "(no correlation id)"
+
+        # Log the FULL exception string server-side (may contain physical names).
+        logger.error(
+            "Database error during %s on %s: %s (correlation_id=%s, resource_id=%s)",
+            operation,
+            resource_name,
+            str(exception),
+            cid,
+            resource_id,
+            exc_info=True,
+        )
+
+        # Build a sanitized HTTP detail: safe category + pgcode + correlation-id.
+        # Physical schema/table names from the raw PG message are deliberately omitted.
+        err_type = exception.__class__.__name__
+        pgcode = _extract_pgcode(exception)
+        pgcode_hint = f", pgcode={pgcode}" if pgcode else ""
+        sanitized_detail = (
+            f"Database error during {operation}"
+            f" ({err_type}{pgcode_hint}; correlation_id={cid})"
+        )
+
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=sanitized_detail,
+        )
+
+
 class ValidationExceptionHandler(ExceptionHandler):
     """Handles validation errors (ValueError, Pydantic ValidationError)."""
 
@@ -518,6 +681,22 @@ class ImmutableConfigExceptionHandler(ExceptionHandler):
         )
 
 
+class ConfigVersionConflictExceptionHandler(ExceptionHandler):
+    """Maps ``ConfigVersionConflictError`` (CAS write lost the race) to HTTP 409."""
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import ConfigVersionConflictError
+
+        return isinstance(exception, ConfigVersionConflictError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exception)
+        )
+
+
 class PluginNotFoundExceptionHandler(ExceptionHandler):
     """Handles plugin not found errors."""
 
@@ -734,6 +913,23 @@ class GcpFailedDependencyExceptionHandler(ExceptionHandler):
         )
 
 
+class GcpStorageDeferredExceptionHandler(ExceptionHandler):
+    """Maps ``GcpStorageDeferredError`` to HTTP 409 (Conflict)."""
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.gcp.errors import GcpStorageDeferredError
+
+        return isinstance(exception, GcpStorageDeferredError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exception),
+        )
+
+
 class GcpInternalErrorHandler(ExceptionHandler):
     """Maps ``GcpInternalError`` to HTTP 500 with the error message preserved.
 
@@ -782,12 +978,14 @@ class ExceptionHandlerRegistry:
         self.register(ConflictExceptionHandler())
         self.register(GcpServiceUnavailableExceptionHandler())
         self.register(GcpFailedDependencyExceptionHandler())
+        self.register(GcpStorageDeferredExceptionHandler())
         self.register(ConstraintViolationExceptionHandler())
         self.register(UnknownFieldsExceptionHandler())
         self.register(IndexMappingMismatchExceptionHandler())
         self.register(AssetSidecarRejectedExceptionHandler())
         self.register(CollectionNotAliveExceptionHandler())  # 404/410/503 — write gate
         self.register(ImmutableConfigExceptionHandler())
+        self.register(ConfigVersionConflictExceptionHandler())  # 409 — CAS write lost the race
         self.register(PluginNotFoundExceptionHandler())
         self.register(ConfigResolutionExceptionHandler())  # 500 — ops misconfig
         self.register(ConfigValidationExceptionHandler())
@@ -801,6 +999,9 @@ class ExceptionHandlerRegistry:
         )  # Catch programming errors before generic validation
         self.register(GcpInternalErrorHandler())  # GcpInternalError → 500 with message preserved
         self.register(DatabaseInputExceptionHandler())  # Catch DB input errors (400)
+        self.register(TableNotFoundExceptionHandler())  # 404 — missing PG hub table, not a server error
+        self.register(PoolSaturationExceptionHandler())  # 503 — bounded pool-acquire timeout (#1894)
+        self.register(DatabaseErrorHandler())  # Surface original DB exception details for better debugging
         self.register(ValidationExceptionHandler())  # Generic - must be last
 
     def register(self, handler: ExceptionHandler, prepend: bool = False) -> None:
@@ -1120,19 +1321,17 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
         "operation": f"{request.method} {request.url.path}",
     }
 
-    # Log the exception to the database and get a log_id for the response
+    # Log the exception (Elasticsearch-backed, #2749) and get a log_id for
+    # the response. immediate=True dispatches straight to the backend
+    # instead of buffering, so log_id is available before we build the
+    # response below.
     log_id = None
     try:
-        from dynastore.tools.discovery import get_protocol
-        from dynastore.models.protocols.database import DatabaseProtocol
-
-        db_svc = get_protocol(DatabaseProtocol)
-        engine = db_svc.engine if db_svc else None
-
         from dynastore.models.protocols.logs import LogsProtocol
+        from dynastore.tools.discovery import get_protocol
 
         log_event = get_protocol(LogsProtocol)
-        if log_event and engine:
+        if log_event:
             log_id = await log_event.log_event(
                 catalog_id=context.get("catalog_id", "_system_"),
                 event_type="exception",
@@ -1144,7 +1343,6 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
                     "traceback": traceback.format_exc(),
                     "request_context": context.get("request_context"),
                 },
-                db_resource=engine,
                 immediate=True,
             )
             if log_id:
@@ -1152,7 +1350,7 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
                 context["log_catalog"] = context.get("catalog_id", "_system_")
     except Exception as log_exc:
         logger.critical(
-            f"CRITICAL: Failed to log original exception to database: {log_exc}",
+            f"CRITICAL: Failed to log original exception: {log_exc}",
             exc_info=True,
         )
         logger.error(f"Original unlogged exception: {exc}", exc_info=True)
@@ -1164,14 +1362,33 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
         if isinstance(result, Response):
             return result
 
+        # Use only the handler-produced detail (already sanitized).
+        # str(exc) is intentionally omitted here: it may contain internal
+        # physical schema/table names that must not appear in HTTP responses.
+        # The full exception string is already captured by the logger.warning
+        # call above and (when available) in the database log entry.
         response_content = {
-            "detail": f"{getattr(result, 'detail', 'An unexpected error occurred.')} | Error: {str(exc)}"
+            "detail": getattr(result, "detail", "An unexpected error occurred.")
         }
         status_code = getattr(result, "status_code", 500)
 
         if log_id and status_code >= 500:
+            from urllib.parse import quote
+
+            from dynastore.models.shared_models import SYSTEM_CATALOG_ID
+
+            # Point at the logs API's ?log_id= filter. Log ids embed an
+            # ISO timestamp whose "+00:00" suffix breaks unencoded query
+            # strings ("+" decodes to a space), so percent-encode strictly.
             _root = request.scope.get("root_path", "").rstrip("/")
-            log_url = f"{_root}/web/#/logs?catalog={context['log_catalog']}&log_id={log_id}"
+            _log_catalog = context["log_catalog"]
+            if _log_catalog == SYSTEM_CATALOG_ID:
+                log_url = f"{_root}/logs/system?log_id={quote(log_id, safe='')}"
+            else:
+                log_url = (
+                    f"{_root}/logs/catalogs/{quote(_log_catalog, safe='')}"
+                    f"?log_id={quote(log_id, safe='')}"
+                )
             response_content["log_reference"] = {  # type: ignore[assignment]
                 "log_id": log_id,
                 "catalog_id": context["log_catalog"],

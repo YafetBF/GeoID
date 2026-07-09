@@ -53,7 +53,11 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
     ConsumerType,
 )
 from dynastore.tools.discovery import get_protocol
-from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.db import (
+    validate_sql_identifier,
+    validate_column_identifier,
+    qualify_table,
+)
 from dynastore.models.query_builder import QueryRequest, QueryResponse
 from dynastore.modules.catalog.query_optimizer import QueryOptimizer
 
@@ -101,6 +105,26 @@ def _pick_operation(request: Optional[QueryRequest]) -> str:
     if any(getattr(fc, "field", None) != "validity" for fc in filters):
         return Operation.SEARCH
     return Operation.READ
+
+
+def _derive_hints_from_request(
+    request: Optional[QueryRequest], hints: "FrozenSet[Hint]" = frozenset(),
+) -> "FrozenSet[Hint]":
+    """Union caller-supplied ``hints`` with hints implied by the request shape.
+
+    A non-empty ``request.group_by`` adds :attr:`Hint.GROUP_BY` so driver
+    resolution (:func:`dynastore.modules.storage.router.get_driver`) prefers a
+    GROUP_BY-capable entry — the default routing config declares it only on
+    the PostgreSQL entry — instead of dispatching to whatever driver SEARCH/
+    READ would otherwise pick (typically Elasticsearch), which silently
+    ignores ``group_by`` (#2829). Shared by every dispatch entry point that
+    forwards a ``QueryRequest`` to :func:`_try_driver_dispatch`.
+    """
+    from dynastore.modules.storage.hints import Hint
+
+    if request is not None and request.group_by:
+        return frozenset(hints) | {Hint.GROUP_BY}
+    return frozenset(hints)
 
 
 def is_query_fallback_driver(driver: Any) -> bool:
@@ -320,6 +344,129 @@ class ItemQueryMixin:
             )
             return None
 
+    async def _resolve_count_config(
+        self,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[Any]:
+        """Resolve :class:`ItemsCountConfig` for the collection.
+
+        Returns ``None`` when the configs protocol is unavailable; callers
+        then use the class defaults (``estimate_count=True``,
+        ``exact_count_threshold=50_000``).
+        """
+        try:
+            from dynastore.modules.storage.read_policy import ItemsCountConfig
+
+            configs = get_protocol(ConfigsProtocol)
+            if configs is None:
+                return None
+            return await configs.get_config(
+                ItemsCountConfig,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - count config miss must not break the read
+            logger.debug(
+                "count config resolution skipped for %s/%s: %s",
+                catalog_id,
+                collection_id,
+                exc,
+            )
+            return None
+
+    async def _resolve_number_matched(
+        self,
+        conn: Any,
+        phys_schema: str,
+        phys_table: str,
+        count_request: "QueryRequest",
+        context: Dict[str, Any],
+        catalog_id: str,
+        collection_id: str,
+        col_config: Any,
+        consumer: Any,
+    ) -> Optional[int]:
+        """Compute ``numberMatched`` via estimate or exact count.
+
+        Decision logic:
+        1. Load :class:`ItemsCountConfig` (defaults: ``estimate_count=True``,
+           ``exact_count_threshold=50_000``).
+        2. Query ``pg_class.reltuples`` for the physical table — O(1).
+        3. The planner estimate is only applicable when the request is
+           **unfiltered** (no structured filters, raw_where, or CQL2 filter).
+           Filtered requests always get an exact count because ``reltuples``
+           has no knowledge of the WHERE predicate — returning the table's
+           total row-count for a bbox-filtered query that matches 87 rows is
+           incorrect and breaks pagination.
+        4. For unfiltered requests: if the estimate is below
+           ``exact_count_threshold`` OR ``estimate_count=False``, run an exact
+           ``SELECT count(*)``.  Otherwise return the planner estimate.
+        5. For filtered requests (any filter present): always run an exact
+           ``SELECT count(*) FROM (filtered-sql) AS sub``.
+
+        OGC API Features §7.15 permits ``numberMatched`` to be approximate
+        only for unfiltered collection listings; filtered results must be exact
+        so pagination links and result counts remain correct.
+        """
+        from dynastore.modules.storage.read_policy import ItemsCountConfig
+
+        count_cfg = await self._resolve_count_config(catalog_id, collection_id)
+        if count_cfg is None:
+            count_cfg = ItemsCountConfig()
+
+        estimate_count: bool = bool(count_cfg.estimate_count)
+        exact_threshold: int = int(count_cfg.exact_count_threshold)
+
+        # Determine whether the request carries any filter predicate.
+        # cql_filter, filters (structured), and raw_where are all checked;
+        # item_ids is also a filter (restricts the result set).
+        has_filters = bool(
+            count_request.filters
+            or count_request.raw_where
+            or count_request.cql_filter
+            or count_request.item_ids
+            or count_request.bbox
+            or count_request.intersects
+            or count_request.datetime
+        )
+
+        if estimate_count and not has_filters:
+            # Fast O(1) planner estimate from pg_class, safe only for
+            # unfiltered listings.  ``reltuples`` is updated by ANALYZE; it is
+            # a reasonable proxy for the total live-row count of the collection.
+            try:
+                reltuples: int = await DQLQuery(
+                    'SELECT reltuples::bigint FROM pg_class '
+                    'WHERE oid = CAST(:table_oid AS regclass)',
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, table_oid=qualify_table(phys_schema, phys_table))
+                if reltuples is None:
+                    reltuples = 0
+            except Exception as exc:  # noqa: BLE001 - fall back to exact count
+                logger.debug(
+                    "pg_class reltuples lookup failed for %s.%s: %s — falling back to exact count",
+                    phys_schema, phys_table, exc,
+                )
+                reltuples = 0
+                estimate_count = False
+
+            if estimate_count and reltuples >= exact_threshold:
+                return reltuples
+
+        # Filtered requests, requests below the size threshold, or when
+        # estimation is disabled: run an exact count.
+        # Use a fresh copy of context so mutations from the data-query
+        # transformation pass do not bleed into the count transformation.
+        count_sql, count_params = await self._apply_query_transformations(
+            count_request, dict(context), catalog_id, collection_id, col_config,
+            db_resource=conn, consumer=consumer,
+        )
+        count_wrapper = f"SELECT count(*) FROM ({count_sql}) AS sub"
+        return await DQLQuery(
+            count_wrapper, result_handler=ResultHandler.SCALAR
+        ).execute(conn, **(count_params or {}))
+
     def map_row_to_feature(
         self,
         row: Dict[str, Any],
@@ -482,6 +629,8 @@ class ItemQueryMixin:
             )
             if params.get("cql_filter"):
                 query_req.cql_filter = params["cql_filter"]
+                query_req.filter_lang = params.get("filter_lang") or "cql2-text"
+                query_req.filter_crs_srid = params.get("filter_crs_srid")
             return query_req
 
         # Mandatory ID
@@ -526,6 +675,8 @@ class ItemQueryMixin:
         # tile filter, e.g. per-``asset_id`` rendering.
         if params.get("cql_filter"):
             query_req.cql_filter = params["cql_filter"]
+            query_req.filter_lang = params.get("filter_lang") or "cql2-text"
+            query_req.filter_crs_srid = params.get("filter_crs_srid")
 
         return query_req
 
@@ -538,12 +689,23 @@ class ItemQueryMixin:
         col_config: ItemsPostgresqlDriverConfig,
         db_resource: Optional[DbResource] = None,
         consumer: ConsumerType = ConsumerType.GENERIC,
+        read_policy: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Applies registered query transformations and generates optimized SQL.
 
         This centralizes the transformation logic used across get_features_query,
         _prepare_search, and stream_items.
+
+        ``read_policy`` (the collection's :class:`ItemsReadPolicy`) carries the
+        wire-shape contract. Threading it lets the optimizer resolve the
+        feature-id expression (``external_id_as_feature_id``) so the ``AS id``
+        projection and the ``item_ids`` predicate key on the SAME identifier the
+        read representation advertises — without it the optimizer defaults to the
+        bare ``geoid`` and a lookup by the advertised id (e.g. an opted-in
+        collection's ``external_id``) misses or 500s on the uuid cast (#3070).
+        Left ``None`` (the default for callers that don't need it) the behaviour
+        is unchanged.
         """
         from dynastore.models.protocols import QueryTransformProtocol
         from dynastore.tools.discovery import get_protocols
@@ -666,6 +828,7 @@ class ItemQueryMixin:
             col_config,
             consumer=consumer,
             schema_fields=context.get("schema_fields"),
+            read_policy=read_policy,
         )
         sql, params = optimizer.build_optimized_query(
             query_request, schema=phys_schema, table=phys_table
@@ -728,6 +891,29 @@ class ItemQueryMixin:
             if not phys_schema or not phys_table:
                 return None
 
+            # Resolve the wire-shape policy BEFORE the query so the ``item_ids``
+            # predicate keys on the SAME identifier the read representation
+            # advertises (#3070). When the collection opts into
+            # ``external_id_as_feature_id`` the optimizer resolves
+            # COALESCE(external_id, geoid) and a lookup by the authored
+            # external_id (e.g. "1") matches; otherwise the id is the geoid.
+            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
+            _ext_id_as_fid = bool(
+                getattr(getattr(read_policy, "feature_type", None),
+                        "external_id_as_feature_id", False)
+            )
+            if not _ext_id_as_fid:
+                # Geoid id-space: the optimizer builds
+                # ``h.geoid = ANY(CAST(:_item_ids AS uuid[]))``, so a non-UUID id
+                # (a stale external_id from a client that predates #3070, or a
+                # foreign id walked over from STAC) would raise an asyncpg
+                # DataError → 500. Short-circuit to a clean 404 instead.
+                import uuid as _uuid
+                try:
+                    _uuid.UUID(str(item_id))
+                except (ValueError, AttributeError, TypeError):
+                    return None
+
             from dynastore.models.query_builder import FieldSelection
             request = QueryRequest(
                 item_ids=[str(item_id)],
@@ -753,13 +939,12 @@ class ItemQueryMixin:
             consumer = getattr(context, "consumer", None) or ConsumerType.GENERIC
             sql, params = await self._apply_query_transformations(
                 request, query_ctx, catalog_id, collection_id, col_config,
-                db_resource=conn, consumer=consumer,
+                db_resource=conn, consumer=consumer, read_policy=read_policy,
             )
 
             result = await _run_query(conn, text(sql), params)
             row = result.mappings().first()
 
-            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
             return (
                 self.map_row_to_feature(
                     dict(row), col_config, lang=lang, context=context,
@@ -836,11 +1021,14 @@ class ItemQueryMixin:
                 sidecar = SidecarRegistry.get_sidecar(sc)
                 if sidecar is None:
                     continue
-                sc_table = f"{phys_table}_{sidecar.sidecar_id}"
+                # Validate identifiers before SQL interpolation (#2314)
+                fid_col = validate_column_identifier(sc.feature_id_field_name)
+                sc_id = validate_column_identifier(str(sidecar.sidecar_id))
+                sc_table = f"{phys_table}_{sc_id}"
                 ext_id = await DQLQuery(
-                    f'SELECT s.{sc.feature_id_field_name} '
-                    f'FROM "{phys_schema}"."{phys_table}" h '
-                    f'JOIN "{phys_schema}"."{sc_table}" s '
+                    f'SELECT s.{fid_col} '
+                    f'FROM {qualify_table(phys_schema, phys_table)} h '
+                    f'JOIN {qualify_table(phys_schema, sc_table)} s '
                     f"ON s.geoid = h.geoid "
                     f"WHERE h.geoid = :geoid "
                     f"AND h.deleted_at IS NULL "
@@ -854,6 +1042,56 @@ class ItemQueryMixin:
                 return None
 
             return None
+
+    async def _resolve_external_ids_to_geoids(
+        self,
+        conn: Any,
+        phys_schema: str,
+        phys_table: str,
+        sidecar_config: Any,
+        feature_id_field: str,
+        ext_ids: List[str],
+    ) -> List[str]:
+        """Resolve external/producer ids to their immutable ``geoid``(s) (#2314).
+
+        ``feature_id_field_name`` is only the *external* representation of a
+        feature. It is NOT unique within a collection — the same external id
+        repeats to represent successive versions of the same feature, each with
+        its own validity. Internally, sidecars are always joinable by ``geoid``,
+        the unique physical id of the item. So instead of matching tile
+        prior-bboxes on the external-id column directly (ambiguous under
+        versioning, and an identifier-interpolation risk because a column name
+        can't be a bound parameter), we resolve external ids to ``geoid`` here,
+        once, behind a validated identifier, and let the caller match on
+        ``h.geoid`` everywhere else.
+
+        When the sidecar manages validity, only the currently-valid version is
+        returned (``validity @> NOW()``); otherwise every matching geoid is
+        returned. The caller is degrade-safe, so any error here propagates to an
+        empty prior-bbox set rather than a captured-but-wrong one.
+        """
+        if not ext_ids:
+            return []
+        # Column/table names are interpolated as SQL identifiers (a parameter
+        # cannot bind an identifier), so validate them against the strict
+        # allowlist before they ever reach the query string.
+        field = validate_sql_identifier(feature_id_field)
+        sidecar_id = validate_sql_identifier(
+            str(getattr(sidecar_config, "sidecar_id", ""))
+        )
+        sc_table = f"{phys_table}_{sidecar_id}"
+        validity_clause = ""
+        validity_column = getattr(sidecar_config, "validity_column", None)
+        if getattr(sidecar_config, "has_validity", False) and validity_column:
+            vcol = validate_sql_identifier(str(validity_column))
+            validity_clause = f" AND s.{vcol} @> NOW()"
+        geoids = await DQLQuery(
+            f'SELECT DISTINCT s.geoid '
+            f'FROM {qualify_table(phys_schema, sc_table)} s '
+            f"WHERE s.{field} = ANY(:_ext_ids){validity_clause}",
+            result_handler=ResultHandler.ALL_SCALARS,
+        ).execute(conn, _ext_ids=[str(i) for i in ext_ids])
+        return [str(g) for g in (geoids or [])]
 
     async def _fetch_prior_bboxes_bulk(
         self,
@@ -875,6 +1113,15 @@ class ItemQueryMixin:
         identical to calling ``get_item`` per item. Callers must gate on
         ``is_tile_cache_active`` before calling this.
 
+        The caller supplies the wire-surface ids (``feature.id``) which may be
+        UUIDs (internal geoid) OR external/producer ids (e.g. CityJSON GUIDs).
+        The query adapts: when the collection has a sidecar with a
+        ``feature_id_field_name`` (the external-id column), the WHERE clause
+        matches against that text column so any string id is accepted. When no
+        such sidecar exists, the ids must be valid UUIDs to match the ``geoid``
+        column; non-UUID ids are filtered out and, if none remain, an empty
+        list is returned immediately.
+
         Degrade-safe: any exception returns ``[]`` so the caller's write is
         never blocked. Empty ``item_ids`` short-circuits immediately.
         """
@@ -887,41 +1134,95 @@ class ItemQueryMixin:
             if not phys_schema or not phys_table:
                 return []
 
+            import uuid as _uuid
+
+            from dynastore.modules.storage.drivers.pg_sidecars import driver_sidecars
+
             # Resolve bbox column name from the geometries sidecar config.
             # Default is ``bbox_geom``; fall back to that when no sidecar
             # config is found so the helper is robust to minimal environments.
             bbox_col = "bbox_geom"
-            from dynastore.modules.storage.drivers.pg_sidecars import driver_sidecars
+            # Find the geometries bbox column and the first sidecar that carries
+            # the external feature-id column (``feature_id_field_name``). The
+            # external id is only a presentation key; it is mutable and repeats
+            # across versions, so it is NEVER used as a match key here (#2314).
+            ext_id_field: Optional[str] = None
+            ext_id_sidecar: Any = None
             for sc in driver_sidecars(col_config):
                 if getattr(sc, "sidecar_type", None) == "geometries":
                     bbox_col = getattr(sc, "bbox_column", None) or bbox_col
-                    break
+                if ext_id_field is None:
+                    fid = getattr(sc, "feature_id_field_name", None)
+                    if fid:
+                        ext_id_field = fid
+                        ext_id_sidecar = sc
+
+            # Partition the wire-surface ids: valid UUIDs are already geoids;
+            # anything else is an external/producer id (e.g. a CityJSON GUID)
+            # that must be resolved to its geoid before matching. We ALWAYS match
+            # on ``h.geoid`` — the unique, immutable physical id — never on the
+            # external id, which is mutable, repeats across versions (ambiguous),
+            # and can't be bound as a parameter when used as a column name
+            # (identifier-interpolation risk). This supersedes the #2045
+            # text-column match while still accepting external ids (#2314).
+            geoids: List[str] = []
+            ext_ids: List[str] = []
+            for i in item_ids:
+                try:
+                    _uuid.UUID(str(i))
+                    geoids.append(str(i))
+                except (ValueError, AttributeError, TypeError):
+                    ext_ids.append(str(i))
+
+            can_resolve = bool(
+                ext_ids and ext_id_field is not None and ext_id_sidecar is not None
+            )
+            if not geoids and not can_resolve:
+                # Nothing matchable: no UUID geoids and no sidecar to resolve the
+                # external ids through. Short-circuit before any DB work.
+                return []
 
             from dynastore.models.protocols.access_filter import AccessFilter
 
-            request = QueryRequest(
-                item_ids=list(item_ids),
-                select=[],
-                raw_selects=[
-                    "h.geoid",
-                    f"ST_XMin(sc_geometries.{bbox_col}) AS _xmin",
-                    f"ST_YMin(sc_geometries.{bbox_col}) AS _ymin",
-                    f"ST_XMax(sc_geometries.{bbox_col}) AS _xmax",
-                    f"ST_YMax(sc_geometries.{bbox_col}) AS _ymax",
-                ],
-                limit=len(item_ids),
-                access_filter=AccessFilter.allow_everything(),
-            )
-            query_ctx: Dict[str, Any] = {
-                "catalog_id": catalog_id,
-                "collection_id": collection_id,
-                "col_config": col_config,
-            }
-            sql, params = await self._apply_query_transformations(
-                request, query_ctx, catalog_id, collection_id, col_config,
-            )
-
             async with managed_transaction(self.engine) as conn:
+                if ext_ids and ext_id_field is not None and ext_id_sidecar is not None:
+                    geoids.extend(
+                        await self._resolve_external_ids_to_geoids(
+                            conn, phys_schema, phys_table,
+                            ext_id_sidecar, ext_id_field, ext_ids,
+                        )
+                    )
+
+                if not geoids:
+                    # External ids resolved to nothing (unknown / fully expired).
+                    return []
+
+                request = QueryRequest(
+                    # item_ids is intentionally None: the id-matching WHERE is
+                    # injected via raw_where/raw_params below so the optimizer
+                    # never applies its own predicate.
+                    item_ids=None,
+                    select=[],
+                    raw_selects=[
+                        "h.geoid",
+                        f"ST_XMin(sc_geometries.{bbox_col}) AS _xmin",
+                        f"ST_YMin(sc_geometries.{bbox_col}) AS _ymin",
+                        f"ST_XMax(sc_geometries.{bbox_col}) AS _xmax",
+                        f"ST_YMax(sc_geometries.{bbox_col}) AS _ymax",
+                    ],
+                    raw_where="h.geoid = ANY(CAST(:_tile_prior_ids AS uuid[]))",
+                    raw_params={"_tile_prior_ids": geoids},
+                    limit=len(geoids),
+                    access_filter=AccessFilter.allow_everything(),
+                )
+                query_ctx: Dict[str, Any] = {
+                    "catalog_id": catalog_id,
+                    "collection_id": collection_id,
+                    "col_config": col_config,
+                }
+                sql, params = await self._apply_query_transformations(
+                    request, query_ctx, catalog_id, collection_id, col_config,
+                )
                 rows = await DQLQuery(
                     sql, result_handler=ResultHandler.ALL_DICTS,
                 ).execute(conn, **params)
@@ -1069,6 +1370,12 @@ class ItemQueryMixin:
             # ``_id``s the upsert path indexed under, so index-delete
             # propagation must key on them (not the external/path id).
             deleted_geoids: List[str] = []
+            # #2249: external id used to key the ITEM_DELETION event so the
+            # item->asset forward cascade (which matches asset_references by
+            # ref_id = external id, stamped at harvest) fires regardless of the
+            # delete path. On the sidecar path ``item_id`` is already the
+            # external id; on the geoid fallback below it is resolved explicitly.
+            resolved_external_id: Optional[str] = None
             if col_config and driver_sidecars(col_config):
                 from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
 
@@ -1077,15 +1384,18 @@ class ItemQueryMixin:
                         sidecar = SidecarRegistry.get_sidecar(sc)
                         if sidecar is None:
                             continue
-                        sc_table = f"{phys_table}_{sidecar.sidecar_id}"
+                        # Validate identifiers before SQL interpolation (#2314)
+                        fid_col = validate_column_identifier(sc.feature_id_field_name)
+                        sc_id = validate_column_identifier(str(sidecar.sidecar_id))
+                        sc_table = f"{phys_table}_{sc_id}"
                         # Soft-delete ALL hub rows linked to this external_id via the sidecar.
                         # DQLQuery handles both async/sync conns uniformly.
                         deleted_geoids = [
                             str(g) for g in await DQLQuery(
-                                f'UPDATE "{phys_schema}"."{phys_table}" h '
+                                f'UPDATE {qualify_table(phys_schema, phys_table)} h '
                                 f"SET deleted_at = NOW() "
-                                f'FROM "{phys_schema}"."{sc_table}" s '
-                                f"WHERE s.{sc.feature_id_field_name} = :ext_id "
+                                f'FROM {qualify_table(phys_schema, sc_table)} s '
+                                f"WHERE s.{fid_col} = :ext_id "
                                 f"AND h.deleted_at IS NULL "
                                 f"AND h.geoid = s.geoid "
                                 f"RETURNING h.geoid",
@@ -1111,6 +1421,15 @@ class ItemQueryMixin:
                     return 0
 
                 from dynastore.modules.catalog.item_service import soft_delete_item_query
+
+                # #2249: resolve the external id while the row is still active so
+                # the ITEM_DELETION event below is keyed consistently with the
+                # sidecar path (the forward cascade matches on the external id).
+                # Returns None when the collection has no external-id sidecar
+                # mapping, in which case we keep the geoid (existing behaviour).
+                resolved_external_id = await self.resolve_external_id_by_geoid(
+                    catalog_id, collection_id, str(item_id), ctx,
+                )
 
                 rows = await soft_delete_item_query.execute(
                     conn,
@@ -1146,7 +1465,7 @@ class ItemQueryMixin:
                             event_type=CatalogEventType.ITEM_DELETION,
                             catalog_id=catalog_id,
                             collection_id=collection_id,
-                            item_id=item_id,
+                            item_id=resolved_external_id or item_id,
                             payload={"original_id": item_id}
                         )
                 except Exception as e:
@@ -1297,7 +1616,7 @@ class ItemQueryMixin:
         offset = request.offset if request and request.offset else 0
         driver_response = await _try_driver_dispatch(
             catalog_id, collection_id, operation, request, limit, offset,
-            hints=hints,
+            hints=_derive_hints_from_request(request, hints),
         )
         if driver_response is not None:
             return driver_response
@@ -1392,6 +1711,15 @@ class ItemQueryMixin:
                     ),
                     None,
                 )
+                # #2899: whether the geometries sidecar keeps a bbox_geom
+                # envelope column — when it does, a skip-geometry read can
+                # still get feature.bbox from the cheap scalar bounds instead
+                # of dropping it alongside geometry.
+                _write_bbox = any(
+                    getattr(cfg, "write_bbox", False)
+                    for cfg in driver_sidecars(col_config)
+                    if getattr(cfg, "sidecar_type", None) == "geometries"
+                )
                 _narrowed = pushdown_read_select(
                     request.select,
                     _feature_type,
@@ -1399,6 +1727,7 @@ class ItemQueryMixin:
                     is_stac=(consumer == ConsumerType.STAC),
                     geometry_field=_geom_field,
                     skip_geometry=bool(getattr(request, "skip_geometry", False)),
+                    write_bbox=_write_bbox,
                 )
                 if _narrowed is not None:
                     request.select = _narrowed
@@ -1427,19 +1756,22 @@ class ItemQueryMixin:
 
             total_count = None
             if count_request is not None:
-                # numberMatched must reflect the full filtered result set, not
-                # the current page. Wrapping the limit-bearing data SQL in
-                # count(*) caps the total at the page size; build the count from
-                # the pagination-free request so the same filters apply without
-                # LIMIT/OFFSET.
-                count_sql, count_params = await self._apply_query_transformations(
-                    count_request, context, catalog_id, collection_id, col_config,
-                    db_resource=conn, consumer=consumer,
+                # numberMatched is computed via _resolve_number_matched which
+                # chooses between a fast planner estimate (pg_class.reltuples,
+                # O(1)) and an exact SELECT count(*) based on ItemsCountConfig.
+                # The page query no longer carries COUNT(*) OVER() so it returns
+                # in time proportional to the page size, not the collection size.
+                total_count = await self._resolve_number_matched(
+                    conn=conn,
+                    phys_schema=phys_schema,
+                    phys_table=phys_table,
+                    count_request=count_request,
+                    context=context,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    col_config=col_config,
+                    consumer=consumer,
                 )
-                count_wrapper = f"SELECT count(*) FROM ({count_sql}) AS sub"
-                total_count = await DQLQuery(
-                    count_wrapper, result_handler=ResultHandler.SCALAR
-                ).execute(conn, **(count_params or {}))
 
         # Stream Generator (O(1) Memory)
         lang = (request.raw_params or {}).get("lang", "en")
@@ -1547,6 +1879,7 @@ class ItemQueryMixin:
         offset = request.offset if request and request.offset else 0
         driver_response = await _try_driver_dispatch(
             catalog_id, collection_id, Operation.SEARCH, request, limit, offset,
+            hints=_derive_hints_from_request(request),
         )
         if driver_response is not None:
             # Collect the async stream into a list (search_items contract returns List).

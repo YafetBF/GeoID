@@ -144,27 +144,54 @@ def _get_platform_ddl() -> str:
     return """
 CREATE SCHEMA IF NOT EXISTS configs;
 
-CREATE TABLE IF NOT EXISTS configs.schemas (
-    schema_id    TEXT        PRIMARY KEY,
-    class_key    TEXT        NOT NULL,
-    schema_json  JSONB       NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by   TEXT
-);
-
-CREATE INDEX IF NOT EXISTS ix_schemas_class_key
-    ON configs.schemas (class_key);
-
 CREATE TABLE IF NOT EXISTS configs.platform_configs (
     ref_key     TEXT        PRIMARY KEY,
     class_key   TEXT        NOT NULL,
-    schema_id   TEXT        NOT NULL REFERENCES configs.schemas(schema_id),
+    schema_id   TEXT        NOT NULL,
     config_data JSONB       NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS ix_platform_configs_class_key
     ON configs.platform_configs (class_key);
+"""
+
+
+# Keep in sync with dynastore.modules.db_config.typed_store.ddl.LEADER_LEASE_DDL
+def _get_lease_ddl() -> str:
+    try:
+        from dynastore.modules.db_config.typed_store.ddl import LEADER_LEASE_DDL
+        return LEADER_LEASE_DDL
+    except ImportError:
+        pass
+    return """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.leader_lease (
+    lock_key    BIGINT      PRIMARY KEY,
+    lock_name   TEXT        NOT NULL,
+    owner       TEXT        NOT NULL,
+    epoch       BIGINT      NOT NULL DEFAULT 1,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+"""
+
+
+# Keep in sync with dynastore.modules.db_config.typed_store.ddl.INSTANCE_LIVENESS_DDL
+def _get_instance_liveness_ddl() -> str:
+    try:
+        from dynastore.modules.db_config.typed_store.ddl import INSTANCE_LIVENESS_DDL
+        return INSTANCE_LIVENESS_DDL
+    except ImportError:
+        pass
+    return """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.instance_liveness (
+    instance_id TEXT        PRIMARY KEY,
+    service     TEXT        NOT NULL,
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -196,10 +223,16 @@ def _log(msg: str) -> None:
 # ── Reset modes ────────────────────────────────────────────────────────────────
 
 async def _reset_configs(conn, dry_run: bool) -> None:
-    ddl = _get_platform_ddl()
-    stmts = ["DROP SCHEMA IF EXISTS configs CASCADE;"] + [
-        s.strip() + ";" for s in ddl.strip().split(";") if s.strip()
+    platform_ddl = _get_platform_ddl()
+    lease_ddl = _get_lease_ddl()
+    instance_liveness_ddl = _get_instance_liveness_ddl()
+    all_ddl_stmts = [
+        s.strip() + ";"
+        for ddl in (platform_ddl, lease_ddl, instance_liveness_ddl)
+        for s in ddl.strip().split(";")
+        if s.strip()
     ]
+    stmts = ["DROP SCHEMA IF EXISTS configs CASCADE;"] + all_ddl_stmts
     if dry_run:
         _log("-- DRY RUN: configs schema statements --")
         for s in stmts:
@@ -208,10 +241,8 @@ async def _reset_configs(conn, dry_run: bool) -> None:
 
     await conn.execute("DROP SCHEMA IF EXISTS configs CASCADE;")
     _log("configs schema dropped OK")
-    for stmt in ddl.strip().split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            await conn.execute(stmt + ";")
+    for stmt in all_ddl_stmts:
+        await conn.execute(stmt)
     _log("configs schema DDL recreated OK")
 
 

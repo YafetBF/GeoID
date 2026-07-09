@@ -33,11 +33,15 @@ license-files = ["../../LICENSE"]
 # `module_*` extras and only lands in environments whose SCOPE pulls them in.
 dependencies = [
     "pydantic>=2.0",
-    "pydantic-settings>=2.3.0",
+    "pydantic-settings>=2.14.2",
     "pydantic-extra-types>=2.10.6",
     "python-dotenv>=1.0.0",
     "python-dateutil",
     "orjson>=3.9.0",
+    # tools/secrets.py Fernet-encrypts `{"__secret__": ...}` config fields;
+    # engine configs carrying encrypted credentials (e.g. valkey_engine_config)
+    # fail to load in build_engine_snapshot without it. See #2976.
+    "cryptography>=48.0.1",
 ]
 
 # ============================================================================
@@ -47,46 +51,45 @@ dependencies = [
 # deps aren't installed (because the SCOPE didn't pull them in) raise
 # ImportError and are skipped — same behavior as before the wheel split.
 #
-# NOTE: the `datastore` entry-point (DatastoreModule / sync psycopg2 engine) is
-# intentionally absent here.  It ships in the separate `dynastore-module-datastore`
-# wheel so it is only registered in environments whose SCOPE selects
-# `module_datastore` (i.e. sync-worker tasks).  API/catalog SCOPEs
-# (`scope_catalog`, `scope_geoid`) do not include `module_datastore`, so the
-# entry-point is absent from importlib.metadata on those services regardless of
-# whether pyiceberg transitively installs psycopg2-binary.  See #1748.
+# NOTE: several entry-points are intentionally absent here.  They ship in
+# separate stub wheels under packages/modules/<name>/ so they are only
+# registered in environments whose SCOPE installs the corresponding extra:
+#
+#   dynastore-module-datastore    — `datastore` (sync psycopg2 engine).
+#                                   Absent from API/catalog SCOPEs so pyiceberg's
+#                                   transitive psycopg2-binary never triggers
+#                                   unexpected DatastoreModule discovery.  See #1748.
+#   dynastore-module-elasticsearch — `elasticsearch`, `storage_elasticsearch`,
+#                                   `storage_elasticsearch_private`,
+#                                   `storage_elasticsearch_envelope`,
+#                                   `storage_elasticsearch_assets`,
+#                                   `collection_elasticsearch`,
+#                                   `catalog_elasticsearch`.  See #2465.
+#   dynastore-module-gcp          — `gcp`, `storage_bigquery`.  See #2465.
+#   dynastore-module-cache        — `cache`.  See #2465.
+#   dynastore-module-storage-iceberg — `storage_iceberg`.  See #2465.
+#   dynastore-module-storage-duckdb  — `storage_duckdb`.  See #2465.
+#   dynastore-module-gdal            — `gdal`.  See #2465.
+#   dynastore-module-tiles           — `tiles`.  See #2465.
+#   dynastore-module-crs             — `crs`.  See #2465.
+#   dynastore-module-web             — `web`.  See #2465.
+#   dynastore-module-iam             — `iam`.  See #2465.
+#   dynastore-module-styles          — `styles`.  See #2465.
+#   dynastore-module-local           — `local_upload`.  See #2465.
+#   dynastore-module-notebooks       — `notebooks`.  See #2465.
 # ============================================================================
 [project.entry-points."dynastore.modules"]
-cache = "dynastore.modules.cache.cache_module:CacheModule"
 tasks = "dynastore.modules.tasks.tasks_module:TasksModule"
 proxy = "dynastore.modules.proxy.proxy_module:ProxyModule"
-gdal = "dynastore.modules.gdal.gdal_module:GdalModule"
 catalog = "dynastore.modules.catalog.catalog_module:CatalogModule"
-gcp = "dynastore.modules.gcp.gcp_module:GCPModule"
-tiles = "dynastore.modules.tiles.tiles_module:TilesModule"
-styles = "dynastore.modules.styles.styles_module:StylesModule"
 moving_features = "dynastore.modules.moving_features.mf_module:MovingFeaturesModule"
-local_upload = "dynastore.modules.local.local_upload:LocalUploadModule"
 connected_systems = "dynastore.modules.connected_systems.ddl:ConnectedSystemsModule"
 db_config = "dynastore.modules.db_config.db_config_service:DBConfigModule"
-iam = "dynastore.modules.iam.module:IamModule"
 db = "dynastore.modules.db.db_service:DBService"
-crs = "dynastore.modules.crs.crs_module:CRSModule"
 task_event_driver = "dynastore.modules.tasks.event_driver:TaskEventDriver"
-notebooks = "dynastore.modules.notebooks.notebooks_module:NotebooksModule"
 stac = "dynastore.modules.stac.module:StacModule"
-elasticsearch = "dynastore.modules.elasticsearch.module:ElasticsearchModule"
 stats = "dynastore.modules.stats.stats_module:STATS"
-web = "dynastore.modules.web.web_module:WebModule"
 storage_postgresql = "dynastore.modules.storage.drivers.postgresql:ItemsPostgresqlDriver"
-storage_elasticsearch = "dynastore.modules.storage.drivers.elasticsearch:ItemsElasticsearchDriver"
-storage_elasticsearch_private = "dynastore.modules.storage.drivers.elasticsearch_private:ItemsElasticsearchPrivateDriver"
-storage_elasticsearch_envelope = "dynastore.modules.storage.drivers.elasticsearch_envelope:ItemsElasticsearchEnvelopeDriver"
-storage_elasticsearch_assets = "dynastore.modules.storage.drivers.elasticsearch:AssetElasticsearchDriver"
-storage_duckdb = "dynastore.modules.storage.drivers.duckdb:ItemsDuckdbDriver"
-storage_iceberg = "dynastore.modules.storage.drivers.iceberg:ItemsIcebergDriver"
-storage_bigquery = "dynastore.modules.storage.drivers.bigquery:ItemsBigQueryDriver"
-collection_elasticsearch = "dynastore.modules.elasticsearch.collection_es_driver:CollectionElasticsearchDriver"
-catalog_elasticsearch = "dynastore.modules.elasticsearch.catalog_es_driver:CatalogElasticsearchDriver"
 collection_postgresql = "dynastore.modules.storage.drivers.collection_postgresql:CollectionPostgresqlDriver"
 catalog_postgresql = "dynastore.modules.storage.drivers.catalog_postgresql:CatalogPostgresqlDriver"
 metadata_catalog_log_indexer = "dynastore.modules.storage.drivers.catalog_log_indexer:LogCatalogIndexer"
@@ -106,6 +109,7 @@ envelope_attrs_backfill = "dynastore.tasks.elasticsearch_indexer.envelope_backfi
 elasticsearch_private_tasks = "dynastore.modules.storage.drivers.elasticsearch_private.tasks:PrivateIndexTask"
 ingestion = "dynastore.tasks.ingestion.ingestion_task:IngestionTask"
 dwh_join = "dynastore.tasks.dwh_join.dwh_join_export_task:DwhJoinExportTask"
+joins_export = "dynastore.tasks.joins_export.joins_export_task:JoinsExportTask"
 export_features = "dynastore.tasks.export_features.export_features_task:ExportFeaturesTask"
 tiles_preseed = "dynastore.tasks.tiles_preseed.task:TilePreseedTask"
 tiles_invalidate = "dynastore.tasks.tiles_invalidate.task:TileInvalidateTask"
@@ -117,9 +121,24 @@ requeue_dead_letter_tasks = "dynastore.tasks.requeue_dead_letter.task:RequeueDea
 requeue_dead_letter_events = "dynastore.tasks.requeue_dead_letter_events.task:RequeueDeadLetterEventsTask"
 stac_harvest = "dynastore.tasks.stac_harvest.task:StacHarvestTask"
 storage_drain = "dynastore.tasks.workclass_drain.storage_drain_task:StorageDrainTask"
+storage_drain_offload = "dynastore.tasks.workclass_drain.storage_drain_task:StorageDrainOffloadTask"
 event_drain = "dynastore.tasks.workclass_drain.event_drain_task:EventDrainTask"
 collection_hard_delete = "dynastore.tasks.collection_hard_delete.task:CollectionHardDeleteTask"
 webhook_delivery = "dynastore.tasks.webhook_delivery.task:WebhookDeliveryTask"
+catalog_provision = "dynastore.tasks.catalog_provision.task:CatalogProvisionTask"
+render_preseed = "dynastore.tasks.render_preseed.task:RenderPreseedTask"
+
+# ============================================================================
+# PRESETS — lightweight, entry-point-discovered preset registrations (#2601).
+# Each module registers itself via `register_preset()` as an import
+# side-effect (see `modules/storage/presets/registry.py:load_preset_entry_points`).
+# `common_dimensions` triggers the `dimensions_materialize` task above but
+# imports nothing from the `dimensions` extension or `ogc_dimensions` itself,
+# so any process serving `/configs/presets` can list/apply it without
+# installing the full dimensions extension.
+# ============================================================================
+[project.entry-points."dynastore.presets"]
+common_dimensions = "dynastore.tasks.dimensions_materialize.preset"
 
 [build-system]
 requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]

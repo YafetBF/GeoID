@@ -33,7 +33,7 @@ import asyncio
 import inspect
 from typing import Callable, Awaitable, List, Dict, Any, Union, Tuple, Optional
 from pydantic import BaseModel, ConfigDict
-from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.modules.db_config.query_executor import DbResource, best_effort_savepoint
 from dynastore.tools.async_utils import signal_bus
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols import DatabaseProtocol
@@ -302,11 +302,24 @@ class LifecycleRegistry:
 
     # Synchronous transactional hook registration
     def sync_catalog_initializer(
-        self, priority: int = 0
+        self, priority: int = 0, critical: bool = False
     ) -> Callable[[SyncCatalogInitializer], SyncCatalogInitializer]:
-        """Decorator to register a catalog initialization hook."""
+        """Decorator to register a catalog initialization hook.
+
+        ``critical=True`` marks a hook whose failure must abort the catalog
+        creation rather than being isolated and skipped. Like every hook it
+        still runs inside a SAVEPOINT (so a mid-flight failure cannot poison
+        sibling hooks), but when that SAVEPOINT rolls back the error is
+        re-raised instead of swallowed, propagating up to roll back the outer
+        creation transaction. Use only for modules whose per-tenant tables the
+        catalog is functionally broken without (e.g. IAM ``policies``): a
+        best-effort savepoint is the wrong home for a table authorization
+        hard-depends on. Non-critical hooks keep the default isolated-and-skip
+        behaviour so one optional module cannot block catalog creation.
+        """
 
         def decorator(func: SyncCatalogInitializer) -> SyncCatalogInitializer:
+            func._lifecycle_critical = critical  # type: ignore[attr-defined]
             return self._register_hook(self._sync_catalog_initializers, priority, func)
 
         # Handle case where it's used without parentheses: @registry.sync_catalog_initializer
@@ -513,48 +526,44 @@ class LifecycleRegistry:
 
         Returns True if successful, False if the initializer failed
         (non-fatal). Raises if the outer transaction itself is already
-        aborted (fatal).
+        aborted, or the connection is dead, or the hook is registered
+        ``critical`` (all fatal — caller must roll back the outer
+        transaction / abort catalog creation).
         """
-        from sqlalchemy.ext.asyncio import AsyncConnection
+        from dynastore.modules.db_config.exceptions import DatabaseConnectionError
 
-        # Only use begin_nested on async connections that support it
-        if not isinstance(conn, AsyncConnection):
-            # Sync connection or engine — call directly with try/except
-            try:
-                result = func(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    await result
-                return True
-            except Exception as e:
-                logger.error(f"{label} failed: {e}", exc_info=True)
+        def _tolerate(exc: BaseException) -> bool:
+            error_str = str(exc)
+            # Fatal connection errors — cannot continue on a dead connection.
+            if isinstance(exc, DatabaseConnectionError) or "ConnectionDoesNotExistError" in error_str:
+                logger.error(f"{label}: fatal connection error. Aborting lifecycle hooks. Error: {exc}")
                 return False
-
-        try:
-            async with conn.begin_nested():
-                result = func(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    await result
-            return True
-        except Exception as e:
-            # If begin_nested itself fails, the outer transaction is already aborted
-            # (InFailedSQLTransactionError on SAVEPOINT creation). This is fatal.
-            error_str = str(e)
-            
-            # Check for fatal connection errors - we cannot continue on a dead connection
-            from dynastore.modules.db_config.exceptions import DatabaseConnectionError
-            if isinstance(e, DatabaseConnectionError) or "ConnectionDoesNotExistError" in error_str:
-                logger.error(f"{label}: fatal connection error. Aborting lifecycle hooks. Error: {e}")
-                raise
-
+            # If begin_nested itself fails, the outer transaction is already
+            # aborted (InFailedSQLTransactionError on SAVEPOINT creation).
             if "InFailedSQLTransaction" in error_str or "current transaction is aborted" in error_str:
                 logger.error(
                     f"{label}: outer transaction already aborted before SAVEPOINT. "
-                    f"Cannot continue lifecycle initialization. Error: {e}"
+                    f"Cannot continue lifecycle initialization. Error: {exc}"
                 )
-                raise  # fatal — caller must roll back the outer transaction
-            # Otherwise the SAVEPOINT was rolled back cleanly; log and continue
-            logger.error(f"{label} failed (SAVEPOINT rolled back, outer tx healthy): {e}", exc_info=True)
-            return False
+                return False
+            # Otherwise the SAVEPOINT was rolled back cleanly; the outer tx is
+            # still healthy so a critical hook can re-raise to abort the create,
+            # while a normal hook is logged and skipped.
+            if getattr(func, "_lifecycle_critical", False):
+                logger.error(
+                    f"{label} is CRITICAL and failed (SAVEPOINT rolled back); "
+                    f"aborting catalog creation. Error: {exc}",
+                    exc_info=True,
+                )
+                return False
+            logger.error(f"{label} failed (SAVEPOINT rolled back, outer tx healthy): {exc}", exc_info=True)
+            return True
+
+        async with best_effort_savepoint(conn, tolerate=_tolerate) as outcome:
+            result = func(*args, **kwargs)
+            if inspect.isawaitable(result):
+                await result
+        return outcome.error is None
 
     async def init_catalog(
         self, conn: DbResource, schema: str, catalog_id: str
@@ -1101,6 +1110,7 @@ class LifecycleRegistry:
                         ResultHandler,
                     )
                     from dynastore.tasks import get_loaded_task_types
+                    from dynastore.tools.db import qualify_table
 
                     schema = get_task_schema()
                     loaded_types = list(get_loaded_task_types())
@@ -1111,7 +1121,7 @@ class LifecycleRegistry:
                         placeholders = ", ".join(f":t_{i}" for i in range(len(loaded_types)))
                         type_params = {f"t_{i}": t for i, t in enumerate(loaded_types)}
                         count_sql = (
-                            f"SELECT COUNT(*) FROM {schema}.tasks "
+                            f"SELECT COUNT(*) FROM {qualify_table(schema, 'tasks')} "
                             f"WHERE status IN ('PENDING', 'ACTIVE', 'RUNNING') "
                             f"AND task_type IN ({placeholders})"
                         )

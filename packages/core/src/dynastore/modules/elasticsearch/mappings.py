@@ -42,7 +42,8 @@ Design philosophy (post-#887):
     entries are unaffected (they carry no ``container`` attribute and
     continue to land in ``properties``).
 """
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from dynastore.modules.elasticsearch.items_projection import (
     LANGUAGE_ANALYZERS,
@@ -250,6 +251,13 @@ CANONICAL_SYSTEM_TYPES: Dict[str, Any] = {
     "validity":         {"type": "date_range"},
     "transaction_time": {"type": "date"},
     "deleted_at":       {"type": "date"},
+    # Transitional lifecycle overlay stamped on collection docs while async
+    # provisioning or hard-delete teardown is in flight.  Absent on active
+    # collection docs, so a ``terms`` must-not filter on this field leaves
+    # active docs (field missing) visible.  Keyword so the filter is exact.
+    # NOTE: existing indices need a one-time offline ``PUT /_mapping`` to add
+    # this field before the filter takes effect on already-indexed docs.
+    "lifecycle_status": {"type": "keyword"},
 }
 
 # Only the fixed-name geometry stats whose emitted shape is verified are pinned
@@ -292,12 +300,35 @@ def _es_type_to_json_schema(es_def: Dict[str, Any]) -> Dict[str, Any]:
     if t == "date":
         return {"type": "string", "format": "date-time"}
     if t == "date_range":
-        # JSON Schema has no native temporal-range type; advertise it as a
-        # date-time string filterable with temporal operators.
+        # JSON Schema has no native temporal-range type. Advertise the same
+        # ``[start, end]`` RFC 3339 interval shape already used for
+        # collection/catalog extents (see
+        # ``shared_models.TemporalExtent.interval``) instead of a scalar
+        # date-time, so a client can tell this is a range with an open
+        # (``null``) end, not a single instant (refs #2230). It remains
+        # filterable via CQL2 temporal operators (``t_before``, ``t_after``,
+        # ``t_intersects``, ``t_disjoint``, ``t_during``, ``t_equals``, …)
+        # against the flat property name.
         return {
-            "type": "string",
-            "format": "date-time",
-            "description": "Temporal validity range; filter with temporal operators.",
+            "type": "object",
+            "properties": {
+                "interval": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"type": ["string", "null"], "format": "date-time"},
+                    },
+                },
+            },
+            "description": (
+                "Temporal validity range as an [start, end] RFC 3339 interval "
+                "(null = open-ended); filter with CQL2 temporal operators "
+                "(t_before, t_after, t_intersects, t_disjoint, t_during, "
+                "t_equals, ...)."
+            ),
         }
     if t in ("double", "float", "half_float", "scaled_float"):
         return {"type": "number"}
@@ -816,15 +847,48 @@ def get_assets_index_name(prefix: str, catalog_id: str) -> str:
 
 
 
-def get_log_index_name(prefix: str) -> str:
-    """Return the name of the logs index."""
-    return f"{prefix}-logs"
+_LOG_INDEX_MONTH_FORMAT = "%Y.%m"
+
+
+def get_log_index_name(prefix: str, when: Optional[datetime] = None) -> str:
+    """Return the monthly log index active at *when* (default: now, UTC).
+
+    Logs write to one index per calendar month — ``{prefix}-logs-YYYY.MM``
+    (#2797) — so a single month's volume never bloats one segment set and
+    whole months can be dropped by the ``es_logs_retention`` maintenance job
+    (``modules/catalog/maintenance_supervisor.py``). Read/search call sites
+    must never target this directly — use :func:`get_log_index_pattern` (or
+    :func:`get_log_read_index_target` to also cover the pre-#2797 flat
+    index) so a query sees every live month.
+    """
+    ts = when or datetime.now(timezone.utc)
+    return f"{prefix}-logs-{ts.strftime(_LOG_INDEX_MONTH_FORMAT)}"
+
+
+def get_log_index_pattern(prefix: str) -> str:
+    """Wildcard spanning every monthly log index for *prefix*.
+
+    Used by the retention job, which only ever needs to enumerate/delete
+    monthly indices — the pre-#2797 flat ``{prefix}-logs`` index (if still
+    present) never matches this pattern and is never touched here.
+    """
+    return f"{prefix}-logs-*"
+
+
+def get_log_read_index_target(prefix: str) -> str:
+    """Index target for log reads/searches: every monthly index, plus the
+    pre-#2797 flat ``{prefix}-logs`` index (comma-separated multi-target).
+
+    The flat index name has no trailing ``-YYYY.MM``, so it does not match
+    :func:`get_log_index_pattern`'s wildcard — any pre-#2797 docs it still
+    holds would otherwise silently vanish from search/get results.
+    """
+    return f"{prefix}-logs,{get_log_index_pattern(prefix)}"
 
 
 LOG_MAPPING: Dict[str, Any] = {
     "dynamic": False,
     "properties": {
-        "id": {"type": "keyword"},
         "catalog_id": {"type": "keyword"},
         "collection_id": {"type": "keyword"},
         "event_type": {"type": "keyword"},
@@ -832,5 +896,24 @@ LOG_MAPPING: Dict[str, Any] = {
         "is_system": {"type": "boolean"},
         "message": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
         "timestamp": {"type": "date"},
+        # Retrieval-only (#2798): never tokenized/searched, just stored so the
+        # `log_reference` deep link on a 5xx response can show the traceback
+        # that motivated the lookup.
+        "stacktrace": {"type": "text", "index": False},
+        # method/path/status/caller id, etc. `flattened` is the same
+        # unknown-tail idiom used by the items/collections `extras` lane —
+        # ES-only; _backend_compat rewrites it to `flat_object` on OpenSearch.
+        "request_context": {"type": "flattened"},
     },
+}
+
+# Logs are a low-value, high-volume stream — they must not cost item-
+# indexing capacity. No replicas (losing a log on node loss is acceptable),
+# a relaxed refresh interval (search freshness isn't latency-critical here),
+# and async translog durability (bounded data loss on a hard crash, in
+# exchange for not fsync-ing every bulk request).
+LOG_INDEX_SETTINGS: Dict[str, Any] = {
+    "number_of_replicas": 0,
+    "refresh_interval": "30s",
+    "translog.durability": "async",
 }

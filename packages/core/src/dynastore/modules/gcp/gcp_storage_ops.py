@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Optional, Dict, Any
+from typing import ClassVar, FrozenSet, List, Optional, Dict, Any
 
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols import (
@@ -37,6 +37,10 @@ class GcpStorageOpsMixin:
     # AssetUploadProtocol surface
     driver_id: str = "gcs"
     supports_versioning: bool = False
+
+    # Scheme-claim for the tile-writer registry (tiles_writers.py) and
+    # tile_blob_storage.StorageTileWriter — this backend serves ``gs://`` URIs.
+    supported_schemes: ClassVar[FrozenSet[str]] = frozenset({"gs"})
 
     # --- Host interface stubs (provided by GCPModule) ---
     _upload_tickets: Dict[str, Dict[str, Any]]
@@ -95,6 +99,14 @@ class GcpStorageOpsMixin:
         """StorageProtocol: Downloads a file from storage to local."""
         return await self.get_bucket_service().download_file(source_path, target_path)
 
+    async def download_file_content(self, path: str) -> Optional[bytes]:
+        """StorageProtocol: Downloads a full object as bytes, or None if absent."""
+        return await self.get_bucket_service().download_file_content(path)
+
+    async def list_prefix(self, base_uri: str, prefix: str) -> List[str]:
+        """StorageProtocol: List object paths under a bucket + key prefix."""
+        return await self.get_bucket_service().list_prefix(base_uri, prefix)
+
     async def file_exists(self, path: str) -> bool:
         """StorageProtocol: Checks if a file exists in storage."""
         return await self.get_bucket_service().file_exists(path)
@@ -108,11 +120,11 @@ class GcpStorageOpsMixin:
         return await self.get_bucket_service().download_bytes_range(path, offset, length)
 
     async def ensure_storage_for_catalog(
-        self, catalog_id: str, conn: Optional[Any] = None
+        self, catalog_id: str, conn: Optional[Any] = None, raise_on_failure: bool = False
     ) -> Optional[str]:
         """StorageProtocol: Ensures that storage exists for a catalog, creating it if it doesn't."""
         return await self.get_bucket_service().ensure_storage_for_catalog(
-            catalog_id, conn=conn
+            catalog_id, conn=conn, raise_on_failure=raise_on_failure
         )
 
     async def drop_storage(
@@ -177,6 +189,7 @@ class GcpStorageOpsMixin:
             GcpFailedDependencyError,
             GcpInternalError,
             GcpServiceUnavailableError,
+            GcpStorageDeferredError,
         )
         from dynastore.modules.gcp.tools import bucket as bucket_tool
         from dynastore.modules.gcp.gcp_config import (
@@ -208,8 +221,59 @@ class GcpStorageOpsMixin:
 
         bucket_name = await self.get_storage_identifier(catalog_id)
         if not bucket_name:
-            raise GcpInternalError(
-                f"Bucket for catalog '{catalog_id}' was not found despite 'ready' status."
+            # Distinguish a deliberately deferred catalog from a stale ready
+            # state (the step IS in the checklist, marked done, but the
+            # bucket is gone). Since un-fao/GeoID#2678 a ``?hints=defer``
+            # create records the held-back step as "deferred" (a terminal
+            # checklist state), rather than omitting the key — but a catalog
+            # created before that fix landed still has the key simply
+            # absent, so both are treated as deferred here.
+            from dynastore.modules.catalog.provisioning_registry import (
+                STEP_DEFERRED,
+            )
+
+            checklist = {}
+            try:
+                checklist = await catalogs_provider.get_provisioning_checklist(catalog_id) or {}
+            except Exception:
+                checklist = {}
+            gcp_bucket_state = checklist.get("gcp_bucket")
+            if gcp_bucket_state is None or gcp_bucket_state == STEP_DEFERRED:
+                # Storage was deferred at create (?hints=defer) and never
+                # provisioned — the catalog is intentionally bucket-free, not
+                # broken. Don't demote; tell the caller to provision on demand.
+                raise GcpStorageDeferredError(
+                    f"Catalog '{catalog_id}' was created without storage "
+                    f"(deferred provisioning), so it has no GCS bucket to upload "
+                    f"into. Provision its storage first by spawning a "
+                    f"catalog_provision task: POST /task/catalogs/{catalog_id} "
+                    f'with {{"task_type": "catalog_provision", "inputs": '
+                    f'{{"operation": "provision"}}}}. Data that already lives '
+                    f"elsewhere can instead be registered as a virtual asset "
+                    f"(POST /catalogs/{catalog_id}/virtual-assets), which needs no "
+                    f"bucket."
+                )
+            # The catalog claims ready but has no backing bucket — the stored
+            # provisioning status is stale. Demote it (best-effort, must not mask
+            # the error below) so the operator can see the broken state and
+            # reprovision via POST /catalog/catalogs/{catalog_id}/reprovision.
+            # ``catalogs_provider`` was already resolved and guarded above.
+            try:
+                await catalogs_provider.mark_provisioning_step(
+                    catalog_id, "gcp_bucket", "failed"
+                )
+            except Exception as demote_exc:
+                logger.warning(
+                    "initiate_upload: could not demote catalog '%s' after "
+                    "missing-bucket detection: %s",
+                    catalog_id, demote_exc,
+                )
+            raise GcpFailedDependencyError(
+                f"Catalog '{catalog_id}' is marked ready but its backing GCS bucket is "
+                f"missing — the catalog has been flagged for re-provisioning. Re-run "
+                f"provisioning via POST /catalog/catalogs/{catalog_id}/reprovision "
+                f"(if eventing previously failed on a permission error, also ensure the "
+                f"Pub/Sub IAM grant pubsub.topics.attachSubscription is in place first)."
             )
 
         storage_client = self.get_storage_client()

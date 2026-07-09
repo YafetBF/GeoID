@@ -30,6 +30,7 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     DQLQuery,
 )
+from dynastore.tools.cache import cached
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from .tiles_models import TileMatrixSet
 
@@ -39,6 +40,21 @@ logger = logging.getLogger(__name__)
 check_srid_query = text(
     "SELECT EXISTS (SELECT 1 FROM spatial_ref_sys WHERE srid = :srid)"
 )
+
+
+@cached(namespace="tiles_srid_exists", ttl=3600, ignore=["conn"])
+async def _srid_exists(conn, srid: int) -> bool:
+    """Check whether ``srid`` is registered in PostGIS ``spatial_ref_sys``.
+
+    The registered SRID set is static at runtime, so this is memoized
+    (keyed on ``srid`` only, ``conn`` excluded from the cache key) instead
+    of re-querying on every tile cache miss.
+    """
+    return bool(
+        await DQLQuery(
+            check_srid_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
+        ).execute(conn, srid=srid)
+    )
 
 
 def _calculate_tile_envelope_wkb(
@@ -91,15 +107,25 @@ async def _build_collection_subquery(
     index_i: int,
     datetime_str: Optional[str] = None,
     cql_filter: Optional[str] = None,
+    filter_lang: str = "cql2-text",
+    filter_crs_srid: Optional[int] = None,
     subset_params: Optional[Dict[str, Any]] = None,
     simplification: Optional[float] = None,
     simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
     extent: int = 4096,
     buffer: int = 256,
     tile_wkb: Optional[bytes] = None,
+    max_features: Optional[float] = None,
+    rank_column: Optional[str] = None,
+    min_rank: Optional[float] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Builds the subquery for a single collection using ItemService.
+
+    ``max_features`` / ``rank_column`` / ``min_rank`` implement pre-transform
+    feature reduction for scalable low-zoom rendering. They are pushed into the
+    shared query builder via its ``limit`` / ``where`` hooks so the reduction
+    happens BEFORE ST_AsMVTGeom (bounding transform cost), not after.
     """
     from dynastore.models.protocols import ConfigsProtocol, ItemsProtocol
     from dynastore.tools.discovery import get_protocol
@@ -171,6 +197,8 @@ async def _build_collection_subquery(
         else str(simplification_algorithm),
         "datetime": datetime_str,
         "cql_filter": cql_filter,
+        "filter_lang": filter_lang,
+        "filter_crs_srid": filter_crs_srid,
         "tile_wkb": tile_wkb,
         "feature_type": feature_type,
         "schema_fields": schema_fields,
@@ -178,6 +206,26 @@ async def _build_collection_subquery(
 
     if subset_params:
         params.update(subset_params)
+
+    # 2b. Pre-transform feature reduction (scalable low-zoom rendering).
+    #
+    # These are honoured by the MVT branch of the query builder
+    # (``item_query._build_base_query_request``), which threads ``limit`` and
+    # ``where``/``raw_params`` into the row-producing subquery — i.e. BEFORE the
+    # per-row ST_AsMVTGeom projection and the wrapping ST_AsMVT aggregate. That
+    # is the whole point: capping/filtering the source rows bounds the transform
+    # cost, which the post-transform density predicates cannot.
+    if max_features and max_features > 0:
+        params["limit"] = int(max_features)
+    if rank_column and min_rank is not None:
+        # Importance-preserving, index-assisted decimation: keep only features
+        # whose stored rank column (e.g. length_m) meets the per-zoom minimum.
+        # ``rank_column`` is operator-configured (TilesConfig.feature_rank_column),
+        # never user input; quote it as an identifier. The threshold is a bind
+        # param. The builder suffixes both the SQL and bind name per collection,
+        # so ``:feat_rank_min`` never collides across a multi-collection tile.
+        params["where"] = f'"{rank_column}" >= :feat_rank_min'
+        params["raw_params"] = {"feat_rank_min": min_rank}
 
     # 3. Get Query from ItemService
     # We pass tile_wkb via params so GeometrySidecar can use it as bind param
@@ -196,6 +244,8 @@ async def _build_collection_subquery(
             access_filter=AccessFilter.allow_everything(),
         )
     except ValueError as exc:
+        if str(exc).startswith("Invalid CQL filter"):
+            raise
         # Storage resolution failed mid-pipeline (e.g. driver config has no
         # physical_table, or catalog row's physical_schema is null).  The
         # tile-resolution-params cache may have served a non-empty meta
@@ -223,6 +273,8 @@ async def get_features_as_mvt_filtered(
     y: int,
     datetime_str: Optional[str] = None,
     cql_filter: Optional[str] = None,
+    filter_lang: str = "cql2-text",
+    filter_crs_srid: Optional[int] = None,
     subset_params: Optional[Dict[str, Any]] = None,
     simplification: Optional[float] = None,
     simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
@@ -234,9 +286,7 @@ async def get_features_as_mvt_filtered(
     Extreme speed: focuses purely on parallel SQL construction and execution.
     """
     # 1. PostGIS check: Ensure target SRID exists
-    srid_exists = await DQLQuery(
-        check_srid_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
-    ).execute(conn, srid=target_srid)
+    srid_exists = await _srid_exists(conn, target_srid)
     if not srid_exists:
         logger.error(f"SRID {target_srid} missing in PostGIS spatial_ref_sys.")
         return None
@@ -249,6 +299,35 @@ async def get_features_as_mvt_filtered(
 
     all_bind_params = {"tile_wkb": tile_wkb, "target_srid": target_srid}
     union_queries = []
+
+    # Resolve the per-tile feature cap and optional rank predicate ONCE from the
+    # shared (catalog-scoped) TilesConfig, then push them into every
+    # per-collection subquery. Both reduce the feature set BEFORE ST_AsMVTGeom,
+    # so render cost, tile size and ST_AsMVT memory are bounded by the cap rather
+    # than the collection's total feature count — the primitive that lets large
+    # collections preseed at low zoom. Bracket resolution mirrors the density /
+    # simplification maps: the highest zoom key ≤ the current zoom wins.
+    def _bracket(meta_key: str) -> Optional[float]:
+        if not resolved_collections:
+            return None
+        m: Dict[int, float] = resolved_collections[0].get(meta_key) or {}
+        if not m:
+            return None
+        try:
+            zi = int(z)
+        except ValueError:
+            return None
+        for zk, val in sorted(m.items(), reverse=True):
+            if zi >= zk:
+                return val
+        return None
+
+    max_features = _bracket("max_features_per_tile_by_zoom")
+    rank_column = (
+        resolved_collections[0].get("feature_rank_column")
+        if resolved_collections else None
+    )
+    min_rank = _bracket("min_feature_rank_by_zoom")
 
     # 3. Build Subqueries for each collection
     for i, meta in enumerate(resolved_collections):
@@ -267,12 +346,17 @@ async def get_features_as_mvt_filtered(
             index_i=i,
             datetime_str=datetime_str,
             cql_filter=cql_filter,
+            filter_lang=filter_lang,
+            filter_crs_srid=filter_crs_srid,
             subset_params=subset_params,
             simplification=simplification,
             simplification_algorithm=simplification_algorithm,
             extent=extent,
             buffer=buffer,
             tile_wkb=tile_wkb,
+            max_features=max_features,
+            rank_column=rank_column,
+            min_rank=min_rank,
         )
         if subq:
             union_queries.append(subq)
@@ -281,19 +365,89 @@ async def get_features_as_mvt_filtered(
     if not union_queries:
         return None
 
-    # 4. Final SQL Execution
+    # 4. Resolve zoom-aware feature density filters (area for polygons, length
+    # for lines).
+    #
+    # Both maps are read from the first resolved collection (they come from
+    # TilesConfig, which is catalog-scoped; the first entry is correct for
+    # single-collection tiles and a reasonable fallback for multi-collection
+    # tiles that share a catalog). Each lookup mirrors the simplification
+    # bracket logic: find the highest zoom key ≤ the current zoom level.
+    #
+    # The two predicates are geometry-family-specific and independent:
+    #   * area   → NOT (ST_Area(geom) > 0 AND ST_Area(geom) < :min_pixel_area)
+    #              drops sub-pixel POLYGONS; points/lines (area = 0) always pass.
+    #   * length → NOT (ST_Length(geom) > 0 AND ST_Length(geom) < :min_pixel_length)
+    #              drops sub-pixel LINES; points/polygons (length = 0) always pass.
+    # The area filter alone can never thin line features (a line's tile-space
+    # area is 0), so line-dominant collections aggregate their full feature set
+    # into every low-zoom tile — the length filter is what makes those tiles
+    # renderable.
+    #
+    # NULL geoms (ST_AsMVTGeom returns NULL for out-of-tile features) are also
+    # filtered because ST_Area/ST_Length(NULL) IS NULL, making the NOT(…)
+    # expression evaluate to NULL, which SQL treats as FALSE in a WHERE clause —
+    # consistent with the spatial-intersects pre-filter in the subqueries.
+    def _resolve_density_bracket(map_key: str) -> Optional[float]:
+        if not resolved_collections:
+            return None
+        density_map: Dict[int, float] = resolved_collections[0].get(map_key) or {}
+        if not density_map:
+            return None
+        try:
+            z_int = int(z)
+        except ValueError:
+            return None
+        for zoom_key, threshold in sorted(density_map.items(), reverse=True):
+            if z_int >= zoom_key:
+                return threshold
+        return None
+
+    min_pixel_area = _resolve_density_bracket("min_feature_pixel_area_by_zoom")
+    min_pixel_length = _resolve_density_bracket("min_feature_pixel_length_by_zoom")
+
+    density_predicates: List[str] = []
+    if min_pixel_area and min_pixel_area > 0:
+        # Exclude sub-pixel polygons; points/lines (area=0) always pass.
+        density_predicates.append(
+            "NOT (ST_Area(mvtgeom.geom) > 0"
+            " AND ST_Area(mvtgeom.geom) < :min_pixel_area)"
+        )
+        all_bind_params["min_pixel_area"] = min_pixel_area
+    if min_pixel_length and min_pixel_length > 0:
+        # Exclude sub-pixel lines; points/polygons (length=0) always pass.
+        density_predicates.append(
+            "NOT (ST_Length(mvtgeom.geom) > 0"
+            " AND ST_Length(mvtgeom.geom) < :min_pixel_length)"
+        )
+        all_bind_params["min_pixel_length"] = min_pixel_length
+
+    area_where = f" WHERE {' AND '.join(density_predicates)}" if density_predicates else ""
+    if density_predicates:
+        logger.debug(
+            "density filter active: z=%s min_pixel_area=%s min_pixel_length=%s",
+            z, min_pixel_area, min_pixel_length,
+        )
+
+    # 5. Final SQL Execution
     full_query = f"""
-        WITH 
+        WITH
         mvtgeom AS ({" UNION ALL ".join(union_queries)})
-        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom') 
-        FROM mvtgeom;
+        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom')
+        FROM mvtgeom{area_where};
     """
 
-    logger.info(
+    logger.debug(
         f"Executing MVT query. Bind params types: { {k: type(v) for k, v in all_bind_params.items()} }"
     )
-    logger.info(f"target_srid value: {all_bind_params.get('target_srid')}")
+    logger.debug(f"target_srid value: {all_bind_params.get('target_srid')}")
 
-    return await DQLQuery(
+    mvt = await DQLQuery(
         full_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
     ).execute(conn, **all_bind_params)
+    # ST_AsMVT is an aggregate over `mvtgeom`, which this query always
+    # executes as a single row (no GROUP BY) — the only way this comes back
+    # None is the aggregate itself being NULL, i.e. zero features matched.
+    # Distinguish that confirmed-empty tile (`b""`, cacheable) from the
+    # earlier resolution failures above (`None`, not cacheable).
+    return mvt if mvt is not None else b""

@@ -43,7 +43,8 @@ else:
 
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.models.driver_context import DriverContext
-from dynastore.modules.db_config.query_executor import managed_transaction
+from dynastore.modules.db_config.query_executor import provisioning_write_with_retry
+from dynastore.modules.catalog.log_manager import log_info
 from dynastore.modules.gcp.gcp_config import (
     GcpCatalogBucketConfig,
     GcpEventingConfig,
@@ -147,11 +148,26 @@ class GcpEventingOpsMixin:
     ) -> Tuple[str, GcpEventingConfig]: ...
 
     def generate_default_topic_id(self, catalog_id: str) -> str:
-        """Generates the deterministic default Pub/Sub topic ID for a catalog."""
+        """Generates the deterministic default Pub/Sub topic ID for a catalog.
+
+        ``catalog_id`` is the immutable internal catalog identifier (shape
+        ``c_<suffix>``).  Topics are therefore named ``ds-c_<suffix>-events``.
+
+        Upgrade note: before the catalog id-model redesign, callers passed the
+        PostgreSQL schema name (shape ``s_<suffix>``) instead, producing topics
+        named ``ds-s_<suffix>-events``.  A non-clean-break upgrade must locate
+        and delete those legacy ``ds-s_*`` topics during catalog hard-delete, as
+        teardown will compute the new ``ds-c_*`` name and will not find them.
+        """
         return f"ds-{catalog_id}-events"
 
     def generate_default_subscription_id(self, catalog_id: str) -> str:
-        """Generates the deterministic default Pub/Sub subscription ID for a catalog."""
+        """Generates the deterministic default Pub/Sub subscription ID for a catalog.
+
+        ``catalog_id`` is the immutable internal catalog identifier (shape
+        ``c_<suffix>``).  See ``generate_default_topic_id`` for the upgrade note
+        regarding legacy ``s_<suffix>``-derived names.
+        """
         return f"ds-{catalog_id}-default-sub"
 
     async def apply_eventing_config(
@@ -246,9 +262,11 @@ class GcpEventingOpsMixin:
                 logger.info(f"Attempting to create topic with path: '{topic_path}'")
                 await run_in_thread(publisher_client.create_topic, name=topic_path)
                 logger.info(f"Created managed Pub/Sub topic: {topic_path}")
+                await log_info(catalog_id, "gcp_topic_created", f"Created managed Pub/Sub topic: {topic_path}")
                 break
             except google_exceptions.AlreadyExists:
                 logger.debug(f"Managed Pub/Sub topic '{topic_path}' already exists.")
+                await log_info(catalog_id, "gcp_topic_adopted", f"Managed Pub/Sub topic already exists, adopting: {topic_path}")
                 break
             except (
                 Aborted,
@@ -327,13 +345,17 @@ class GcpEventingOpsMixin:
                 )
                 bucket_name = cfg.bucket_name
             else:
-                async with managed_transaction(self.engine) as legacy_conn:
+                # Acquire a fresh connection with retry so a connection closed
+                # during the preceding GCP API calls does not abort the lookup.
+                async def _read_bucket_name(legacy_conn, _cid=catalog_id):
                     cfg = await config_service.get_config(
                         GcpCatalogBucketConfig,
-                        catalog_id=catalog_id,
+                        catalog_id=_cid,
                         ctx=DriverContext(db_resource=legacy_conn),
                     )
-                    bucket_name = cfg.bucket_name
+                    return cfg.bucket_name
+
+                bucket_name = await provisioning_write_with_retry(self.engine, _read_bucket_name)
         if not bucket_name:
             raise RuntimeError(
                 f"Cannot setup GCS notification: Bucket for catalog '{catalog_id}' does not exist."
@@ -350,9 +372,21 @@ class GcpEventingOpsMixin:
             max_retries: int = 8,
             initial_delay: float = 0.5,
         ):
-            """
-            Retries listing notifications with exponential backoff to handle GCS eventual consistency.
-            Even after a bucket exists, it may not be immediately ready for all operations.
+            """Retry listing bucket notifications with exponential backoff.
+
+            GCS eventual consistency: even after a bucket exists, it may not be
+            immediately ready for all operations (NotFound on list_notifications
+            is a known race after bucket creation).  Each miss emits a structured
+            WARNING matching the ``gcs_operation_retry`` pattern so a single
+            log-based metric can track both transient-error retries and
+            eventual-consistency waits:
+
+                gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s
+
+            Note: ``NotFound`` here is an eventually-consistent probe, NOT a
+            transient service error, so the per-bucket circuit breaker is not fed
+            by these misses — tripping the breaker on a newly-created bucket would
+            block subsequent legitimate operations on that bucket.
             """
 
             def _list_notifications_sync():
@@ -365,17 +399,25 @@ class GcpEventingOpsMixin:
                 except google_exceptions.NotFound as e:
                     last_exception = e
                     if attempt < max_retries:
-                        # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s, 16s, 32s, 64s (max ~127s total)
+                        # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s, 16s, 32s, 64s
                         delay = initial_delay * (2 ** (attempt - 1))
-                        logger.debug(
-                            f"Attempt {attempt}/{max_retries}: Bucket '{bucket_name_str}' not ready for listing notifications. "
-                            f"Retrying in {delay}s..."
+                        logger.warning(
+                            "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+                            bucket_name_str,
+                            "list_notifications",
+                            attempt,
+                            max_retries,
+                            f"NotFound: {e}",
                         )
                         await asyncio.sleep(delay)
                     else:
                         logger.warning(
-                            f"Failed to list notifications after {max_retries} attempts. "
-                            f"Bucket '{bucket_name_str}' may not be fully ready yet."
+                            "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+                            bucket_name_str,
+                            "list_notifications",
+                            max_retries,
+                            max_retries,
+                            f"NotFound: bucket not ready after {max_retries} attempts: {e}",
                         )
                         raise
             # Should never reach here, but just in case
@@ -523,6 +565,11 @@ class GcpEventingOpsMixin:
                     f"'{notification.notification_id}' for prefix '{prefix}' on "
                     f"bucket '{bucket_name}' with attributes "
                     f"{list(prefix_attributes.keys())}."
+                )
+                await log_info(
+                    catalog_id,
+                    "gcp_gcs_notification_created",
+                    f"Created GCS notification '{notification.notification_id}' for prefix '{prefix}' on bucket '{bucket_name}'.",
                 )
 
         managed_config.bucket_id = bucket_name
@@ -731,6 +778,13 @@ class GcpEventingOpsMixin:
             logger.info(
                 f"Created Pub/Sub push subscription '{subscription_path}' to endpoint '{push_endpoint}' with attributes {list(attributes.keys())}."
             )
+            _sub_catalog_id = attributes.get("catalog_id")
+            if _sub_catalog_id:
+                await log_info(
+                    _sub_catalog_id,
+                    "gcp_subscription_created",
+                    f"Created Pub/Sub push subscription '{subscription_path}'.",
+                )
         except google_exceptions.AlreadyExists as already_exists_err:
             # Pub/Sub binds subscription→topic immutably. Before refreshing
             # push_config, verify the existing subscription is bound to the
@@ -774,6 +828,13 @@ class GcpEventingOpsMixin:
                 logger.info(
                     f"Successfully updated PushConfig (attributes: {list(attributes.keys())}) for existing subscription '{subscription_path}'."
                 )
+                _sub_catalog_id = attributes.get("catalog_id")
+                if _sub_catalog_id:
+                    await log_info(
+                        _sub_catalog_id,
+                        "gcp_subscription_adopted",
+                        f"Pub/Sub subscription already exists, push config refreshed: '{subscription_path}'.",
+                    )
             except Exception as e:
                 logger.error(
                     f"Failed to update PushConfig for existing subscription '{subscription_path}': {e}"
@@ -818,6 +879,11 @@ class GcpEventingOpsMixin:
                 logger.info(
                     f"Deleted managed Pub/Sub subscription: {managed_config.subscription.subscription_path}"
                 )
+                await log_info(
+                    catalog_id,
+                    "gcp_subscription_deleted",
+                    f"Deleted managed Pub/Sub subscription: {managed_config.subscription.subscription_path}",
+                )
             except google_exceptions.NotFound:
                 logger.debug(
                     f"Managed Pub/Sub subscription '{managed_config.subscription.subscription_path}' not found. Nothing to delete."
@@ -833,6 +899,11 @@ class GcpEventingOpsMixin:
                 )
                 logger.info(
                     f"Deleted managed Pub/Sub topic: {managed_config.topic_path}"
+                )
+                await log_info(
+                    catalog_id,
+                    "gcp_topic_deleted",
+                    f"Deleted managed Pub/Sub topic: {managed_config.topic_path}",
                 )
             except google_exceptions.NotFound:
                 logger.debug(
@@ -906,7 +977,12 @@ class GcpEventingOpsMixin:
             if not project_id:
                 return
 
-            # Default Topic (deleting topic deletes its subscriptions)
+            # Default Topic (deleting topic deletes its subscriptions).
+            # topic_id is derived from the internal catalog_id (ds-c_<suffix>-events).
+            # Catalogs provisioned before the id-model redesign used a schema-derived
+            # name (ds-s_<suffix>-events).  A non-clean-break upgrade must also attempt
+            # deletion of that legacy name here; this deploy is clean-break so it is
+            # not needed.
             topic_id = self.generate_default_topic_id(catalog_id)
             topic_path = self.get_publisher_client().topic_path(project_id, topic_id)
             try:
@@ -915,6 +991,11 @@ class GcpEventingOpsMixin:
                     request={"topic": topic_path},
                 )
                 logger.info(f"Forcefully deleted default topic: {topic_path}")
+                await log_info(
+                    catalog_id,
+                    "gcp_topic_deleted",
+                    f"Forcefully deleted default Pub/Sub topic: {topic_path}",
+                )
             except google_exceptions.NotFound:
                 pass
             except Exception as e:
@@ -933,6 +1014,11 @@ class GcpEventingOpsMixin:
                     request={"subscription": sub_path},
                 )
                 logger.info(f"Forcefully deleted default subscription: {sub_path}")
+                await log_info(
+                    catalog_id,
+                    "gcp_subscription_deleted",
+                    f"Forcefully deleted default Pub/Sub subscription: {sub_path}",
+                )
             except google_exceptions.NotFound:
                 pass
             except Exception as e:

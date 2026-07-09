@@ -49,6 +49,7 @@ from dynastore.models.protocols.typed_driver import (
 from dynastore.models.mutability import Immutable
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.storage.driver_config import DriverCapability
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.storage_location import StorageLocation
 from pydantic import Field
@@ -146,8 +147,22 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
 
     # Catalog ES is the canonical async secondary index + primary SEARCH
     # backend for catalog metadata routing.  It auto-defaults into WRITE
-    # (as a secondary index, identified by ``is_catalog_indexer``) and SEARCH.
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.WRITE})
+    # (as a secondary index, identified by ``is_catalog_indexer``), SEARCH,
+    # and READ (hinted — only selected when the caller explicitly requests it
+    # via ``prefer:es`` or ``geometry_simplified``; default path stays on PG).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({
+        Operation.SEARCH, Operation.WRITE, Operation.READ,
+    })
+
+    # Hints this driver serves on the READ/SEARCH operations.
+    # GEOMETRY_SIMPLIFIED: ES stores the index-time simplified geometry.
+    # METADATA: generic "I want catalog metadata" — declares this driver
+    #   participates in metadata reads at all.  There is no geometry at the
+    #   metadata level so geometry hints (GEOMETRY_EXACT) do not apply here.
+    supported_hints: ClassVar[FrozenSet[Hint]] = frozenset({
+        Hint.GEOMETRY_SIMPLIFIED,
+        Hint.METADATA,
+    })
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,

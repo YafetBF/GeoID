@@ -19,11 +19,23 @@
 from typing import ClassVar, Tuple
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
+from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
 
 
 class ConnectedSystemsPluginConfig(ExposableConfigMixin, PluginConfig):
-    """Service-exposure config for the OGC API - Connected Systems extension."""
-    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "connected_systems")
+    """Service-exposure config for the OGC API - Connected Systems extension.
 
-    # `enabled` inherited from ExposableConfigMixin — no further fields.
+    Scoped to platform and catalog tiers only (not per-collection): all
+    Connected Systems resources are catalog-scoped (systems, datastreams,
+    observations are keyed on ``catalog_id``), so there is no meaningful
+    collection-level override surface.
+    """
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "connected_systems")
+    _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog")
+
+    # `enabled` inherited from ExposableConfigMixin.
+
+    # Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*)
+    default_limit: Mutable[int] = 100
+    max_limit: Mutable[int] = 1000

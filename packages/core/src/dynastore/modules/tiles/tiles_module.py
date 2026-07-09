@@ -45,6 +45,7 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     DbResource,
     managed_transaction,
+    _read_live_fg_acquire_timeout,
 )
 from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 from dynastore.modules.db_config.locking_tools import check_table_exists
@@ -69,10 +70,12 @@ logger = logging.getLogger(__name__)
 TILE_MATRIX_SETS_DDL = """
 CREATE TABLE IF NOT EXISTS tiles.tile_matrix_sets (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
+    -- catalog_id holds the immutable internal catalog id (not the public external id).
+    -- Partitioned on this value so rows survive catalog renames transparently.
     catalog_id VARCHAR NOT NULL,
     tms_id VARCHAR NOT NULL,
     definition JSONB NOT NULL, -- The full OGC TileMatrixSet definition
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),    
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (catalog_id, id),
     UNIQUE (catalog_id, tms_id) -- Ensures uniqueness of TMS within a catalog
 ) PARTITION BY LIST (catalog_id);
@@ -156,17 +159,34 @@ class TilesModule(ModuleProtocol, DatabaseProtocol):
                 await DDLQuery(TILE_MATRIX_SETS_DDL).execute(conn)
                 await DDLQuery(TILE_MATRIX_SETS_COMMENT_DDL).execute(conn)
 
-            # Register PG tile storage as fallback if no higher-priority provider (e.g. GCS) registered yet
+            # Register the composite tile-cache dispatcher unconditionally.
+            # It is the ONLY TileStorageProtocol plugin — no other module
+            # registers one. Per call it resolves the live writer list
+            # (tiles_writers.resolve_effective_writers) and selects ONE
+            # available writer (tiles_writers.select_tile_writer); each
+            # implementation module (this one for PG, the gcp module for
+            # GCS, modules/local for local disk) only needs to register a
+            # (config class, factory) pair — see tiles_writers.py.
             if get_protocol(TileStorageProtocol) is None:
-                self._pg_tile_storage = TilePGPreseedStorage()
-                register_plugin(self._pg_tile_storage)
-                logger.info("TilesModule: Registered TilePGPreseedStorage as fallback.")
+                from .tile_blob_storage import CompositeTileStorage
+
+                self._composite_tile_storage = CompositeTileStorage()
+                register_plugin(self._composite_tile_storage)
+                logger.info("TilesModule: Registered CompositeTileStorage.")
 
             # Register PG archive storage as fallback if no higher-priority provider registered yet
             if get_protocol(TileArchiveStorageProtocol) is None:
                 self._pg_tile_archive = PGTileArchive()
                 register_plugin(self._pg_tile_archive)
                 logger.info("TilesModule: Registered PGTileArchive as fallback.")
+
+            # Register the PostGIS TileSourceProtocol impl. v1 ships one
+            # source; the engine (tiles_engine.build_render_context) picks
+            # the first registered source whose supports(driver) is True.
+            from .tiles_source import PostgisTileSource
+
+            self._postgis_tile_source = PostgisTileSource()
+            register_plugin(self._postgis_tile_source)
 
             logger.info("TilesModule: Initialization complete.")
         except Exception as e:
@@ -177,7 +197,7 @@ class TilesModule(ModuleProtocol, DatabaseProtocol):
         yield
 
         # --- SHUTDOWN ---
-        for attr in ("_pg_tile_storage", "_pg_tile_archive"):
+        for attr in ("_composite_tile_storage", "_pg_tile_archive", "_postgis_tile_source"):
             obj = getattr(self, attr, None)
             if obj is not None:
                 unregister_plugin(obj)
@@ -364,7 +384,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         data: bytes,
         format: str,
     ) -> Optional[str]:
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         cfg = await _load_caching_config()
         if not cfg.cache_enabled:
@@ -410,7 +430,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         y: int,
         format: str,
     ) -> Optional[bytes]:
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         cfg = await _load_caching_config()
         if not cfg.cache_enabled:
@@ -488,7 +508,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         format: str,
     ) -> bool:
         """Checks for tile existence using a lightweight SELECT EXISTS query."""
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         cfg = await _load_caching_config()
         if not cfg.cache_enabled:
@@ -832,7 +852,11 @@ async def create_custom_tms(
         return StoredTileMatrixSet.model_validate(result)
 
 
-@cached(maxsize=128, namespace="tiles_get_custom_tms")
+@cached(
+    maxsize=128,
+    namespace="tiles_get_custom_tms",
+    ttl=300,
+)
 async def get_custom_tms(catalog_id: str, tms_id: str) -> Optional[TileMatrixSet]:
     """Retrieves a specific custom TileMatrixSet from a catalog."""
     result = await _get_tms_query.execute(
@@ -841,7 +865,11 @@ async def get_custom_tms(catalog_id: str, tms_id: str) -> Optional[TileMatrixSet
     return TileMatrixSet.model_validate(result["definition"]) if result else None
 
 
-@cached(maxsize=32, namespace="tiles_list_custom_tms")
+@cached(
+    maxsize=32,
+    namespace="tiles_list_custom_tms",
+    ttl=300,
+)
 async def list_custom_tms(
     catalog_id: str, limit: int = 100, offset: int = 0
 ) -> List[TileMatrixSet]:
@@ -852,7 +880,12 @@ async def list_custom_tms(
     return [TileMatrixSet.model_validate(row["definition"]) for row in results]
 
 
-@cached(maxsize=128, namespace="tiles_resolve_srid", ignore=["conn"])
+@cached(
+    maxsize=128,
+    namespace="tiles_resolve_srid",
+    ignore=["conn"],
+    ttl=300,
+)
 async def resolve_srid(
     conn: DbResource, crs_str: str, catalog_id: Optional[str] = None
 ) -> int:
@@ -1013,7 +1046,11 @@ async def ensure_custom_crs_in_postgis(
     return next_srid
 
 
-@cached(maxsize=1024, namespace="tiles_collection_source_srid")
+@cached(
+    maxsize=1024,
+    namespace="tiles_collection_source_srid",
+    ttl=300,
+)
 async def get_collection_source_srid(
     catalog_id: str, collection_id: str
 ) -> Optional[int]:
@@ -1023,7 +1060,13 @@ async def get_collection_source_srid(
     2. Falls back to PostGIS Find_SRID lookup.
     """
     engine = _get_engine()
-    async with managed_transaction(engine) as conn:
+    # Bounded so a rebuild triggered under pool pressure (e.g. by the render
+    # path's cache miss) times out into PoolSaturationError -> 503 +
+    # Retry-After instead of riding the engine's own pool_timeout into a raw
+    # 500 (#3023).
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
         # Check logical configuration first for CRS hints
         # We can look for 'source_crs' in TilesConfig at collection level
         catalogs = get_protocol(CatalogsProtocol)
@@ -1076,9 +1119,17 @@ async def get_collection_source_srid(
             LIMIT 1;
         """)
         sidecar_table = f"{phys_table}_geometries"
+        # Run this pure system-catalog read against the ENGINE, not the
+        # managed_transaction `conn`. It depends only on phys_schema/phys_table
+        # (resolved above from the driver location), never on anything written
+        # or read earlier in this transaction, so it is safe to execute on a
+        # fresh pooled connection. Doing so routes it through the executor's
+        # engine path, which retries once on a mid-flight disconnect (a pooled
+        # wire killed server-side after pool_pre_ping but before execute) —
+        # exactly the TOCTOU failure that 500'd this lookup in production.
         srid = await DQLQuery(
             srid_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
-        ).execute(conn, schema=phys_schema, table=phys_table, sidecar=sidecar_table)
+        ).execute(engine, schema=phys_schema, table=phys_table, sidecar=sidecar_table)
         if not srid:
             return 4326
         return srid
@@ -1093,7 +1144,15 @@ async def get_tile_resolution_params(
     Returns: physical names, source_srid, and simplification rules.
     """
     engine = _get_engine()
-    async with managed_transaction(engine) as conn:
+    # Bounded for the same reason as get_collection_source_srid above: this
+    # cached rebuild is the nested acquire #3014/#3022 identified as the
+    # thing a render request could deadlock behind — a plain
+    # managed_transaction(engine) rides the engine's full pool_timeout on
+    # saturation and surfaces as a raw 500 instead of the fail-fast
+    # PoolSaturationError -> 503 + Retry-After path (#3023).
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
         # 1. Resolve Physical Names (Cached inside catalogs protocol)
         catalogs = get_protocol(CatalogsProtocol)
         if not catalogs:
@@ -1170,9 +1229,27 @@ async def get_tile_resolution_params(
             ))
 
         # Extract relevant fields
-        simplification_by_zoom = {}
+        simplification_by_zoom: Dict[int, float] = {}
+        min_feature_pixel_area_by_zoom: Dict[int, float] = {}
+        min_feature_pixel_length_by_zoom: Dict[int, float] = {}
+        max_features_per_tile_by_zoom: Dict[int, int] = {}
+        feature_rank_column: Optional[str] = None
+        min_feature_rank_by_zoom: Dict[int, float] = {}
         if isinstance(tiles_config, TilesConfig):
             simplification_by_zoom = tiles_config.simplification_by_zoom or {}
+            min_feature_pixel_area_by_zoom = (
+                tiles_config.min_feature_pixel_area_by_zoom or {}
+            )
+            min_feature_pixel_length_by_zoom = (
+                tiles_config.min_feature_pixel_length_by_zoom or {}
+            )
+            max_features_per_tile_by_zoom = (
+                tiles_config.max_features_per_tile_by_zoom or {}
+            )
+            feature_rank_column = tiles_config.feature_rank_column
+            min_feature_rank_by_zoom = (
+                tiles_config.min_feature_rank_by_zoom or {}
+            )
 
         # 4. Resolve the collection config for sidecar-aware MVT queries from
         # the SAME tile-capable driver resolved above (Hint.TILES → PG). Two
@@ -1209,6 +1286,11 @@ async def get_tile_resolution_params(
             "phys_table": phys_table,
             "source_srid": source_srid,
             "simplification_by_zoom": simplification_by_zoom,
+            "min_feature_pixel_area_by_zoom": min_feature_pixel_area_by_zoom,
+            "min_feature_pixel_length_by_zoom": min_feature_pixel_length_by_zoom,
+            "max_features_per_tile_by_zoom": max_features_per_tile_by_zoom,
+            "feature_rank_column": feature_rank_column,
+            "min_feature_rank_by_zoom": min_feature_rank_by_zoom,
             "catalog_id": catalog_id,
             "collection_id": collection_id,
             "col_config": col_config,

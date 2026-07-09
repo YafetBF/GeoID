@@ -30,14 +30,26 @@ set -e
 : "${GUNICORN_WORKERS:=4}"
 : "${GUNICORN_THREADS:=1}"
 : "${GUNICORN_TIMEOUT:=30}"
+# Shutdown drain budget (#2925 / #2924): Cloud Run gives a container
+# roughly 10s after SIGTERM before SIGKILL. Without explicit bounds here,
+# uvicorn waits *indefinitely* for open connections to close before it
+# ever runs ASGI lifespan shutdown (DB engine dispose, background
+# service stop, LISTEN connection teardown, ...) — a single stalled
+# connection means that never happens, and the process sits until
+# something external hard-kills it mid-drain, dropping in-flight
+# requests and leaking DB-side resources. GUNICORN_DRAIN_TIMEOUT bounds
+# uvicorn's own wait (see gunicorn_worker.DrainAwareUvicornWorker);
+# GUNICORN_GRACEFUL_TIMEOUT is gunicorn's outer safety net, set a little
+# higher so uvicorn's bounded drain + lifespan shutdown normally finish
+# and exit the worker on their own first. Both stay comfortably under
+# the platform's ~10s SIGKILL ceiling.
+: "${GUNICORN_DRAIN_TIMEOUT:=8}"
+: "${GUNICORN_GRACEFUL_TIMEOUT:=9}"
 : "${KEEP_ALIVE:=5}"
 : "${LOG_LEVEL:=info}"
 : "${ACCESS_LOG:=-}"
 : "${ERROR_LOG:=-}"
 : "${VENV_PATH:=/opt/venv}"
-# Worker concurrency: number of parallel worker processes for the in-app worker.
-# Multiple processes prevent deadlocks when tasks write to shared resources (e.g. static files).
-: "${WORKER_CONCURRENCY:=4}"
 # --- Durable Task Environment ---
 : "${RUNNER_ID:=$(hostname)}"
 : "${NAME:=$(hostname)}"
@@ -83,12 +95,13 @@ case "$MODE" in
         fi
 
         exec gunicorn \
-          --worker-class "uvicorn.workers.UvicornWorker" \
+          --worker-class "dynastore.scripts.gunicorn_worker.DrainAwareUvicornWorker" \
           "${APP}.main:app" \
           --bind "0.0.0.0:${PORT:-${TCP_PORT:-80}}" \
           --workers "${GUNICORN_WORKERS}" \
           --threads "${GUNICORN_THREADS}" \
           --timeout "${GUNICORN_TIMEOUT}" \
+          --graceful-timeout "${GUNICORN_GRACEFUL_TIMEOUT}" \
           --keep-alive "${KEEP_ALIVE}" \
           --log-level "${LOG_LEVEL}" \
           --access-logfile "${ACCESS_LOG}" \
@@ -97,7 +110,7 @@ case "$MODE" in
         ;;
 
     worker)
-        echo "Starting Worker (${WORKER_CONCURRENCY} concurrent processes)..."
+        echo "Starting Worker..."
         # Expose a minimal HTTP probe for Cloud Run liveness checks.
         # The probe returns 200 only while the worker process is alive.
         #
@@ -142,10 +155,7 @@ if __name__ == "__main__":
 PROBE_EOF
         fi
 
-        # Run with --concurrency to spawn multiple worker processes.
-        # This prevents deadlocks when tasks write to shared resources (e.g. static files)
-        # while other tasks are waiting for I/O.
-        exec python -m "${APP}.main" --worker --concurrency "${WORKER_CONCURRENCY}" "$@"
+        exec python -m "${APP}.main" --worker "$@"
         ;;
 
     *)

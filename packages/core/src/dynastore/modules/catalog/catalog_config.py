@@ -60,6 +60,20 @@ class CollectionInfo(PluginConfig):
         ),
     )
 
+    allow_geometry: Mutable[Optional[bool]] = Field(
+        default=None,
+        description=(
+            "Capability override for the geometry sidecar, independent of "
+            "``kind`` (RFC #2550 — ``kind`` informs defaults, it no longer "
+            "hard-gates storage capabilities). ``None`` (default) derives the "
+            "decision from ``kind``: VECTOR/RASTER get a geometry sidecar, "
+            "RECORDS does not. ``True`` forces the geometry sidecar on "
+            "regardless of kind (e.g. a RECORDS collection with a real "
+            "footprint geometry, per OGC API - Records Part 1 Req 55). "
+            "``False`` forces it off regardless of kind."
+        ),
+    )
+
 
 # --- Partitioning (Physical) ---
 
@@ -127,6 +141,32 @@ class CollectionPluginConfig(PluginConfig):
             "next chunk opens its tx. Default 50 is safe for geometry-heavy "
             "collections (large per-row payloads); lightweight attribute-only "
             "collections can raise this to several hundred."
+        ),
+    )
+
+    sync_ingest_batch_rows: Mutable[int] = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        description=(
+            "Row cap per upsert() call when a synchronous POST "
+            "/collections/{id}/items bulk request is sub-batched "
+            "(OGCTransactionMixin._ingest_items). A payload at or under this "
+            "size, and under sync_ingest_batch_memory_mb, is written in a "
+            "single call — unchanged pre-existing behaviour. Larger payloads "
+            "are split so the synchronous request path never holds the whole "
+            "FeatureCollection in memory at once."
+        ),
+    )
+
+    sync_ingest_batch_memory_mb: Mutable[int] = Field(
+        default=32,
+        ge=1,
+        description=(
+            "Accumulated-geometry memory budget (MiB) per upsert() call for "
+            "the same synchronous bulk-POST sub-batching described on "
+            "sync_ingest_batch_rows. Whichever limit is reached first — row "
+            "count or byte budget — flushes the current sub-batch."
         ),
     )
 

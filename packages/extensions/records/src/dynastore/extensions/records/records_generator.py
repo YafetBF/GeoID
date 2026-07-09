@@ -18,25 +18,112 @@
 
 """Transforms internal Feature / DB rows into OGC Records API responses.
 
-The internal model is ``Feature(geometry=None, properties={...})``; this
-module maps those to the ``Record`` wire format defined by OGC API -
-Records Part 1 (OGC 20-004).
+The internal model is ``Feature(geometry=None, properties={...})`` by
+default; this module maps those to the ``Record`` wire format defined by
+OGC API - Records Part 1 (OGC 20-004). Req 55 of that spec allows a
+record's ``geometry`` to be a real geometry instead of ``null`` — a
+collection opts into that via the ``CollectionInfo.allow_geometry``
+capability (RFC #2550), resolved by :func:`collection_has_geometry`.
 """
 
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, cast
 
 from geojson_pydantic import Feature as _GeoJSONFeature
 
-from dynastore.models.protocols import ItemsProtocol
+from dynastore.models.dimensions import DIMENSIONS_CATALOG_ID
 from dynastore.models.localization import LocalizedText
 from dynastore.models.shared_models import Link
+from dynastore.models.driver_context import DriverContext
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 from dynastore.tools.discovery import get_protocol
+from dynastore.extensions.tools.ogc_row_mapping import (
+    parse_temporal_range,
+    resolve_mapped_feature,
+)
 
 from . import records_models as rm
 
 logger = logging.getLogger(__name__)
+
+
+def _records_collection_url(catalog_id: str, collection_id: str, root_url: str) -> str:
+    """Build the canonical URL of a Records collection.
+
+    Dimension-backed collections are materialized under the internal
+    ``DIMENSIONS_CATALOG_ID`` sentinel catalog (not a real per-tenant
+    catalog), so their links must not reuse the catalog-scoped
+    ``/records/catalogs/{catalog_id}/collections/{id}`` shape — that would
+    leak the ``_dimensions_`` sentinel into a public URL (#2957). They get
+    the genuine platform-tier ``/records/dimensions/{id}`` path instead.
+    """
+    if catalog_id == DIMENSIONS_CATALOG_ID:
+        return f"{root_url}/records/dimensions/{collection_id}"
+    return f"{root_url}/records/catalogs/{catalog_id}/collections/{collection_id}"
+
+
+async def collection_has_geometry(
+    catalog_id: str,
+    collection_id: str,
+    db_resource: Optional[Any] = None,
+    strict: bool = False,
+) -> bool:
+    """Resolve whether *collection_id* currently has an active geometry sidecar.
+
+    Consults the same ``_effective_sidecars`` resolution the PG driver uses
+    at write/read time — ``CollectionInfo.kind`` plus the ``allow_geometry``
+    capability override (RFC #2550) — instead of re-reading
+    ``allow_geometry`` in isolation. This keeps the answer correct across a
+    ``kind``/``allow_geometry`` reclassification (both are mutable) without
+    requiring a matching physical migration: the resolved sidecar list is
+    the single source of truth every write/read call site already uses.
+
+    ``strict`` selects the error posture:
+
+    - ``strict=False`` (default, read paths) fails *closed* — a resolution
+      error returns ``False`` (the historic geometry-less RECORDS default),
+      so a geometry is at worst hidden from a response, never fabricated.
+    - ``strict=True`` (write paths) re-raises the resolution error instead
+      of returning ``False``. On a write, a false negative would force a
+      client-submitted geometry to ``null`` and persist that data loss
+      behind a ``201`` — so a transient config-resolution hiccup must fail
+      the write loudly and let the client retry, not silently drop data.
+    """
+    try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.catalog.catalog_config import CollectionInfo
+        from dynastore.modules.storage.drivers.pg_sidecars import _effective_sidecars
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return False
+        ct = await configs.get_config(
+            CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
+        )
+        col_config = await configs.get_config(
+            ItemsPostgresqlDriverConfig,
+            catalog_id=catalog_id, collection_id=collection_id,
+            ctx=DriverContext(db_resource=db_resource),
+        )
+        resolved = _effective_sidecars(
+            col_config,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            collection_type=ct.kind.value,
+            context={"allow_geometry": ct.allow_geometry},
+        )
+        return any(isinstance(sc, GeometriesSidecarConfig) for sc in resolved)
+    except Exception:
+        logger.warning(
+            "collection_has_geometry: resolution failed for %s/%s",
+            catalog_id, collection_id, exc_info=True,
+        )
+        if strict:
+            raise
+        return False
 
 
 def db_row_to_record(
@@ -46,6 +133,7 @@ def db_row_to_record(
     root_url: str,
     layer_config: Optional[ItemsPostgresqlDriverConfig] = None,
     read_policy: Optional[Any] = None,
+    geometry_enabled: bool = False,
 ) -> rm.Record:
     """Convert a DB row or mapped Feature into an OGC Record.
 
@@ -60,19 +148,19 @@ def db_row_to_record(
     fallback honours ``feature_type.expose`` / ``external_id_as_feature_id``.
     Items arriving already mapped (the canonical ``stream_items`` path) skip
     the fallback and are unaffected.
+
+    ``geometry_enabled`` (RFC #2550, resolved by the caller via
+    :func:`collection_has_geometry`) gates whether the mapped item's
+    ``geometry``/``bbox`` are surfaced on the returned ``Record`` or forced
+    to ``null`` — the OGC API - Records Part 1 default for a collection with
+    no geometry capability. Defaults to ``False`` so existing callers that
+    don't pass it keep the byte-identical geometry-less behaviour.
     """
     # Map raw DB row via sidecar pipeline if needed
-    if not isinstance(item, _GeoJSONFeature):
-        items_mod = get_protocol(ItemsProtocol)
-        if items_mod and layer_config:
-            item = items_mod.map_row_to_feature(
-                item, layer_config, read_policy=read_policy
-            )
-        else:
-            logger.warning(
-                "Cannot map DB row: ItemsProtocol unavailable or no layer_config."
-            )
-            item = _GeoJSONFeature(type="Feature", geometry=None, properties={})
+    item = cast(
+        _GeoJSONFeature,
+        resolve_mapped_feature(item, layer_config, read_policy=read_policy),
+    )
 
     # Extract properties
     props = dict(item.properties or {}) if hasattr(item, "properties") else {}
@@ -98,23 +186,30 @@ def db_row_to_record(
     feature_id = str(item.id) if item.id is not None else None
 
     # Links
-    self_url = f"{root_url}/records/catalogs/{catalog_id}/collections/{collection_id}/items/{feature_id}"
+    collection_url = _records_collection_url(catalog_id, collection_id, root_url)
+    self_url = f"{collection_url}/items/{feature_id}"
     links = [
         Link(href=self_url, rel="self", type="application/geo+json"),
         Link(
-            href=f"{root_url}/records/catalogs/{catalog_id}/collections/{collection_id}",
+            href=collection_url,
             rel="collection",
             type="application/json",
         ),
     ]
 
-    return rm.Record(
+    record_kwargs: Dict[str, Any] = dict(
         type="Feature",
         id=feature_id,
-        geometry=None,
+        geometry=getattr(item, "geometry", None) if geometry_enabled else None,
         properties=record_props,
         links=links,
     )
+    if geometry_enabled:
+        bbox = getattr(item, "bbox", None)
+        if bbox is not None:
+            record_kwargs["bbox"] = bbox
+
+    return rm.Record(**record_kwargs)
 
 
 def collection_to_records_collection(
@@ -131,7 +226,7 @@ def collection_to_records_collection(
     coll_dict = collection if isinstance(collection, dict) else collection.model_dump(exclude_none=True)
 
     coll_id = coll_dict.get("id", "")
-    self_url = f"{root_url}/records/catalogs/{catalog_id}/collections/{coll_id}"
+    self_url = _records_collection_url(catalog_id, coll_id, root_url)
 
     links = [
         Link(href=self_url, rel="self", type="application/json"),
@@ -209,8 +304,6 @@ def collection_to_records_collection(
 
 def _extract_time(props: Dict[str, Any]) -> Optional[rm.RecordTime]:
     """Extract temporal information from properties."""
-    import re
-
     # Direct time object
     time_val = props.pop("time", None)
     if time_val and isinstance(time_val, dict):
@@ -219,19 +312,9 @@ def _extract_time(props: Dict[str, Any]) -> Optional[rm.RecordTime]:
     # From validity range (PG tstzrange)
     validity = props.pop("validity", None)
     if validity is not None:
-        try:
-            if hasattr(validity, "lower"):
-                start = _to_iso(validity.lower) if validity.lower else None
-                end = _to_iso(validity.upper) if validity.upper else None
-                return rm.RecordTime(interval=[start, end])
-            match = re.search(r"[\[\(]([^,]*),\s*([^\]\)]*)", str(validity))
-            if match:
-                s, e = match.groups()
-                start = s.strip().strip('"') if s.strip() and s.strip() != "-infinity" else None
-                end = e.strip().strip('"') if e.strip() and e.strip() != "infinity" else None
-                return rm.RecordTime(interval=[start, end])
-        except Exception as exc:
-            logger.warning("Failed to parse validity range %s: %s", validity, exc)
+        parsed = parse_temporal_range(validity)
+        if parsed is not None:
+            return rm.RecordTime(interval=[parsed[0], parsed[1]])
 
     # From valid_from / valid_to
     vf = props.pop("valid_from", None)

@@ -18,24 +18,27 @@
 
 """Build QueryRequest objects for DGGS zone or bbox-based PostGIS queries."""
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
-from dynastore.models.query_builder import QueryRequest
+from dateutil.parser import isoparse
+
+from dynastore.models.query_builder import FilterCondition, FilterOperator, QueryRequest
 from dynastore.modules.dggs.h3_indexer import (
-    cell_to_geojson_polygon,
     is_valid_cell,
+    rect_bound_for_cell,
 )
+from dynastore.tools.ogc_common import parse_rfc3339_interval
 
 
 def bbox_for_zone(zone_id: str) -> Tuple[float, float, float, float]:
-    """Return (xmin, ymin, xmax, ymax) bounding box for an H3 cell."""
+    """Return (xmin, ymin, xmax, ymax) bounding box for an H3 cell.
+
+    Correctly handles cells that cross the antimeridian by using
+    :func:`h3_indexer.rect_bound_for_cell`.
+    """
     if not is_valid_cell(zone_id):
         raise ValueError(f"Invalid H3 zone ID: {zone_id!r}")
-    polygon = cell_to_geojson_polygon(zone_id)
-    coords = polygon["coordinates"][0]
-    lngs = [c[0] for c in coords]
-    lats = [c[1] for c in coords]
-    return min(lngs), min(lats), max(lngs), max(lats)
+    return rect_bound_for_cell(zone_id)
 
 
 def build_query_for_zone(
@@ -118,6 +121,54 @@ def build_global_query(
     return _build_query(datetime_str=datetime_str, limit=limit)
 
 
+def _parse_datetime_filters(datetime_str: str) -> List[FilterCondition]:
+    """Parse a datetime string into one or more filter conditions.
+
+    Handles three formats:
+    - Instant: "2024-01-01" -> EQ
+    - Closed interval: "2024-01-01/2024-12-31" -> GTE + LTE
+    - Open start: "../2024-12-31" -> LTE
+    - Open end: "2024-01-01/.." -> GTE
+
+    Args:
+        datetime_str: RFC3339 datetime string (instant or interval)
+
+    Returns:
+        List of FilterCondition objects for the datetime field
+    """
+    if "/" not in datetime_str:
+        return [
+            FilterCondition(
+                field="datetime",
+                operator=FilterOperator.EQ,
+                value=datetime_str,
+            )
+        ]
+
+    start_str, end_str = parse_rfc3339_interval(datetime_str)
+
+    filters = []
+
+    if start_str:
+        filters.append(
+            FilterCondition(
+                field="datetime",
+                operator=FilterOperator.GTE,
+                value=isoparse(start_str),
+            )
+        )
+    if end_str:
+        filters.append(
+            FilterCondition(
+                field="datetime",
+                operator=FilterOperator.LTE,
+                value=isoparse(end_str),
+            )
+        )
+
+    return filters
+
+
 def _build_query(
     xmin: Optional[float] = None,
     ymin: Optional[float] = None,
@@ -128,12 +179,9 @@ def _build_query(
     datetime_str: Optional[str] = None,
     limit: int = 10_000,
 ) -> QueryRequest:
-    from dynastore.models.query_builder import FilterCondition, FilterOperator
-
     filters = []
 
     if sidecar_field is not None and sidecar_cell_int is not None:
-        # Preferred path: exact B-tree equality on pre-computed sidecar column.
         filters.append(
             FilterCondition(
                 field=sidecar_field,
@@ -142,7 +190,6 @@ def _build_query(
             )
         )
     elif all(v is not None for v in [xmin, ymin, xmax, ymax]):
-        # Fallback path: GIST bbox scan (may overselect near cell edges).
         ewkt = (
             f"SRID=4326;POLYGON(({xmin} {ymin},{xmax} {ymin},"
             f"{xmax} {ymax},{xmin} {ymax},{xmin} {ymin}))"
@@ -157,12 +204,6 @@ def _build_query(
         )
 
     if datetime_str:
-        filters.append(
-            FilterCondition(
-                field="datetime",
-                operator=FilterOperator.EQ,
-                value=datetime_str,
-            )
-        )
+        filters.extend(_parse_datetime_filters(datetime_str))
 
     return QueryRequest(limit=limit, filters=filters)

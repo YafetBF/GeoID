@@ -34,7 +34,7 @@ import json as _json
 import logging
 import os  # noqa: E402
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Optional
+from typing import Any, FrozenSet, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -44,10 +44,8 @@ from starlette import status
 
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
-from dynastore.extensions.tools.fast_api import AppJSONResponse as _AppJSONResponse
-from dynastore.extensions.tools.language_utils import get_language
-from dynastore.extensions.web.decorators import expose_web_page, expose_static  # noqa: E402
-from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.web.decorators import expose_web_page  # noqa: E402
+from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.protocols import StylesProtocol
 from dynastore.modules.catalog import catalog_module
@@ -62,6 +60,7 @@ from dynastore.modules.styles.models import (
     SLDContent,
     Style,
     StyleCreate,
+    StyleList,
     StyleUpdate,
 )
 from dynastore.tools.db import validate_sql_identifier
@@ -136,6 +135,10 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
     protocol_title = "DynaStore OGC API - Styles"
     protocol_description = "Style management and retrieval via OGC API - Styles"
 
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "styles"
+
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
         self.app = app
@@ -152,34 +155,9 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         yield
         logger.info("StylesService: stopped.")
 
-    # ------------------------------------------------------------------
-    # Web page contribution (WebPageContributor / StaticAssetProvider)
-    # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    @expose_static("styles")
-    def provide_static_files(self) -> List[str]:
-        """Exposes the internal static directory for the Styles browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="styles_browser",
@@ -190,99 +168,117 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
     async def provide_styles_browser(self, request: Request):
         return await self._serve_page_template("styles_browser.html")
 
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
-
     # ------------------------------------------------------------------
     # Route registration (Pattern B)
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        # Standard OGC landing page + conformance
-        self.router.add_api_route("/", self.get_landing_page, methods=["GET"])
-        self.router.add_api_route(
-            "/conformance", self.get_conformance, methods=["GET"]
-        )
-
+        self.register_ogc_standard_routes()
         col_prefix = "/catalogs/{catalog_id}/collections/{collection_id}/styles"
 
-        self.router.add_api_route(
-            col_prefix,
-            self.create_style_for_collection,
-            methods=["POST"],
-            response_model=Style,
-            status_code=status.HTTP_201_CREATED,
-            summary="Create a style for a collection",
-        )
-        self.router.add_api_route(
-            col_prefix,
-            self.list_styles,
-            methods=["GET"],
-            response_model=List[Style],
-            summary="List styles for a collection",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}",
-            self.get_style,
-            methods=["GET"],
-            response_model=Style,
-            summary="Get a specific style",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}",
-            self.update_style,
-            methods=["PUT"],
-            response_model=Style,
-            summary="Update a style",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}",
-            self.delete_style,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete a style",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}/stylesheet",
-            self.get_stylesheet,
-            methods=["GET"],
-            summary="Get stylesheet body (content-negotiated)",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}/metadata",
-            self.get_style_metadata,
-            methods=["GET"],
-            summary="Style metadata with stylesheet links per encoding",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}/legend",
-            self.get_style_legend,
-            methods=["GET"],
-            summary="Redirect to style legend image (rel=preview)",
-        )
-        self.router.add_api_route(
-            "/all",
-            self.list_all_styles,
-            methods=["GET"],
-            summary="List all styles across catalogs (discovery convenience)",
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            (
+                col_prefix,
+                "create_style_for_collection",
+                ["POST"],
+                {
+                    "response_model": Style,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Create a style for a collection",
+                },
+            ),
+            (
+                col_prefix,
+                "list_styles",
+                ["GET"],
+                {"response_model": StyleList, "summary": "List styles for a collection"},
+            ),
+            (
+                col_prefix + "/{style_id}",
+                "get_style",
+                ["GET"],
+                {"response_model": Style, "summary": "Get a specific style"},
+            ),
+            (
+                col_prefix + "/{style_id}",
+                "update_style",
+                ["PUT"],
+                {"response_model": Style, "summary": "Update a style"},
+            ),
+            (
+                col_prefix + "/{style_id}",
+                "delete_style",
+                ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT, "summary": "Delete a style"},
+            ),
+            (
+                col_prefix + "/{style_id}/stylesheet",
+                "get_stylesheet",
+                ["GET"],
+                {"summary": "Get stylesheet body (content-negotiated)"},
+            ),
+            (
+                col_prefix + "/{style_id}/metadata",
+                "get_style_metadata",
+                ["GET"],
+                {"summary": "Style metadata with stylesheet links per encoding"},
+            ),
+            (
+                col_prefix + "/{style_id}/legend",
+                "get_style_legend",
+                ["GET"],
+                {"summary": "Redirect to style legend image (rel=preview)"},
+            ),
+            (
+                "/all",
+                "list_all_styles",
+                ["GET"],
+                {"summary": "List all styles across catalogs (discovery convenience)"},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
-    # Standard OGC endpoints (delegated to OGCServiceMixin)
+    # Internal helpers
     # ------------------------------------------------------------------
 
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> _AppJSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
+    async def _resolve_internal_catalog_id(self, external_catalog_id: str) -> str:
+        """Resolve the public external catalog id to the immutable internal id.
 
-    async def get_conformance(self, request: Request):
-        return await self.ogc_conformance_handler(request)
+        All DB operations and partition keys use the internal id so that a
+        catalog rename (external id change) never orphans existing rows.
+        Raises 404 when the catalog does not exist.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+        internal_id = await catalogs_svc.resolve_catalog_id(external_catalog_id)
+        if not internal_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Catalog '{external_catalog_id}' not found.",
+            )
+        return internal_id
+
+    async def _resolve_internal_collection_id(
+        self, internal_catalog_id: str, external_collection_id: str
+    ) -> str:
+        """Resolve the public external collection id to the immutable internal id.
+
+        Mirrors ``_resolve_internal_catalog_id``: all DB operations key styles
+        by the internal collection id so that a collection rename (external
+        id change) never orphans existing style rows, and so styles created
+        via the external id are found by readers that resolve the same
+        collection to its internal id (see #2952). Raises 404 when the
+        collection does not exist.
+        """
+        from dynastore.extensions.tools.resolvers import (
+            resolve_internal_collection_id_or_404,
+        )
+
+        catalogs_svc = await self._get_catalogs_service()
+        return await resolve_internal_collection_id_or_404(
+            catalogs_svc, internal_catalog_id, external_collection_id
+        )
 
     # ------------------------------------------------------------------
     # Style CRUD
@@ -294,6 +290,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         collection_id: str,
         style: StyleCreate = Body(...),
         conn: AsyncConnection = Depends(get_async_connection),
+        engine=Depends(get_async_engine),
     ) -> Style:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
@@ -301,15 +298,30 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
 
-        from dynastore.modules.db_config.partition_tools import ensure_partition_exists
+        # Resolve the public external catalog id to the immutable internal id.
+        # All DB operations and partition keys use the internal id so that
+        # a catalog rename (external id change) never orphans existing rows.
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+        internal_collection_id = await self._resolve_internal_collection_id(
+            internal_catalog_id, collection_id
+        )
+
+        from dynastore.modules.db_config.partition_tools import (
+            ensure_partitions_off_request_connection,
+        )
 
         try:
-            await ensure_partition_exists(
-                conn,
-                table_name="styles",
-                schema="styles",
-                strategy="LIST",
-                partition_value=catalog_id,
+            # Provisioned on a dedicated connection (not `conn`, the
+            # request-scoped one) so the ACCESS EXCLUSIVE lock this
+            # CREATE TABLE ... PARTITION OF statement takes on the shared
+            # styles.styles parent table is released as soon as this call
+            # returns, instead of being held for the rest of the request's
+            # transaction (see #2749, #2831).
+            await ensure_partitions_off_request_connection(
+                engine,
+                partitions=[
+                    dict(table_name="styles", schema="styles", strategy="LIST", partition_value=internal_catalog_id),
+                ],
             )
         except Exception as exc:
             logger.error(
@@ -321,7 +333,14 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
             ) from exc
 
         try:
-            return await styles_db.create_style(conn, catalog_id, collection_id, style)
+            return await styles_db.create_style(
+                conn,
+                internal_catalog_id,
+                internal_collection_id,
+                style,
+                external_catalog_id=catalog_id,
+                external_collection_id=collection_id,
+            )
         except IntegrityError as exc:
             if exc.orig and getattr(exc.orig, "sqlstate", None) == "23505":
                 raise HTTPException(
@@ -335,10 +354,18 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         catalog_id: str,
         collection_id: str,
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of styles to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         request_hints: FrozenSet = Depends(parse_hints_param),
-    ) -> List[Style]:
+    ) -> StyleList:
         # Accepted for uniform cross-protocol routing-hints support; this route
         # reads style metadata rows and performs no vector-geometry read.
         validate_sql_identifier(catalog_id)
@@ -346,9 +373,32 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
 
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
-        return await styles_db.list_styles_for_collection(
-            conn, catalog_id, collection_id, limit, offset
+
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+        internal_collection_id = await self._resolve_internal_collection_id(
+            internal_catalog_id, collection_id
         )
+
+        from dynastore.extensions.styles.config import StylesPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        styles_config = await self._get_plugin_config(
+            StylesPluginConfig, catalog_id, collection_id,
+        )
+        limit = resolve_page_limit(
+            limit, default_limit=styles_config.default_limit, max_limit=styles_config.max_limit,
+        )
+
+        styles, total = await styles_db.list_styles_for_collection(
+            conn,
+            internal_catalog_id,
+            internal_collection_id,
+            limit,
+            offset,
+            external_catalog_id=catalog_id,
+            external_collection_id=collection_id,
+        )
+        return StyleList(styles=styles, numberMatched=total, numberReturned=len(styles))
 
     async def get_style(
         self,
@@ -360,8 +410,18 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+        internal_collection_id = await self._resolve_internal_collection_id(
+            internal_catalog_id, collection_id
+        )
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn,
+            internal_catalog_id,
+            internal_collection_id,
+            style_id,
+            external_catalog_id=catalog_id,
+            external_collection_id=collection_id,
         )
         if not style:
             raise HTTPException(status_code=404, detail="Style not found.")
@@ -378,7 +438,16 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
-        updated = await styles_db.update_style(conn, catalog_id, style_id, style_update)
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
+        updated = await styles_db.update_style(
+            conn,
+            internal_catalog_id,
+            style_id,
+            style_update,
+            external_catalog_id=catalog_id,
+            external_collection_id=collection_id,
+        )
         if not updated:
             raise HTTPException(status_code=404, detail="Style not found.")
         return updated
@@ -393,13 +462,23 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+        internal_collection_id = await self._resolve_internal_collection_id(
+            internal_catalog_id, collection_id
+        )
+
         style_to_delete = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn,
+            internal_catalog_id,
+            internal_collection_id,
+            style_id,
+            external_catalog_id=catalog_id,
+            external_collection_id=collection_id,
         )
         if not style_to_delete:
             raise HTTPException(status_code=404, detail="Style not found.")
 
-        deleted = await styles_db.delete_style(conn, catalog_id, style_to_delete.id)
+        deleted = await styles_db.delete_style(conn, internal_catalog_id, style_to_delete.id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Style found but could not be deleted.")
 
@@ -422,8 +501,18 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+        internal_collection_id = await self._resolve_internal_collection_id(
+            internal_catalog_id, collection_id
+        )
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn,
+            internal_catalog_id,
+            internal_collection_id,
+            style_id,
+            external_catalog_id=catalog_id,
+            external_collection_id=collection_id,
         )
         if style is None:
             raise HTTPException(status_code=404, detail="Style not found.")
@@ -480,8 +569,18 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+        internal_collection_id = await self._resolve_internal_collection_id(
+            internal_catalog_id, collection_id
+        )
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn,
+            internal_catalog_id,
+            internal_collection_id,
+            style_id,
+            external_catalog_id=catalog_id,
+            external_collection_id=collection_id,
         )
         if style is None:
             raise HTTPException(status_code=404, detail="Style not found.")
@@ -507,8 +606,11 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
                 }
             )
 
-        links = list(style.links or [])
-        links.extend(stylesheet_links)
+        serialized_links = [
+            lnk.model_dump(by_alias=True, exclude_none=True)
+            for lnk in (style.links or [])
+        ]
+        serialized_links.extend(stylesheet_links)
         return JSONResponse(
             content={
                 "id": style.style_id,
@@ -516,7 +618,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
                 "description": style.description,
                 "keywords": style.keywords,
                 "scope": "style",
-                "links": links,
+                "links": serialized_links,
             }
         )
 
@@ -534,8 +636,18 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+        internal_collection_id = await self._resolve_internal_collection_id(
+            internal_catalog_id, collection_id
+        )
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn,
+            internal_catalog_id,
+            internal_collection_id,
+            style_id,
+            external_catalog_id=catalog_id,
+            external_collection_id=collection_id,
         )
         if style is None:
             raise HTTPException(status_code=404, detail="Style not found.")
@@ -554,22 +666,51 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
     async def list_all_styles(
         self,
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of styles to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ) -> JSONResponse:
-        styles = await styles_db.list_all_styles(conn, limit=limit, offset=offset)
-        return JSONResponse(
-            content={
-                "styles": [
-                    {
-                        "id": s.style_id,
-                        "title": s.title,
-                        "description": s.description,
-                        "catalog_id": s.catalog_id,
-                        "collection_id": s.collection_id,
-                    }
-                    for s in styles
-                    if s is not None
-                ]
-            }
+        from dynastore.extensions.styles.config import StylesPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        styles_config = await self._get_plugin_config(StylesPluginConfig)
+        limit = resolve_page_limit(
+            limit, default_limit=styles_config.default_limit, max_limit=styles_config.max_limit,
         )
+
+        styles = await styles_db.list_all_styles(conn, limit=limit, offset=offset)
+
+        # s.catalog_id is already the external id (resolved via the JOIN in
+        # styles_db.list_all_styles). s.collection_id is not, since collections
+        # live in a per-catalog schema and can't be resolved with a single
+        # cross-catalog JOIN — resolve it per row instead (cached, see
+        # assets_service.py's identical cross-collection pattern). A row whose
+        # collection no longer resolves is nulled rather than leaking the
+        # internal id.
+        catalogs_svc = await self._get_catalogs_service()
+        style_entries = []
+        for s in styles:
+            if s is None:
+                continue
+            external_collection_id = None
+            if s.collection_id is not None:
+                external_collection_id = await catalogs_svc.collections.resolve_collection_external_id(
+                    s.catalog_id, s.collection_id, allow_missing=True
+                )
+            style_entries.append(
+                {
+                    "id": s.style_id,
+                    "title": s.title,
+                    "description": s.description,
+                    "catalog_id": s.catalog_id,
+                    "collection_id": external_collection_id,
+                }
+            )
+        return JSONResponse(content={"styles": style_entries})

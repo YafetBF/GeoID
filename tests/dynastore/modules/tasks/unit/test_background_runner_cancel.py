@@ -490,3 +490,27 @@ def test_notification_transform_cancel_with_no_payload():
         assert inbox.empty()
 
     asyncio.run(_run())
+
+
+def test_notification_transform_platform_config_changed_broadcasts():
+    """platform_config_changed must broadcast with identifier=None.
+
+    The ConfigReloadService waits on the bare channel key
+    ``(PLATFORM_CONFIG_CHANGED, None)``; if the transform forwarded the
+    class_key payload as the identifier (the generic fallthrough), a real
+    NOTIFY would land on a different key and never wake the watcher — it would
+    then converge only on the bridge health-beat. This guards that wiring.
+
+    Ownership of this channel moved from the task-queue bridge to db_config's
+    ConfigReloadService (shared notification hub refactor), so the transform
+    under test now lives there.
+    """
+    from dynastore.modules.db_config.config_reload_service import (
+        _platform_config_changed_transform,
+    )
+    from dynastore.tools.async_utils import PLATFORM_CONFIG_CHANGED
+
+    result = _platform_config_changed_transform(
+        PLATFORM_CONFIG_CHANGED, "ValkeyEngineConfig"
+    )
+    assert result == (PLATFORM_CONFIG_CHANGED, None)

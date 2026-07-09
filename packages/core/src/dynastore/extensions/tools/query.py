@@ -32,6 +32,7 @@ from dynastore.extensions.tools.formatters import (
     format_response,
     OGCResponseMetadata,
 )
+from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,11 @@ HINTS_QUERY_DESCRIPTION = (
     "Canonical tokens come from the Hint vocabulary — e.g. "
     "``geometry_exact`` requests full-precision geometry from the exact-capable "
     "driver (today PostgreSQL) instead of the simplified search-backend copy. "
-    "Unknown tokens are ignored, so passing an unsupported hint is harmless."
+    "Unknown tokens are ignored, so passing an unsupported hint is harmless. "
+    "The parametric token ``prefer:<driver>`` (e.g. ``prefer:es``, ``prefer:pg``) "
+    "pins a READ/SEARCH to a specific driver regardless of its declared hint "
+    "surface — for example ``?hints=prefer:es`` routes a collection metadata "
+    "READ to Elasticsearch first with PostgreSQL kept as the fallback."
 )
 
 
@@ -316,6 +321,78 @@ OGC_RESERVED_QUERY_PARAMS: frozenset = frozenset({
 })
 
 
+async def resolve_queryable_property_names(catalog_id: str, collection_id: str) -> set:
+    """Return the set of valid queryable property names for a collection.
+
+    Single source of truth for validating any request parameter that names a
+    collection attribute against exactly the surface the ``/queryables``
+    endpoint advertises — the collection's own field definitions (via
+    :pymeth:`ItemsProtocol.get_collection_fields`) merged with
+    ``canonical_queryable_properties()`` (the bounded canonical system/stats
+    lanes, refs #2230/#2235). Shared by the OGC Features ``properties=``
+    projection parameter and the OGC Features / STAC ad-hoc
+    ``?{property}={value}`` filter shorthand — no parallel validator.
+
+    Returns an empty set when the introspection protocol is unavailable; the
+    caller treats that as "permissive" and skips validation rather than
+    failing every request when the introspection backend is offline.
+    """
+    from dynastore.models.protocols import ItemsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    items_svc = get_protocol(ItemsProtocol)
+    if items_svc is None:
+        return set()
+    try:
+        all_fields = await items_svc.get_collection_fields(catalog_id, collection_id)
+    except Exception:
+        return set()
+    names: set = set()
+    for fd in all_fields.values():
+        if not getattr(fd, "expose", True):
+            continue
+        final_name = getattr(fd, "alias", None) or getattr(fd, "name", None)
+        if not final_name or final_name in ("geoid", "geom"):
+            continue
+        names.add(final_name)
+
+    from dynastore.modules.elasticsearch.mappings import canonical_queryable_properties
+
+    names |= canonical_queryable_properties().keys()
+    return names
+
+
+def reject_unknown_filter_params(extra_filters: Dict[str, str], valid_names: set) -> None:
+    """Reject ad-hoc ``?{property}={value}`` filter params outside ``valid_names``.
+
+    Skips validation when ``valid_names`` is empty (introspection unavailable
+    — see :func:`resolve_queryable_property_names`), the same permissive
+    fallback the ``properties=`` projection check uses. Otherwise raises
+    ``HTTPException`` (400) naming every offending parameter.
+
+    This must run before the shorthand is folded into a CQL filter and
+    dispatched to a driver: the PG driver's ``parse_cql_filter`` already 400s
+    on an unmapped property name, but the ES SEARCH driver silently dropped
+    the unmapped predicate and served the unfiltered listing while the count
+    path independently collapsed to zero — the count and the returned
+    features must always describe the same selection (#2682). Validating
+    here, once, ahead of dispatch keeps both paths consistent regardless of
+    which driver ends up serving the request.
+    """
+    if not valid_names or not extra_filters:
+        return
+    unknown = sorted(k for k in extra_filters if k not in valid_names)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown filter parameter(s): {', '.join(unknown)}. Not a "
+                "queryable property of this collection — see '/queryables' "
+                "for the supported filter names."
+            ),
+        )
+
+
 def _cql_escape_literal(value: str) -> str:
     """Escape a value for embedding inside a single-quoted CQL2 string literal.
 
@@ -584,9 +661,13 @@ def parse_ogc_query_request(
 
     if bbox:
         try:
-            parsed_bbox = tuple(map(float, bbox.split(",")))
-            if len(parsed_bbox) != 4:
-                raise ValueError("BBOX must have 4 coordinates.")
+            parsed_bbox = parse_bbox_string(
+                bbox,
+                dimensionality=BboxDimensionality.STRICT_2D,
+                allow_none=False,
+                validate_geometry=False,
+            )
+            assert parsed_bbox is not None  # allow_none=False guarantees this
             srid = bbox_crs_srid or 4326
             request_obj.filters.append(
                 FilterCondition(
@@ -674,6 +755,8 @@ def stream_ogc_features(
     target_srid: int = 4326,
     links: Optional[List[Any]] = None,
     language: str = "en",
+    offset: Optional[int] = None,
+    max_response_bytes: Optional[int] = None,
 ) -> StreamingResponse:
     """
     Unified streaming response for OGC Features/WFS/DWH.
@@ -681,6 +764,16 @@ def stream_ogc_features(
     ``language`` controls how ``Link.title`` values (``LocalizedText``) are
     resolved before writing to the wire.  Default ``'en'`` collapses each
     title to a plain string; ``'*'`` preserves the full multi-language dict.
+
+    ``offset``/``max_response_bytes`` (#2681): pass both to enable a
+    config-driven response byte budget — once the serialized ``features``
+    bytes cross ``max_response_bytes`` the GeoJSON/JSON page is cut short and
+    the precomputed ``next`` link in ``links`` is replaced with one built
+    from the number of items actually served (see
+    :func:`dynastore.extensions.tools.formatters._stream_ogc_json`).
+    ``numberReturned`` always reflects what was actually streamed;
+    ``numberMatched`` is unaffected. Omit both (the default) to keep the
+    unbounded legacy behaviour.
     """
     from datetime import datetime, timezone
     from dynastore.extensions.tools.response_i18n import resolve_links
@@ -709,4 +802,6 @@ def stream_ogc_features(
         collection_id=collection_id,
         target_srid=target_srid,
         metadata=ogc_metadata,
+        max_response_bytes=max_response_bytes,
+        offset=offset,
     )

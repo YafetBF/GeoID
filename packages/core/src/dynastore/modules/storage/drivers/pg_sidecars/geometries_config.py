@@ -27,13 +27,14 @@ This module is extracted to avoid circular dependencies between:
 
 from typing import List, Optional, Dict, Literal
 from enum import Enum
-from pydantic import Field
+from pydantic import Field, field_validator
 from dynastore.models.mutability import Computed
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     ComputedKind,
 )
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarConfig, SidecarConfigRegistry
+from dynastore.tools.db import validate_column_identifier, InvalidIdentifierError
 
 # ============================================================================
 # ENUMS
@@ -58,6 +59,14 @@ class SimplificationAlgorithm(str, Enum):
     DOUGLAS_PEUCKER = "douglas_peucker"
     TOPOLOGY_PRESERVING = "topology_preserving"
     VISVALINGAM_WHYATT = "visvalingam_whyatt"
+    # ST_SnapToGrid: O(n) grid-snap pre-pass before ST_AsMVTGeom.
+    # Snaps every coordinate to a gridsize cell (same unit as source CRS).
+    # Far faster than topology-preserving for dense polygon collections;
+    # sub-pixel rings collapse to degenerate geometry, which ST_AsMVTGeom
+    # drops as NULL — the same invisible features the density filter removes
+    # explicitly. Preferred for MVT render because ST_AsMVTGeom already
+    # quantises internally; the pre-pass only reduces vertex count cheaply.
+    SNAP_TO_GRID = "snap_to_grid"
 
 
 class GeometryPartitionStrategyPreset(str, Enum):
@@ -97,6 +106,27 @@ class GeometriesSidecarConfig(SidecarConfig):
         default="bbox_geom", 
         description="Bounding box column name. If set, a separate column for the spatial extent is managed. Set to None to disable."
     )
+
+    @field_validator("geom_column", "bbox_column", mode="before")
+    @classmethod
+    def _validate_column_identifiers(cls, v: Optional[str]) -> Optional[str]:
+        """Validate column identifier fields before they reach SQL interpolation.
+
+        These field names are interpolated into SQL queries (column names cannot
+        be bound parameters). Reject non-identifier values at the config boundary
+        so injection attempts fail early with a clear error, rather than reaching
+        the query string. None is always valid (disables the column). (#2314)
+        """
+        if v is None:
+            return v
+        try:
+            return validate_column_identifier(v)
+        except InvalidIdentifierError as exc:
+            raise ValueError(
+                f"Column name {v!r} is not a valid SQL identifier: {exc}. "
+                "The value is interpolated into SQL; use only letters, "
+                "digits, and underscores, starting with a letter or underscore."
+            ) from exc
 
     @property
     def write_bbox(self) -> bool:

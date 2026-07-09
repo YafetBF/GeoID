@@ -20,7 +20,7 @@
 Storage-related protocol definitions.
 """
 
-from typing import Protocol, Optional, Any, runtime_checkable
+from typing import List, Protocol, Optional, Any, runtime_checkable
 
 @runtime_checkable
 class StorageProtocol(Protocol):
@@ -33,7 +33,7 @@ class StorageProtocol(Protocol):
         """Returns the storage identifier (e.g., bucket name) associated with a catalog."""
         ...
 
-    async def ensure_storage_for_catalog(self, catalog_id: str, conn: Optional[Any] = None) -> Optional[str]:
+    async def ensure_storage_for_catalog(self, catalog_id: str, conn: Optional[Any] = None, raise_on_failure: bool = False) -> Optional[str]:
         """Ensures that storage (e.g., a bucket) exists for a catalog, creating it if it doesn't."""
         ...
 
@@ -41,7 +41,13 @@ class StorageProtocol(Protocol):
         """Returns the storage path (e.g., gs://...) for a catalog."""
         ...
 
-    async def drop_storage(self, catalog_id: str, conn: Optional[Any] = None) -> bool:
+    async def drop_storage(
+        self,
+        catalog_id: str,
+        conn: Optional[Any] = None,
+        physical_schema: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+    ) -> bool:
         """Remove all binary storage resources (e.g. bucket, prefix) associated with a catalog.
 
         This is the uniform teardown entry point for binary storage, parallel to the
@@ -50,6 +56,11 @@ class StorageProtocol(Protocol):
 
         Returns True when cleanup completed (idempotent — a missing bucket/resource
         is a no-op success, not a failure).
+
+        ``physical_schema`` / ``bucket_name`` select the recreation-safe teardown
+        path (#2298): an explicit old-resource target captured at delete time so a
+        catalog rapidly recreated under a new schema is never collaterally deleted.
+        Implementations that have no such race may ignore both.
         """
         ...
 
@@ -100,3 +111,29 @@ class StorageProtocol(Protocol):
             with open(tmp.name, "rb") as f:
                 f.seek(offset)
                 return f.read(length)
+
+    async def download_file_content(self, path: str) -> Optional[bytes]:
+        """Download a full object as bytes, or None if it does not exist.
+
+        Default: existence-check then download to a temp file and read it
+        back — correct but allocates a temp file per call. Providers should
+        override this with a direct in-memory read (e.g. GCS
+        ``blob.download_as_bytes()``).
+        """
+        import tempfile
+        if not await self.file_exists(path):
+            return None
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            await self.download_file(path, tmp.name)
+            with open(tmp.name, "rb") as f:
+                return f.read()
+
+    async def list_prefix(self, base_uri: str, prefix: str) -> List[str]:
+        """List object paths (each usable as ``delete_file``'s ``path`` arg)
+        under ``{base_uri}/{prefix}``.
+
+        Default: not supported (empty list) — callers that need a prefix-
+        scoped bulk delete degrade to a no-op rather than fail. Providers
+        should override this (GCS: ``bucket.list_blobs(prefix=...)``).
+        """
+        return []

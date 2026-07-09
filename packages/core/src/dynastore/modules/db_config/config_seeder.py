@@ -69,11 +69,13 @@ from typing import Any, Dict, List, Optional
 from dynastore.modules.db_config.instance import DEFAULTS_DIR
 from dynastore.modules.db_config.locking_tools import acquire_startup_lock
 from dynastore.models.plugin_config import PluginConfig, resolve_config_class
-from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.modules.db_config.query_executor import DbResource, is_lock_not_available_error
 
 logger = logging.getLogger(__name__)
 
 
+# Listed alongside every other static lock/lease key in
+# modules/tasks/durable/lock_registry.py.
 _SEED_LOCK_KEY = "config_seeder.defaults"
 _PRODUCTION_ENV_NAMES = frozenset({"prod", "production"})
 
@@ -135,36 +137,48 @@ async def seed_default_configs(engine: DbResource) -> None:
 
     # One advisory lock per cluster so only one process applies seeds (and
     # the legacy-key fixup) per boot. If we can't acquire within the default
-    # 30s, log and proceed without seeding — the holder will do it.
-    async with acquire_startup_lock(engine, _SEED_LOCK_KEY) as conn:
-        if conn is None:
-            logger.info(
-                "config_seeder: another process holds %s — skipping.",
-                _SEED_LOCK_KEY,
-            )
-            return
-        if json_files and config_mgr is not None:
-            # Cold-boot guard (#2209): ensure ``configs.platform_configs`` exists
-            # before writing any seed. ``PlatformConfigService`` (module priority
-            # 0) skips its DDL when the DB engine is not yet up (DBService is
-            # priority 10), so on a fresh DB the table can be absent when this
-            # seeder runs — silently dropping every seed (notably ``idp_config``),
-            # which leaves authentication with no IdP registered until a restart.
-            # Idempotent ``CREATE ... IF NOT EXISTS`` under the advisory lock we
-            # already hold — a bootstrap ensure, not a migration.
-            try:
-                from dynastore.modules.db_config.platform_config_service import (
-                    PlatformConfigService,
+    # 30s, log and proceed without seeding — the holder will do it. A
+    # lock-timeout raises (PG 55P03) rather than yielding None, so it's
+    # caught explicitly here and folded into the same skip path — another
+    # process winning the race is expected, not fatal (#2625).
+    try:
+        async with acquire_startup_lock(engine, _SEED_LOCK_KEY) as conn:
+            if conn is None:
+                logger.info(
+                    "config_seeder: another process holds %s — skipping.",
+                    _SEED_LOCK_KEY,
                 )
+                return
+            if json_files and config_mgr is not None:
+                # Cold-boot guard (#2209): ensure ``configs.platform_configs`` exists
+                # before writing any seed. ``PlatformConfigService`` (module priority
+                # 0) skips its DDL when the DB engine is not yet up (DBService is
+                # priority 10), so on a fresh DB the table can be absent when this
+                # seeder runs — silently dropping every seed (notably ``idp_config``),
+                # which leaves authentication with no IdP registered until a restart.
+                # Idempotent ``CREATE ... IF NOT EXISTS`` under the advisory lock we
+                # already hold — a bootstrap ensure, not a migration.
+                try:
+                    from dynastore.modules.db_config.platform_config_service import (
+                        PlatformConfigService,
+                    )
 
-                await PlatformConfigService.initialize_storage(conn)
-            except Exception:
-                logger.warning(
-                    "config_seeder: platform config storage ensure failed; "
-                    "seeds may be skipped if the table is absent.",
-                    exc_info=True,
-                )
-        await _seed_from_files(conn, config_mgr, json_files)
+                    await PlatformConfigService.initialize_storage(conn)
+                except Exception:
+                    logger.warning(
+                        "config_seeder: platform config storage ensure failed; "
+                        "seeds may be skipped if the table is absent.",
+                        exc_info=True,
+                    )
+            await _seed_from_files(conn, config_mgr, json_files)
+    except Exception as exc:
+        if not is_lock_not_available_error(exc):
+            raise
+        logger.info(
+            "config_seeder: %s timed out (another process is likely still "
+            "seeding) — skipping: %s",
+            _SEED_LOCK_KEY, exc,
+        )
 
 
 async def _seed_from_files(
@@ -202,6 +216,21 @@ async def _seed_from_files(
             "config_seeder: bootstrap guard set — skipping non-override seeds.",
         )
 
+    # Fetched once per seeding pass rather than per seed file: ``merged`` is
+    # already deduplicated by class_key, so each iteration only ever checks
+    # membership of its own (unique) class — no iteration's write can change
+    # what a later iteration's check needs to see. A snapshot before the loop
+    # is therefore equivalent to a per-iteration re-query.
+    try:
+        existing_configs: Optional[Dict[type, Any]] = await config_mgr.list_configs()
+    except Exception as exc:  # noqa: BLE001 — degrade to apply-anyway
+        logger.debug(
+            "config_seeder: list_configs failed (%s) — applying seeds without "
+            "skip-if-existing check.",
+            exc,
+        )
+        existing_configs = None
+
     applied = 0
     skipped_initialized = 0
     skipped_unknown = 0
@@ -211,7 +240,7 @@ async def _seed_from_files(
             skipped_initialized += 1
             continue
         try:
-            outcome = await _apply_one(config_mgr, class_key, payload)
+            outcome = await _apply_one(config_mgr, class_key, payload, existing_configs)
         except Exception as exc:  # noqa: BLE001 — never fail boot
             logger.warning(
                 "config_seeder: failed to apply seed for %s: %s",
@@ -252,9 +281,15 @@ async def _seed_from_files(
 
 
 async def _apply_one(
-    config_mgr: Any, class_key: str, payload: Dict[str, Any],
+    config_mgr: Any,
+    class_key: str,
+    payload: Dict[str, Any],
+    existing_configs: Optional[Dict[type, Any]],
 ) -> str:
     """Apply a single seed payload.
+
+    ``existing_configs`` is the ``list_configs()`` snapshot taken once by the
+    caller before the seeding loop started (see ``_seed_from_files``).
 
     Returns one of: ``"applied"``, ``"skipped_existing"``,
     ``"skipped_unknown_class"``, ``"rejected_bad_value"``.
@@ -272,20 +307,12 @@ async def _apply_one(
     # Skip when a row already exists and override is False. ``get_config``
     # always returns *something* (defaults materialised on demand) so we
     # use ``list_configs`` to distinguish "stored row" from "default".
-    if not override:
-        try:
-            existing = await config_mgr.list_configs()
-            if cls in existing:
-                logger.info(
-                    "config_seeder: %s already present — skipping (override=false).",
-                    class_key,
-                )
-                return "skipped_existing"
-        except Exception as exc:  # noqa: BLE001 — degrade to apply-anyway
-            logger.debug(
-                "config_seeder: list_configs failed (%s) — applying %s anyway.",
-                exc, class_key,
-            )
+    if not override and existing_configs is not None and cls in existing_configs:
+        logger.info(
+            "config_seeder: %s already present — skipping (override=false).",
+            class_key,
+        )
+        return "skipped_existing"
 
     config = cls.model_validate(value)
     await config_mgr.set_config(cls, config)

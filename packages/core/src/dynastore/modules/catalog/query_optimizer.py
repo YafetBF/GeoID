@@ -37,6 +37,7 @@ from dynastore.models.query_builder import (
 )
 from dynastore.models.ogc import Feature
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.db import quote_ident as _canonical_quote_ident
 from dynastore.models.protocols.items import ItemsProtocol
 
 logger = logging.getLogger(__name__)
@@ -66,13 +67,11 @@ def _quote_alias(alias: str) -> str:
     e.g. the MVT outer wrapper that selects ``"CODE"`` from the inner subquery.
     Idempotent: an already-quoted alias is returned unchanged. ``*`` is never
     quoted. See #719.
+
+    Thin wrapper around the canonical ``dynastore.tools.db.quote_ident``
+    (#2700) — kept as a local alias so call sites in this module don't churn.
     """
-    a = alias.strip()
-    if a == "*":
-        return a
-    if a.startswith('"') and a.endswith('"'):
-        return a
-    return '"' + a.replace('"', '""') + '"'
+    return _canonical_quote_ident(alias.strip(), allow_star=True)
 
 
 class QueryOptimizer:
@@ -443,6 +442,28 @@ class QueryOptimizer:
                 if FieldCapability.GROUPABLE not in field_def.capabilities:
                     errors.append(f"Field {field} is not groupable")
 
+        # Validate select/group_by consistency (#2859): a selected field that
+        # is neither grouped nor aggregated cannot appear in the projection
+        # alongside an explicit GROUP BY. #2843 made ``build_optimized_query``
+        # silently drop that field from the render, which left a caller
+        # expecting it back with no signal it vanished — reject the shape
+        # here instead, consistent with the other diagnostics above.
+        #
+        # Skipped when the select list includes a wildcard: the wildcard's
+        # rendered SELECT list (sidecar expansion plus any explicit
+        # overrides) is only fully resolved at render time, so it is not
+        # knowable here. The render-time guard in ``build_optimized_query``
+        # is the only defense for that combination — see the guard on the
+        # wildcard branch's explicit-override loop.
+        if query.group_by and not any(sel.field == "*" for sel in query.select):
+            for sel in query.select:
+                if sel.field not in query.group_by and not sel.aggregation:
+                    errors.append(
+                        f"Field {sel.field} is selected but neither grouped "
+                        "nor aggregated; add it to group_by or apply an "
+                        "aggregation"
+                    )
+
         return errors
 
     def get_all_queryable_fields(self) -> Dict[str, FieldDefinition]:
@@ -531,6 +552,25 @@ class QueryOptimizer:
             served = type(sc).serves_consumers()
             return served is None or self.consumer in served
 
+        def _drop_unconditional_envelope(
+            sidecars: List[SidecarConfig],
+        ) -> List[SidecarConfig]:
+            """Remove the access_envelope sidecar when access is provably
+            unconditional (blanket allow, no deny, no union).
+
+            The envelope sidecar is RETAINED when:
+            * ``access_filter`` is ``None`` — fail-closed; sidecar appends FALSE.
+            * ``is_unconditional`` is False — row-level WHERE must run.
+            Only dropped when ``is_unconditional`` is True (pure JOIN overhead).
+            """
+            _af = getattr(query, "access_filter", None)
+            if _af is not None and _af.is_unconditional:
+                return [
+                    sc for sc in sidecars
+                    if getattr(sc, "sidecar_type", None) != "access_envelope"
+                ]
+            return sidecars
+
         # Check SELECT fields
         for sel in query.select:
             if sel.field == "*":
@@ -538,10 +578,13 @@ class QueryOptimizer:
                 # selecting *.  Consumer-specific sidecars (e.g.
                 # stac_metadata for non-STAC consumers) are skipped — the
                 # caller asked for "everything for *this* response shape".
-                return [
+                # Conditional ABAC envelope: drop the sidecar when access is
+                # provably unconditional (same invariant as the explicit-
+                # projection path below — see _drop_unconditional_envelope).
+                return _drop_unconditional_envelope([
                     sc for sc in driver_sidecars(self.col_config)
                     if _serves_active_consumer(sc)
-                ]
+                ])
 
             if sel.field in self.field_index:
                 sidecar, _ = self.field_index[sel.field]
@@ -619,17 +662,21 @@ class QueryOptimizer:
         # A user-facing read sets ``access_filter`` via
         # ``access_scope.compile_read_access_filter``; a privileged/system read
         # must pass ``AccessFilter.allow_everything()`` explicitly to opt out.
-        # (The
-        # ``select=*`` path already includes the sidecar via the consumer-serving
-        # branch above; this closes the explicit-projection gap.)
+        # (The ``select=*`` path already includes the sidecar via the consumer-
+        # serving branch above; this closes the explicit-projection gap.)
         for sc_config in driver_sidecars(self.col_config):
             if getattr(sc_config, "sidecar_type", None) == "access_envelope":
                 required_sidecars.add(sc_config.sidecar_id)
 
-        # Return only required sidecar configs, preserving declaration order
-        return [
-            sc for sc in driver_sidecars(self.col_config) if sc.sidecar_id in required_sidecars
-        ]
+        # Conditional ABAC envelope (read-perf, #2550): see
+        # _drop_unconditional_envelope above.  Both the select=* early-return
+        # path and this explicit-projection path apply the same drop so that
+        # unconditional (blanket-allow) principals skip the envelope JOIN on
+        # all read shapes.
+        return _drop_unconditional_envelope([
+            sc for sc in driver_sidecars(self.col_config)
+            if sc.sidecar_id in required_sidecars
+        ])
 
     def build_optimized_query(
         self,
@@ -664,11 +711,23 @@ class QueryOptimizer:
         # Build SELECT clause
         select_fields = []
 
-        if query.include_total_count:
-            select_fields.append("COUNT(*) OVER() AS _total_count")
-
         if any(sel.field == "*" for sel in query.select):
-            select_fields.append("h.*")
+            # #2829: a wildcard select is the DEFAULT ``QueryRequest.select``
+            # (the ``select`` validator coerces any falsy value, including an
+            # omitted/empty list, to ``[FieldSelection(field="*")]``), so a
+            # caller building ``QueryRequest(group_by=[...])`` without
+            # separately naming the grouped field lands here — not in the
+            # dead-code "empty select" branch below. ``h.*`` unconditionally
+            # expands to every hub column (geoid, deleted_at, ...), none of
+            # which are grouped, so it — and the sidecar wildcard expansion a
+            # few lines down — must be skipped for a GROUP BY request. Sidecar
+            # columns instead come from the narrowed "selective mode" (see
+            # ``get_select_fields``'s ``group_by``-aware gating), which
+            # restricts to exactly the grouped fields; the group_by projection
+            # guarantee below fills in anything neither h.* nor a sidecar
+            # contributes (e.g. a JSONB-dynamic field with no static column).
+            if not query.group_by:
+                select_fields.append("h.*")
             # Collect the set of fields explicitly overridden by non-* FieldSelections
             # AND by raw_selects entries (used by the MVT transform to inject
             # ``ST_AsMVTGeom(...) AS geom``), so sidecar expansion can skip them
@@ -687,7 +746,8 @@ class QueryOptimizer:
                 if sidecar:
                     sc_alias = f"sc_{sidecar.sidecar_id}"
                     for f in sidecar.get_select_fields(
-                        request=query, sidecar_alias=sc_alias, include_all=True
+                        request=query, sidecar_alias=sc_alias,
+                        include_all=not query.group_by,
                     ):
                         logical_name = _extract_alias(f)
                         if logical_name in explicit_field_names:
@@ -701,6 +761,15 @@ class QueryOptimizer:
             # SELECT list alongside the wildcard expansion.
             for sel in query.select:
                 if sel.field == "*" or sel.field not in self.field_index:
+                    continue
+                if query.group_by and sel.field not in query.group_by and not sel.aggregation:
+                    # #2859: mirror the non-wildcard branch's guard below
+                    # (#2843) — an explicit override selected alongside the
+                    # wildcard cannot appear in SELECT next to an explicit
+                    # GROUP BY unless it is itself grouped or aggregated.
+                    # ``validate_query`` does not catch this combination (the
+                    # wildcard's full override set is only resolved here, at
+                    # render time), so this is the sole defense for it.
                     continue
                 _, field_def = self.field_index[sel.field]
                 expr = field_def.sql_expression
@@ -733,11 +802,33 @@ class QueryOptimizer:
         else:
             # Always check if geoid is explicitly requested or aggregation implies it
             has_aggregations = any(sel.aggregation for sel in query.select)
-            if not has_aggregations and "geoid" not in [s.field for s in query.select]:
-                # Only add geoid implicit selection if no aggregations (don't break GROUP BY)
+            if (
+                not has_aggregations
+                and not query.group_by
+                and "geoid" not in [s.field for s in query.select]
+            ):
+                # Only add the implicit geoid selection when nothing forces a
+                # GROUP BY — an explicit `query.group_by` builds its own GROUP
+                # BY clause below from exactly the requested fields, and an
+                # ungrouped h.geoid slipped into SELECT alongside it violates
+                # PostgreSQL's GROUP BY rule (#2829): "column h.geoid must
+                # appear in the GROUP BY clause or be used in an aggregate
+                # function".
                 select_fields.append("h.geoid")
 
             for sel in query.select:
+                if query.group_by and sel.field not in query.group_by and not sel.aggregation:
+                    # #2829: a selected field that is neither grouped nor
+                    # aggregated cannot appear in SELECT alongside an explicit
+                    # GROUP BY — PostgreSQL rejects it ("column ... must
+                    # appear in the GROUP BY clause or be used in an
+                    # aggregate function"). #2859: this shape is now rejected
+                    # up front by ``validate_query``, so a request reaching
+                    # this point should already have the field excluded; the
+                    # drop here is defense-in-depth against a caller that
+                    # builds SQL without validating first.
+                    continue
+
                 if sel.field == "geoid":
                     select_fields.append("h.geoid")
                     continue
@@ -779,6 +870,29 @@ class QueryOptimizer:
                 # Apply alias
                 alias = sel.alias or sel.field
                 select_fields.append(f"{expr} as {_quote_alias(alias)}")
+
+        # #2829: every GROUP BY field must reach the SELECT list, even when
+        # the caller did not also name it in ``query.select`` (e.g. the
+        # region-mapping-style distinct-values read: ``select=[]``,
+        # ``group_by=["region"]`` — group by a property without separately
+        # re-selecting it). Without this, such a request built an empty (or
+        # group_by-field-less) SELECT list — a SQL syntax error, not merely
+        # a grouping error. Fields already reaching SELECT via an explicit
+        # ``FieldSelection`` (checked by output alias, matching the explicit
+        # form's own ``<expr> as "<name>"`` rendering) are not duplicated.
+        if query.group_by:
+            already_selected = {_extract_alias(f) for f in select_fields}
+            for gb_field in query.group_by:
+                if gb_field in already_selected:
+                    continue
+                if gb_field == "geoid":
+                    select_fields.append("h.geoid")
+                elif gb_field in self.field_index:
+                    _, gb_field_def = self.field_index[gb_field]
+                    select_fields.append(
+                        f"{gb_field_def.sql_expression} as {_quote_alias(gb_field)}"
+                    )
+                already_selected.add(gb_field)
 
         if query.raw_selects:
             select_fields.extend(query.raw_selects)
@@ -827,8 +941,19 @@ class QueryOptimizer:
                     is_spatial = filt.spatial_op or op_sql.upper().startswith("ST_")
                     is_range = op_sql in ("&&", "@>", "<@", "||", "&<", "&>")
 
-            if is_spatial:
+            if is_spatial and op_sql.upper().startswith("ST_"):
+                # ST_* function form: ST_Intersects(expr, :param)
                 where_conditions.append(f"{op_sql}({expr}, :{param_name})")
+            elif is_spatial:
+                # Infix spatial operator (e.g. BBOX → "&&"): the value is an
+                # EWKT geometry literal.  Rendering as ``&&(expr, :param)``
+                # causes PostgreSQL to parse the two-element parenthesised list
+                # as a composite/record type and then apply ``&&`` to that
+                # single record operand, producing:
+                #   operator does not exist: && record
+                # The correct form is ``expr && ST_GeomFromEWKT(:param)`` so
+                # each side of the infix operator is a typed geometry.
+                where_conditions.append(f"{expr} {op_sql} ST_GeomFromEWKT(:{param_name})")
             elif is_range or op_sql in ("&&", "@>", "<@", "||", "&<", "&>"):
                 if op_sql == "@>" and not str(filt.value).startswith(("[", "(")):
                     where_conditions.append(
@@ -926,6 +1051,27 @@ class QueryOptimizer:
             "table": table,
         }
 
+        # Pre-compute the sort-providing sidecar config for the INNER-join optimisation.
+        # When the default-sort path is active (no explicit sort, no GROUP BY, no
+        # aggregation), the sidecar that provides the default sort (typically the
+        # attributes sidecar via external_id) can drive the query from its
+        # idx_ext_id_sort index — but only when joined as INNER, not LEFT.
+        # LEFT JOIN forces hub to be the outer table and blocks index-ordered
+        # streaming.  We detect the sort-provider here so the JOIN loop below
+        # can pass join_type="INNER" for just that one sidecar without affecting
+        # all other sidecars' join semantics.
+        _default_sort_sc_config = None
+        if (
+            not query.sort
+            and not query.group_by
+            and not any(sel.aggregation for sel in query.select)
+        ):
+            for _sc_conf in required_sidecars:
+                _sc = SidecarRegistry.get_sidecar(_sc_conf, lenient=True)
+                if _sc and _sc.get_default_sort():
+                    _default_sort_sc_config = _sc_conf
+                    break
+
         for sc_config in required_sidecars:
             sidecar = SidecarRegistry.get_sidecar(sc_config, lenient=True)
             if not sidecar:
@@ -944,8 +1090,15 @@ class QueryOptimizer:
             # the alias is followed by " ON", not a space.
             join_exists = any(f" AS {sc_alias} " in j for j in query_context["joins"])
             if not join_exists:
+                # Use INNER JOIN for the sort-providing sidecar so the planner can
+                # drive from its ext_id_sort index and stream rows in ORDER BY order
+                # without a full filesort.  Every other sidecar keeps LEFT semantics.
+                _join_type = "INNER" if sc_config is _default_sort_sc_config else "LEFT"
                 query_context["joins"].append(
-                    sidecar.get_join_clause(schema, table, hub_alias="h", sidecar_alias=sc_alias)
+                    sidecar.get_join_clause(
+                        schema, table, hub_alias="h", sidecar_alias=sc_alias,
+                        join_type=_join_type,
+                    )
                 )
         
         # Add any extra joins contributed by sidecars
@@ -973,18 +1126,20 @@ class QueryOptimizer:
         # Resolve the feature-ID expression. ``provides_feature_id`` on the
         # sidecar is a capability flag (at most one sidecar can provide it).
         #
-        # Two cases:
-        # 1. Non-STAC consumers: the wire-shape decision lives on the read
-        #    policy — when ``external_id_as_feature_id`` is False,
-        #    ``feature.id == geoid`` regardless of sidecar capability.
-        # 2. STAC consumers: STAC items MUST expose the authored external_id
-        #    (the original STAC item id) as the stable, client-facing identifier.
-        #    Use COALESCE(external_id, geoid) unconditionally so that GET /items
-        #    and POST /search produce the same id regardless of the per-collection
-        #    read-policy setting (search.py uses the same COALESCE convention).
-        #    Items without an external_id fall back to the geoid UUID.
+        # The wire-shape decision lives on the read policy for EVERY consumer,
+        # STAC included (#3070). When ``external_id_as_feature_id`` is False (the
+        # default) the stable ``geoid`` is the feature id; only when a collection
+        # opts in does the authored ``external_id`` become the id, falling back
+        # to the geoid UUID for rows that carry none. Honouring the policy here
+        # keeps a single item's id identical across OGC Features and STAC instead
+        # of Features showing the geoid while STAC silently forced the external_id
+        # — the id round-trips because GET /items, GET /items/{id} and POST
+        # /search all resolve against this same expression (see search.py, which
+        # gates its hand-written id projection on the same flag). The STAC Item
+        # spec only *recommends* reusing the provider id scheme, so a geoid id is
+        # equally conformant.
         feature_id_expr: str = "h.geoid"
-        use_coalesce = self._external_id_as_feature_id() or self.consumer == ConsumerType.STAC
+        use_coalesce = self._external_id_as_feature_id()
         if use_coalesce:
             for sc_config in required_sidecars:
                 sidecar = SidecarRegistry.get_sidecar(sc_config, lenient=True)
@@ -993,7 +1148,14 @@ class QueryOptimizer:
                     feature_id_expr = f"COALESCE({sc_alias}.{sidecar.feature_id_field_name}, h.geoid::text)"
                     break
 
-        if not any("AS id" in f or f.rstrip().endswith(" id") for f in select_fields):
+        # Skip the implicit "AS id" projection for a GROUP BY request (#2829):
+        # ``feature_id_expr`` is a per-row identity (h.geoid, or a COALESCE
+        # against it) that is neither one of the requested group_by fields nor
+        # aggregated, so PostgreSQL rejects it the same way it rejects the
+        # implicit geoid selection above.
+        if not query.group_by and not any(
+            "AS id" in f or f.rstrip().endswith(" id") for f in select_fields
+        ):
             select_fields.append(f"{feature_id_expr} AS id")
 
         # Filter by item_ids using the resolved feature-ID expression.

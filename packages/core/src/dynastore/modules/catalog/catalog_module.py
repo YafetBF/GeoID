@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from dynastore.modules.storage.hints import Hint
 
 from dynastore.modules import ModuleProtocol
+
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
     DDLQuery,
@@ -82,7 +83,7 @@ from dynastore.modules.catalog.event_service import (
     register_event_listener,
     emit_event,
 )
-from dynastore.modules.catalog.log_manager import LogService, initialize_system_logs
+from dynastore.modules.catalog.log_manager import LogService
 
 logger = logging.getLogger(__name__)
 
@@ -187,24 +188,29 @@ async def _asset_event_bridge(
 CATALOGS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS catalog.catalogs (
     id VARCHAR PRIMARY KEY,
-    physical_schema VARCHAR NOT NULL UNIQUE,
+    external_id VARCHAR NOT NULL,
     provisioning_status VARCHAR(50) NOT NULL DEFAULT 'ready',
     provisioning_checklist JSONB DEFAULT NULL,
+    first_ready_at TIMESTAMPTZ DEFAULT NULL,
     deleted_at TIMESTAMPTZ DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS catalogs_external_uq
+    ON catalog.catalogs (external_id)
+    WHERE deleted_at IS NULL;
 """
 
 SHARED_PROPERTIES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS catalog.shared_properties (
-    key_name VARCHAR PRIMARY KEY, 
-    key_value VARCHAR NOT NULL, 
-    owner_code VARCHAR, 
-    created_at TIMESTAMPTZ DEFAULT NOW(), 
+    key_name VARCHAR PRIMARY KEY,
+    key_value VARCHAR NOT NULL,
+    owner_code VARCHAR,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 """
+
 
 
 _module_instance: Optional[ModuleProtocol] = None
@@ -375,6 +381,173 @@ class CatalogModule(ModuleProtocol):
             register_item_reverse_cascade_subscriber()
             register_item_forward_cascade_subscriber()
 
+            # Register catalog_core as priority-0 provisioner.  It runs the
+            # tenant schema DDL and lifecycle hooks that every other provisioner
+            # (GCP, ES, …) depends on.  Priority 0 guarantees it executes in its
+            # own group before any priority-100 provisioner group.
+            from dynastore.modules.catalog.provisioning_registry import (
+                provisioning_registry as _prov_registry,
+                SCOPE_CATALOG,
+            )
+
+            async def _catalog_core_is_active(catalog_id: str, conn=None) -> bool:
+                return True
+
+            async def _catalog_core_provision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "provision",
+                collection_id=None,
+                **_kw,
+            ) -> None:
+                """Run the core tenant DDL for a catalog.
+
+                Called by CatalogProvisionTask via call_hook(**ctx).  Opens its
+                own managed transaction because the task runs outside any caller
+                transaction.  The checklist was already seeded by
+                _create_catalog_async before the task was enqueued.  Lifecycle
+                events (CATALOG_CREATION / AFTER_CATALOG_CREATION) are emitted
+                by CatalogProvisionTask.run() after all checklist steps complete.
+                """
+                from dynastore.modules.catalog.catalog_service import (
+                    get_catalog_engine,
+                    _invalidate_catalog_model_cache,
+                    _invalidate_catalog_external_id_cache,
+                )
+                from dynastore.modules.db_config.query_executor import managed_transaction
+                from dynastore.tools.protocol_helpers import resolve
+                from dynastore.models.protocols import CatalogsProtocol
+
+                catalogs = resolve(CatalogsProtocol)
+                catalog_model = await catalogs.get_catalog_model(catalog_id)
+                if catalog_model is None:
+                    raise RuntimeError(
+                        f"catalog_core provisioner: catalog '{catalog_id}' not found"
+                    )
+
+                run_core_init = getattr(catalogs, "_run_core_init", None)
+                if run_core_init is None:
+                    raise RuntimeError(
+                        f"CatalogsProtocol implementation {type(catalogs).__name__} "
+                        "does not expose _run_core_init; cannot run catalog_core provisioner"
+                    )
+
+                _ext_id = external_id or getattr(catalog_model, "external_id", None) or catalog_id
+                physical_schema = catalog_id
+
+                async with managed_transaction(get_catalog_engine()) as conn:
+                    await run_core_init(
+                        conn,
+                        catalog_model,
+                        _ext_id,
+                        physical_schema,
+                    )
+
+                _invalidate_catalog_model_cache(catalog_id)
+                _invalidate_catalog_external_id_cache(_ext_id)
+
+            async def _catalog_core_deprovision(
+                catalog_id: str,
+                external_id=None,
+                scope: str = "catalog",
+                operation: str = "deprovision_hard",
+                collection_id=None,
+                config_snapshot=None,
+                **_kw,
+            ) -> None:
+                """Deprovision the core tenant schema for a catalog (#2340).
+
+                Called by CatalogProvisionTask with operation='deprovision_hard'.
+                Mirrors _purge_catalog_storage: snapshots cascade refs, drops
+                the schema CASCADE, and hard-deletes the registry row.
+
+                For the PostgreSQL driver, catalog_id IS the physical schema name.
+                Runs in its own managed transaction because the task is outside
+                any caller transaction. Lifecycle events (CATALOG_HARD_DELETION,
+                AFTER_CATALOG_HARD_DELETION) are emitted by CatalogProvisionTask
+                after all deprovision steps complete.
+                """
+                from dynastore.modules.catalog.catalog_service import (
+                    get_catalog_engine,
+                    _hard_delete_catalog_query,
+                    _invalidate_catalog_model_cache,
+                    _invalidate_catalog_external_id_cache,
+                )
+                from dynastore.modules.db_config.query_executor import (
+                    managed_transaction,
+                    DQLQuery,
+                    ResultHandler,
+                )
+                from dynastore.modules.db_config.locking_tools import safe_drop_relation
+                from dynastore.modules.catalog.cascade_runtime import CascadeOrchestrator
+                from dynastore.modules.catalog.resource_owner import CleanupMode, ResourceScope, ScopeRef
+
+                orchestrator = CascadeOrchestrator()
+                scope_ref = ScopeRef(scope=ResourceScope.CATALOG, catalog_id=catalog_id)
+
+                async with managed_transaction(get_catalog_engine()) as conn:
+                    # Snapshot cascade refs BEFORE schema drop while DB rows are readable.
+                    cascade_task_id = await orchestrator.snapshot_and_enqueue(
+                        conn, scope_ref, CleanupMode.HARD
+                    )
+
+                    # For the PostgreSQL driver, catalog_id IS the physical schema.
+                    # Resolve it (works on tombstoned rows too).
+                    physical_schema = await DQLQuery(
+                        "SELECT id FROM catalog.catalogs WHERE id = :catalog_id;",
+                        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+                    ).execute(conn, catalog_id=catalog_id)
+
+                    if physical_schema:
+                        # DROP SCHEMA CASCADE with retry on lock contention.
+                        await safe_drop_relation(
+                            conn,
+                            schema=physical_schema,
+                            relation=physical_schema,
+                            kind="schema",
+                            cascade=True,
+                            max_retries=5,
+                        )
+
+                    # Hard-delete the registry row (cascades to catalog_core/stac).
+                    await _hard_delete_catalog_query.execute(conn, id=catalog_id)
+
+                    if cascade_task_id is not None:
+                        logger.info(
+                            "catalog_core deprovision: enqueued cascade cleanup task %s for catalog %r.",
+                            cascade_task_id, catalog_id,
+                        )
+
+                _invalidate_catalog_model_cache(catalog_id)
+                if external_id:
+                    _invalidate_catalog_external_id_cache(external_id)
+
+            _prov_registry.register(
+                "catalog_core",
+                _catalog_core_is_active,
+                priority=0,
+                scope=SCOPE_CATALOG,
+                name="Core tenant schema",
+                description="Creates tenant schema, core tables, and lifecycle hooks.",
+                provision=_catalog_core_provision,
+                deprovision=_catalog_core_deprovision,
+            )
+
+            # Wire render preseed subscriber — enqueues durable render_preseed
+            # obligations on AFTER_ASSET_CREATION when the feature is enabled
+            # via RenderPreseedConfig (disabled by default).
+            try:
+                from dynastore.modules.renders.preseed_sync import (
+                    register_render_preseed_subscriber,
+                )
+                register_render_preseed_subscriber()
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "CatalogModule: render preseed subscriber registration failed "
+                    "(non-fatal): %s", _exc,
+                )
+
             # 4. Initialize Storage & Schemas
             # Hub/sidecar creation is handled by ItemsPostgresqlDriver.ensure_storage()
             # which is called from _create_collection_internal(). No lifecycle hook needed.
@@ -382,10 +555,12 @@ class CatalogModule(ModuleProtocol):
             async with managed_transaction(engine) as conn:
                 await ensure_schema_exists(conn, "catalog")
 
-                # Centralized system-level maintenance initialization
-                await initialize_system_logs(conn)
+                # System-level logs table removed (#2749) — logs are
+                # Elasticsearch-only now; no PG DDL for them anywhere.
 
-                await DDLQuery(CATALOGS_TABLE_DDL + SHARED_PROPERTIES_SCHEMA).execute(conn)
+                await DDLQuery(
+                    CATALOGS_TABLE_DDL + SHARED_PROPERTIES_SCHEMA
+                ).execute(conn)
 
                 # Metadata-domain tables: catalog.catalog_core +
                 # catalog.catalog_stac.  The only collection- and
@@ -436,41 +611,67 @@ class CatalogModule(ModuleProtocol):
             register_reindex_listener(self.event_service)
 
 
-            # 7. Start soft-delete TTL reaper background loop.
-            # Leader-elected (pg advisory lock) — only one pod runs scans.
+            # 7–10. Start leader-elected background services via BackgroundSupervisor.
+            from dynastore.modules.db_config.instance import get_service_name
+            from dynastore.tools.background_service import (
+                BackgroundSupervisor,
+                ServiceContext,
+            )
             from dynastore.modules.catalog.soft_delete_reaper import (
                 SoftDeleteReaper,
                 load_reaper_config,
             )
-            _reaper_shutdown = asyncio.Event()
-            _reaper: Optional[SoftDeleteReaper] = None
-            try:
-                reaper_cfg = await load_reaper_config()
-                _reaper = SoftDeleteReaper(reaper_cfg)
-                _reaper.start(_reaper_shutdown)
-                logger.info(
-                    "CatalogModule: soft-delete reaper started "
-                    "(grace=%ds, interval=%ds).",
-                    reaper_cfg.soft_grace_period_seconds,
-                    reaper_cfg.reaper_interval_seconds,
-                )
-            except Exception as exc:  # noqa: BLE001 — never block startup
-                logger.warning(
-                    "CatalogModule: soft-delete reaper failed to start: %s — "
-                    "soft-deleted entities will not be automatically promoted.",
-                    exc,
-                )
-
-            # 8. Register maintenance-supervisor job cadences and start the
-            # leader-elected supervisor loop (jobs 4–9: events, logs, IAM).
             from dynastore.modules.catalog.maintenance_supervisor import (
                 MaintenanceSupervisor,
                 build_supervisor_config,
                 register_supervisor_jobs,
                 unschedule_superseded_cron_jobs,
             )
-            _supervisor_shutdown = asyncio.Event()
-            _supervisor: Optional[MaintenanceSupervisor] = None
+            from dynastore.modules.catalog.lifecycle_reaper import (
+                LifecycleReaper,
+                load_lifecycle_reaper_config,
+            )
+            from dynastore.modules.db.db_contention_monitor import (
+                DbContentionMonitor,
+                load_db_contention_monitor_config,
+            )
+            from dynastore.modules.db.instance_liveness import (
+                InstanceLivenessHeartbeat,
+            )
+            from dynastore.modules.db.zombie_session_reaper import (
+                ZombieSessionReaper,
+                load_zombie_session_reaper_config,
+            )
+            from dynastore.modules.scaling.publisher import ScalingSignalPublisher
+            # Import-time side effect: registers the lowest-priority fallback
+            # PlatformScalingProtocol so the control loop has somewhere safe
+            # to land on deployments with no platform-specific actuator.
+            import dynastore.modules.scaling.noop_actuator  # noqa: F401
+
+            _bg_shutdown = asyncio.Event()
+            bg_supervisor = BackgroundSupervisor()
+            # ScalingSignalProtocol providers registered alongside the
+            # BackgroundSupervisor services (rather than via the
+            # ``registered_services`` tuple, which enters ``.lifespan()`` on
+            # each entry — these have none) so they unregister cleanly below.
+            _scaling_plugins: list = []
+
+            try:
+                reaper_cfg = await load_reaper_config()
+                bg_supervisor.register(SoftDeleteReaper(reaper_cfg))
+                logger.info(
+                    "CatalogModule: soft-delete reaper registered "
+                    "(grace=%ds, interval=%ds).",
+                    reaper_cfg.soft_grace_period_seconds,
+                    reaper_cfg.reaper_interval_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: soft-delete reaper failed to configure: %s — "
+                    "soft-deleted entities will not be automatically promoted.",
+                    exc,
+                )
+
             try:
                 supervisor_cfg = build_supervisor_config()
                 # Clean-cut safety: drop any pre-existing events/logs/IAM pg_cron
@@ -478,59 +679,64 @@ class CatalogModule(ModuleProtocol):
                 # non-fresh deploy (no-op when pg_cron is absent).
                 await unschedule_superseded_cron_jobs(engine)
                 await register_supervisor_jobs(engine)
-                _supervisor = MaintenanceSupervisor(supervisor_cfg)
-                _supervisor.start(_supervisor_shutdown)
-                logger.info("CatalogModule: maintenance supervisor started.")
+                bg_supervisor.register(MaintenanceSupervisor(supervisor_cfg))
+                logger.info("CatalogModule: maintenance supervisor registered.")
             except Exception as exc:  # noqa: BLE001 — never block startup
                 logger.warning(
-                    "CatalogModule: maintenance supervisor failed to start: %s — "
+                    "CatalogModule: maintenance supervisor failed to configure: %s — "
                     "events/logs/IAM pruning will not run automatically.",
                     exc,
                 )
 
-            # 9. Start lifecycle-state reaper for stuck PROVISIONING / DELETING
-            # collections (backstop for pods that crash mid-init or mid-purge).
-            from dynastore.modules.catalog.lifecycle_reaper import (
-                LifecycleReaper,
-                load_lifecycle_reaper_config,
-            )
-            _lifecycle_reaper_shutdown = asyncio.Event()
-            _lifecycle_reaper: Optional[LifecycleReaper] = None
+            try:
+                from dynastore.modules.catalog.log_drainer import LogDrainer
+                from dynastore.modules.catalog.log_service_config import (
+                    load as load_log_service_config,
+                )
+
+                log_service_cfg = await load_log_service_config()
+                bg_supervisor.register(LogDrainer(log_service_cfg))
+                logger.info(
+                    "CatalogModule: log drainer registered (interval=%ss).",
+                    log_service_cfg.valkey_drain_interval_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: log drainer failed to configure: %s — "
+                    "Valkey-buffered logs will not be drained (the direct-"
+                    "to-backend dispatch fallback still writes logs).",
+                    exc,
+                )
+
             try:
                 lifecycle_reaper_cfg = await load_lifecycle_reaper_config()
-                _lifecycle_reaper = LifecycleReaper(lifecycle_reaper_cfg)
-                _lifecycle_reaper.start(_lifecycle_reaper_shutdown)
+                bg_supervisor.register(LifecycleReaper(lifecycle_reaper_cfg))
                 logger.info(
-                    "CatalogModule: lifecycle reaper started "
+                    "CatalogModule: lifecycle reaper registered "
                     "(threshold=%ds, interval=%ds).",
                     lifecycle_reaper_cfg.stuck_threshold_seconds,
                     lifecycle_reaper_cfg.reaper_interval_seconds,
                 )
             except Exception as exc:  # noqa: BLE001 — never block startup
                 logger.warning(
-                    "CatalogModule: lifecycle reaper failed to start: %s — "
+                    "CatalogModule: lifecycle reaper failed to configure: %s — "
                     "stuck PROVISIONING/DELETING collections will not be "
                     "automatically reconciled.",
                     exc,
                 )
 
-            # 10. Start the read-only DB contention monitor — periodic
-            # snapshot of lock-waits vs. slow queries on the shared Postgres
-            # instance, so an incident can be attributed to locking or to DB
-            # resource pressure instead of guessed at. Leader-elected; read-only.
-            from dynastore.modules.db.db_contention_monitor import (
-                DbContentionMonitor,
-                load_db_contention_monitor_config,
-            )
-            _contention_monitor_shutdown = asyncio.Event()
-            _contention_monitor: Optional[DbContentionMonitor] = None
             try:
                 contention_cfg = load_db_contention_monitor_config()
                 if contention_cfg.enabled:
-                    _contention_monitor = DbContentionMonitor(contention_cfg)
-                    _contention_monitor.start(_contention_monitor_shutdown)
+                    monitor = DbContentionMonitor(contention_cfg)
+                    bg_supervisor.register(monitor)
+                    # Same instance registered for discovery so the scaling
+                    # publisher can read the global conn_pressure signal this
+                    # monitor's leader ticks populate on ``_last_conn_pressure``.
+                    register_plugin(monitor)
+                    _scaling_plugins.append(monitor)
                     logger.info(
-                        "CatalogModule: DB contention monitor started "
+                        "CatalogModule: DB contention monitor registered "
                         "(interval=%ds, slow_query=%ds, lock_wait=%ds).",
                         contention_cfg.interval_seconds,
                         contention_cfg.slow_query_seconds,
@@ -538,30 +744,94 @@ class CatalogModule(ModuleProtocol):
                     )
             except Exception as exc:  # noqa: BLE001 — never block startup
                 logger.warning(
-                    "CatalogModule: DB contention monitor failed to start: %s — "
+                    "CatalogModule: DB contention monitor failed to configure: %s — "
                     "lock/slow-query contention will not be logged automatically.",
                     exc,
                 )
 
             try:
+                # Always registered — its tick() live-reads
+                # ZombieSessionReaperConfig.enabled and does zero DB work
+                # while the reaper is off (the default), so this never adds
+                # background load on its own and a live configs-API PATCH
+                # enabling the reaper takes effect without a pod restart.
+                bg_supervisor.register(InstanceLivenessHeartbeat())
+                logger.info("CatalogModule: instance liveness heartbeat registered.")
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: instance liveness heartbeat failed to "
+                    "configure: %s — the zombie-session reaper will see no "
+                    "live instances and will not reap anyone (fail-safe).",
+                    exc,
+                )
+
+            try:
+                zombie_reaper_cfg = await load_zombie_session_reaper_config()
+                bg_supervisor.register(ZombieSessionReaper(zombie_reaper_cfg))
+                logger.info(
+                    "CatalogModule: zombie-session reaper registered "
+                    "(enabled=%s, shadow_mode=%s, idle_threshold=%ds, interval=%ds).",
+                    zombie_reaper_cfg.enabled,
+                    zombie_reaper_cfg.zombie_reaper_shadow_mode,
+                    zombie_reaper_cfg.idle_threshold_seconds,
+                    zombie_reaper_cfg.reaper_interval_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: zombie-session reaper failed to configure: "
+                    "%s — dead-instance sessions will not be automatically "
+                    "reaped.",
+                    exc,
+                )
+
+            try:
+                from dynastore.modules.storage.drivers.duckdb import (
+                    DuckDbPoolSignalProvider,
+                )
+
+                duckdb_signal_provider = DuckDbPoolSignalProvider()
+                register_plugin(duckdb_signal_provider)
+                _scaling_plugins.append(duckdb_signal_provider)
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: DuckDB pool signal provider failed to "
+                    "register: %s — DuckDB pool saturation will not feed the "
+                    "autoscaling control loop.",
+                    exc,
+                )
+
+            try:
+                bg_supervisor.register(ScalingSignalPublisher(self.config_service))
+                logger.info("CatalogModule: scaling signal publisher registered.")
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: scaling signal publisher failed to "
+                    "configure: %s — autoscaling signals will not be "
+                    "published.",
+                    exc,
+                )
+
+            bg_ctx = ServiceContext(
+                engine=engine,
+                shutdown=_bg_shutdown,
+                is_ephemeral=bool(getattr(app_state, "ephemeral_job", False)),
+                name=get_service_name() or "unknown",
+            )
+            try:
+                # start() is inside the try so the finally always drains the
+                # supervisor — if start() itself raises after submitting some
+                # services, those tasks are still stopped and _bg_shutdown is set.
+                bg_supervisor.start(bg_ctx)
                 yield
             finally:
-                _reaper_shutdown.set()
-                _supervisor_shutdown.set()
-                _lifecycle_reaper_shutdown.set()
-                _contention_monitor_shutdown.set()
-                if _reaper is not None:
-                    await _reaper.stop()
-                if _supervisor is not None:
-                    await _supervisor.stop()
-                if _lifecycle_reaper is not None:
-                    await _lifecycle_reaper.stop()
-                if _contention_monitor is not None:
-                    await _contention_monitor.stop()
+                _bg_shutdown.set()
+                await bg_supervisor.stop()
                 # Services cleanup handled by AsyncExitStack (stack.close() via __aexit__)
                 # Remove the services from the discovery registry so a future
                 # lifespan does not leave stale instances behind them.
                 for svc in registered_services:
+                    unregister_plugin(svc)
+                for svc in _scaling_plugins:
                     unregister_plugin(svc)
 
     # === Private service accessors (assert-narrowed for pyright) ===
@@ -640,6 +910,9 @@ class CatalogModule(ModuleProtocol):
             catalog_id, force=force, ctx=ctx
         )
 
+    async def get_hard_delete_task(self, catalog_id: str) -> Optional[Any]:
+        return await self._cs.get_hard_delete_task(catalog_id)
+
     async def delete_catalog_language(
         self, catalog_id: str, lang: str, ctx: Optional[DriverContext] = None
     ) -> bool:
@@ -655,9 +928,11 @@ class CatalogModule(ModuleProtocol):
         ctx: Optional[DriverContext] = None,
         q: Optional[str] = None,
         ids: Optional[Set[str]] = None,
+        include_unready: bool = False,
     ) -> List[Catalog]:
         return await self._cs.list_catalogs(
-            limit=limit, offset=offset, lang=lang, ctx=ctx, q=q, ids=ids
+            limit=limit, offset=offset, lang=lang, ctx=ctx, q=q, ids=ids,
+            include_unready=include_unready,
         )
 
     async def search_catalogs(
@@ -1066,39 +1341,52 @@ class CatalogModule(ModuleProtocol):
         error_message: str,
         severity: str = "unrecoverable",
         inputs: Optional[Dict[str, Any]] = None,
-        originating_event: Optional[str] = None,
         **kwargs,
     ):
-        """Generic task failure handler. Routes rollback by originating_event, not task_type.
+        """Generic task failure handler. Routes provisioning rollback by task_type.
 
-        Any module (GCP, Elasticsearch, etc.) can dispatch tasks without coupling
-        to CatalogModule. The caller only needs to store the triggering catalog event
-        in extra_context['originating_event'] when creating the TaskCreate.
+        A failed provisioning task (``catalog_provision`` / ``gcp_provision_catalog``)
+        carries the target catalog in ``inputs['catalog_id']``. The catalog's
+        ``provisioning_status`` is already flipped to ``failed`` by the checklist
+        machinery — a failing provisioner marks its own step ``failed`` and any
+        still-pending steps are drained to ``failed`` on terminal task exit
+        (see ``_drain_provisioning_checklist``). What that path does *not* capture
+        is the human-readable failure reason, so this handler records it in
+        ``extra_metadata['provisioning_error']`` for operator diagnostics, and
+        re-asserts ``provisioning_status='failed'`` as idempotent defense-in-depth
+        for the edge case where the task dies before any step mark and the
+        best-effort drain also fails.
+
+        Routing is by ``task_type`` (reliably propagated from the failure
+        emitter) rather than a catalog lifecycle event: ``TaskCreate`` carries no
+        ``originating_event`` and the emitter cannot supply one without a schema
+        change, so the previous ``originating_event`` gate never fired.
         """
         logger.warning(
             f"Task '{task_type}' ({task_id}) FAILED [{severity}]: {error_message}"
         )
         inputs = inputs or {}
 
-        # Route rollback by what catalog lifecycle event triggered this task
-        if originating_event in {
-            CatalogEventType.CATALOG_CREATION,
-            str(CatalogEventType.CATALOG_CREATION),
-        }:
+        # Catalog-provisioning task types that carry a target ``catalog_id`` and
+        # whose failure must be reflected on the catalog row.
+        _PROVISIONING_TASK_TYPES = {"catalog_provision", "gcp_provision_catalog"}
+
+        if task_type in _PROVISIONING_TASK_TYPES:
             catalog_id = inputs.get("catalog_id")
             if catalog_id:
                 logger.info(
-                    f"Rolling back catalog '{catalog_id}' provisioning to 'failed' "
+                    f"Recording provisioning failure for catalog '{catalog_id}' "
                     f"(triggered by '{task_type}' failure, severity={severity})."
                 )
                 catalogs = get_protocol(CatalogsProtocol)
                 if catalogs:
                     _dr = kwargs.get("db_resource")
                     _ctx = DriverContext(db_resource=_dr) if _dr else None
-                    # (1) Flip the provisioning_status column to 'failed' so
-                    #     the fail-fast guard at the API layer rejects
-                    #     write operations on this catalog (endpoints call
+                    # (1) Re-assert provisioning_status='failed' so the
+                    #     fail-fast guard at the API layer rejects write
+                    #     operations on this catalog (endpoints call
                     #     ``require_catalog_ready`` which reads this column).
+                    #     Idempotent: the checklist path usually set it already.
                     try:
                         await catalogs.update_provisioning_status(
                             catalog_id, "failed", ctx=_ctx,
@@ -1109,8 +1397,8 @@ class CatalogModule(ModuleProtocol):
                             f"set provisioning_status='failed': {e}"
                         )
                     # (2) Record the error detail in ``extra_metadata`` —
-                    #     best-effort diagnostic for operators; unrelated
-                    #     to the fail-fast column flip above.
+                    #     best-effort diagnostic for operators; this is the
+                    #     part the checklist path does not capture.
                     try:
                         await catalogs.update_catalog(
                             catalog_id,

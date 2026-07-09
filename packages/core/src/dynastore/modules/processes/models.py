@@ -23,7 +23,7 @@ from dynastore.models.localization import LocalizedText, CoercibleLocalizedText
 from uuid import UUID
 from datetime import datetime
 from dynastore.models.shared_models import Link
-from dynastore.models.tasks import Task, TaskPayload, TaskExecutionMode
+from dynastore.models.tasks import Task, TaskPayload, TaskExecutionMode, TaskExecutionOverrides
 
 if TYPE_CHECKING:
     from dynastore.modules.tasks.models import Task
@@ -143,7 +143,10 @@ class ProcessSummary(BaseModel):
             "catalog-level and collection-level URLs."
         ),
     )
-    jobControlOptions: List[JobControlOptions] = [JobControlOptions.ASYNC_EXECUTE]
+    jobControlOptions: List[JobControlOptions] = [
+        JobControlOptions.ASYNC_EXECUTE,
+        JobControlOptions.DISMISS,
+    ]
     outputTransmission: List[TransmissionMode] = [TransmissionMode.REFERENCE]
     links: List[Link] = []
     typologies: List[ProcessTypology] = Field(
@@ -259,6 +262,34 @@ class StatusInfo(BaseModel):
     description: Optional[Any] = None
     links: List[Link]
 
+
+class JobList(BaseModel):
+    """OGC API - Processes JobList model for job listing responses."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "jobs": [
+                        {
+                            "jobID": "550e8400-e29b-41d4-a716-446655440000",
+                            "status": "running",
+                            "type": "process",
+                            "links": [],
+                        }
+                    ],
+                    "links": [
+                        {"rel": "self", "href": "/processes/jobs", "type": "application/json"},
+                        {"rel": "next", "href": "/processes/jobs?offset=20", "type": "application/json"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    jobs: List[StatusInfo]
+    links: List[Link]
+
 class OutputExecutionRequest(BaseModel):
     """Describes how an output should be returned/processed."""
     format: Optional[Dict[str, Any]] = None
@@ -311,6 +342,16 @@ class ExecuteRequest(BaseModel):
     inputs: Dict[str, Any]
     outputs: Optional[Dict[str, OutputExecutionRequest]] = None
     response: str = Field(default="document", pattern="^(document|raw)$")
+    execution_overrides: Optional[TaskExecutionOverrides] = Field(
+        default=None,
+        description=(
+            "Vendor extension: per-execution resource overrides forwarded to the task "
+            "runner. Sets Cloud Run job timeout and retry cap for this execution only. "
+            "Absent for OGC API - Processes standard-compliant callers; silently "
+            "ignored by runners that do not support it. Accepted fields: "
+            "timeout_seconds, cpu, memory, max_retries (all Optional)."
+        ),
+    )
 
 # Type alias for clarity: a process execution task payload
 ProcessTaskPayload = TaskPayload[ExecuteRequest] # This remains for type hinting
@@ -356,6 +397,13 @@ def task_to_status_info(task: "Task", links: Optional[List[Link]] = None) -> Sta
         TaskStatusEnum.DEAD_LETTER: "failed",
     }
     api_status = mapping.get(task.status, "accepted")
+    # #2893: a REMOTE task is born ACTIVE (owned/leased) at dispatch time, but
+    # its container may still be cold-starting — started_at stays NULL until
+    # claim_for_execution stamps the real container-start moment. Report
+    # "accepted" (not "running") for that window; the RUNNING legacy alias
+    # always means a genuinely running task, so it is left mapped to "running".
+    if task.status == TaskStatusEnum.ACTIVE and task.started_at is None:
+        api_status = "accepted"
 
     # ``message`` carries the failure reason for failed jobs; for successful
     # jobs a task may return a human-facing message (e.g. a signed result URL)

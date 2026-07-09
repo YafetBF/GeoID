@@ -30,8 +30,23 @@ integration tests; this snapshot is the unit-level guard.
 from __future__ import annotations
 
 
+# OGC API - Records - Part 1: Core (20-004r1) defines these record classes
+# (Tables 3 & 4). The GeoJSON encoding is covered by conf/json; the standard
+# defines no separate conf/geojson, no conf/core, and no record-creation
+# (conf/manage-records) class — Part 1 is discovery and retrieval only.
 EXPECTED_PASS1_RECORDS_URIS = {
-    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/geojson",  # T5
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-core",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-collection",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/json",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/sorting",
+}
+
+# Classes OGC API - Records Part 1 does NOT define — must never be advertised
+# (a CITE run keyed on these URIs would fail).
+INVALID_RECORDS_URIS = {
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/core",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/geojson",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/manage-records",
 }
 
 EXPECTED_PASS1_WEB_URIS = {
@@ -40,7 +55,7 @@ EXPECTED_PASS1_WEB_URIS = {
 
 EXPECTED_PASS1_MAPS_URIS = {
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",       # T7
-    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/geotiff",    # T7
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tiff",       # T7 (Maps uses tiff; geotiff is a Coverages class)
 }
 
 EXPECTED_PASS1_STYLES_URIS = {
@@ -55,11 +70,31 @@ EXPECTED_PASS1_STYLES_URIS = {
 }
 
 
-def test_records_declares_geojson_conformance():
+def test_records_declares_valid_part1_classes():
+    """Records advertises the Part 1 classes it implements.
+
+    OGC API - Records - Part 1: Core (20-004r1, Tables 3 & 4) defines
+    record-core, record-collection, json and sorting; these must be declared.
+    """
     from dynastore.extensions.records.records_service import OGC_API_RECORDS_URIS
     declared = set(OGC_API_RECORDS_URIS)
     missing = EXPECTED_PASS1_RECORDS_URIS - declared
-    assert not missing, f"Records extension missing Pass 1 URIs: {sorted(missing)}"
+    assert not missing, f"Records extension missing Part 1 URIs: {sorted(missing)}"
+
+
+def test_records_does_not_overclaim_undefined_classes():
+    """OGC API - Records Part 1 defines no conf/core, conf/geojson or
+    conf/manage-records class (Part 1 is discovery/retrieval only; the GeoJSON
+    encoding is folded into conf/json). Advertising any of them is an overclaim
+    a CITE run keyed on the URI would fail, so none may be declared.
+    """
+    from dynastore.extensions.records.records_service import OGC_API_RECORDS_URIS
+    declared = set(OGC_API_RECORDS_URIS)
+    overclaimed = INVALID_RECORDS_URIS & declared
+    assert not overclaimed, (
+        f"Records extension advertises classes OGC API Records Part 1 does not "
+        f"define: {sorted(overclaimed)}"
+    )
 
 
 def test_web_declares_oas31_conformance():
@@ -109,7 +144,7 @@ def _read_styles_conformance_uris_from_source() -> set:
     )
 
 
-def test_maps_declares_jpeg_and_geotiff_conformance():
+def test_maps_declares_jpeg_and_tiff_conformance():
     declared = _read_maps_conformance_uris_from_source()
     missing = EXPECTED_PASS1_MAPS_URIS - declared
     assert not missing, f"Maps extension missing Pass 1 URIs: {sorted(missing)}"
@@ -147,10 +182,12 @@ def test_full_pass1_uri_set_is_declared_somewhere():
     )
 
 
+# Coverages is OGC 19-087 (DRAFT); these track the current axis-typed taxonomy.
+# Spatial-only: no temporal subsetting/scaling is implemented, so no
+# subsetting-temporal / scaling-temporal / *-general is declared.
 EXPECTED_PASS2_COVERAGES_URIS = {
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-subset",
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-bbox",
-    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coverage-datetime",
+    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/subsetting-spatial",
+    "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/scaling-spatial",
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/geotiff",
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/netcdf",
     "http://www.opengis.net/spec/ogcapi-coverages-1/1.0/conf/coveragejson",

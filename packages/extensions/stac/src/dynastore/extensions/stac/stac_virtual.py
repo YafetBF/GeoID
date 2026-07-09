@@ -20,11 +20,12 @@
 
 import logging
 import asyncio
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, List, Optional, cast
 
 import pystac
 from fastapi import Depends, HTTPException, Query, Request, status
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
+from dynastore.extensions.tools.pagination import build_pagination_links
 from dynastore.models.driver_context import DriverContext
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -48,6 +49,30 @@ from dynastore.extensions.stac.search import ItemSearchRequest
 from . import stac_generator, asset_factory, metadata_mapper
 
 logger = logging.getLogger(__name__)
+
+
+def _virtual_page_links(
+    request: Request, offset: int, limit: int, returned_count: int
+) -> List[pystac.Link]:
+    """Build prev/next ``pystac.Link`` objects for a virtual-hierarchy page.
+
+    These endpoints have no total-count query (a one-off DISTINCT/JOIN list,
+    not a driver search), so "is there a next page" is inferred the same way
+    the original hand-rolled code did: a full page (``returned_count ==
+    limit``) implies more may follow. That's expressed to the shared helper
+    as a synthetic ``total_count`` that is either just past this page (next
+    exists) or exactly at its end (no next) — ``offset`` is untouched, so the
+    ``prev`` half behaves identically either way.
+    """
+    synthetic_total = (
+        offset + limit + 1 if returned_count == limit else offset + returned_count
+    )
+    return [
+        pystac.Link(rel=rel, target=href)
+        for rel, href in build_pagination_links(
+            request, offset, limit, synthetic_total, raw=True
+        )
+    ]
 
 
 if TYPE_CHECKING:
@@ -75,7 +100,15 @@ class StacVirtualMixin(_Host):
         collection_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of assets to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ):
         """
@@ -98,6 +131,13 @@ class StacVirtualMixin(_Host):
         async with managed_transaction(engine) as conn:
             stac_config = await self._get_stac_config(
                 catalog_id, collection_id, db_resource=conn
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             if not stac_config.asset_tracking.enabled:
@@ -139,20 +179,8 @@ class StacVirtualMixin(_Host):
             )
 
         # Add pagination links
-        if len(assets) == limit:
-            virtual_cat.add_link(
-                pystac.Link(
-                    rel="next",
-                    target=f"{base_url}?offset={offset + limit}&limit={limit}",
-                )
-            )
-        if offset > 0:
-            virtual_cat.add_link(
-                pystac.Link(
-                    rel="prev",
-                    target=f"{base_url}?offset={max(0, offset - limit)}&limit={limit}",
-                )
-            )
+        for link in _virtual_page_links(request, offset, limit, len(assets)):
+            virtual_cat.add_link(link)
 
         return JSONResponse(content=virtual_cat.to_dict())
 
@@ -258,7 +286,15 @@ class StacVirtualMixin(_Host):
         asset_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ):
         """Lists every collection in *catalog_id* where *asset_id* has rows,
@@ -273,6 +309,14 @@ class StacVirtualMixin(_Host):
         catalogs_svc = await self._get_catalogs_service()
 
         async with managed_transaction(engine) as conn:
+            stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
+            )
+
             phys_schema = await catalogs_svc.resolve_physical_schema(
                 catalog_id, ctx=DriverContext(db_resource=conn)
             )
@@ -353,20 +397,8 @@ class StacVirtualMixin(_Host):
                 )
             )
 
-        if len(collection_ids) == limit:
-            virtual_cat.add_link(
-                pystac.Link(
-                    rel="next",
-                    target=f"{base_url}?offset={offset + limit}&limit={limit}",
-                )
-            )
-        if offset > 0:
-            virtual_cat.add_link(
-                pystac.Link(
-                    rel="prev",
-                    target=f"{base_url}?offset={max(0, offset - limit)}&limit={limit}",
-                )
-            )
+        for link in _virtual_page_links(request, offset, limit, len(collection_ids)):
+            virtual_cat.add_link(link)
 
         return JSONResponse(content=virtual_cat.to_dict())
 
@@ -377,7 +409,15 @@ class StacVirtualMixin(_Host):
         asset_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
     ):
@@ -402,6 +442,13 @@ class StacVirtualMixin(_Host):
         async with managed_transaction(engine) as conn:
             stac_config = await self._get_stac_config(
                 catalog_id, collection_id, db_resource=conn
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             # Use ItemsProtocol.stream_items to leverage standard filtering and sidecar logic
@@ -525,21 +572,8 @@ class StacVirtualMixin(_Host):
         coll_dict["numberReturned"] = len(stac_items)
 
         # Paging links
-        base_url = get_url(request, remove_qp=True)
-        if (offset + limit) < total_count:
-            coll_dict.setdefault("links", []).append(
-                {
-                    "rel": "next",
-                    "href": f"{base_url}?offset={offset + limit}&limit={limit}",
-                }
-            )
-        if offset > 0:
-            coll_dict.setdefault("links", []).append(
-                {
-                    "rel": "prev",
-                    "href": f"{base_url}?offset={max(0, offset - limit)}&limit={limit}",
-                }
-            )
+        for rel, href in build_pagination_links(request, offset, limit, total_count, raw=True):
+            coll_dict.setdefault("links", []).append({"rel": rel, "href": href})
 
         return JSONResponse(content=coll_dict)
 
@@ -786,7 +820,15 @@ class StacVirtualMixin(_Host):
         request: Request,
         engine=Depends(get_async_engine),
         parent_value: Optional[str] = Query(None),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of hierarchy members to return. Omitted falls "
+                "back to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
     ):
         """
         Virtual View: Returns a STAC collection representation of a hierarchy level.
@@ -817,6 +859,13 @@ class StacVirtualMixin(_Host):
                 await config_manager.get_config(
                     StacPluginConfig, catalog_id, collection_id, ctx=DriverContext(db_resource=conn
                 )),
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             if not stac_config.hierarchy or not stac_config.hierarchy.enabled:
@@ -968,7 +1017,15 @@ class StacVirtualMixin(_Host):
         request: Request,
         engine=Depends(get_async_engine),
         parent_value: Optional[str] = Query(None),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
     ):
@@ -1004,6 +1061,13 @@ class StacVirtualMixin(_Host):
                 await config_service.get_config(
                     StacPluginConfig, catalog_id, collection_id, ctx=DriverContext(db_resource=conn
                 )),
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             if not stac_config.hierarchy or not stac_config.hierarchy.enabled:
@@ -1082,13 +1146,10 @@ class StacVirtualMixin(_Host):
         coll_dict["numberMatched"] = total_count
         coll_dict["numberReturned"] = len(stac_items)
 
-        # Paging links
-        base_url = get_url(request, remove_qp=True)
-        if (offset + limit) < total_count:
-            next_url = f"{base_url}?offset={offset + limit}&limit={limit}"
-            if parent_value:
-                next_url += f"&parent_value={parent_value}"
-            coll_dict.setdefault("links", []).append({"rel": "next", "href": next_url})
+        # Paging links (``parent_value``, when present, is already part of the
+        # request's query params, so it round-trips through unchanged).
+        for rel, href in build_pagination_links(request, offset, limit, total_count, raw=True):
+            coll_dict.setdefault("links", []).append({"rel": rel, "href": href})
 
         return JSONResponse(content=coll_dict)
 
@@ -1233,20 +1294,14 @@ class StacVirtualMixin(_Host):
         if aggregation_results:
             coll_dict["aggregations"] = aggregation_results
 
-        # Paging links
+        # Paging links. ``search_items`` resolves/clamps ``search_request.limit``
+        # in place before returning — it is never None past this point.
+        # ``parent_value``, when present, is already part of the request's
+        # query params, so it round-trips through unchanged.
         offset = search_request.offset
+        assert search_request.limit is not None
         limit = search_request.limit
-        base_url = get_url(request, remove_qp=True)
-        if (offset + limit) < total_count:
-            next_url = f"{base_url}?offset={offset + limit}&limit={limit}"
-            if parent_value:
-                next_url += f"&parent_value={parent_value}"
-            coll_dict.setdefault("links", []).append({"rel": "next", "href": next_url})
-
-        if offset > 0:
-            prev_url = f"{base_url}?offset={max(0, offset - limit)}&limit={limit}"
-            if parent_value:
-                prev_url += f"&parent_value={parent_value}"
-            coll_dict.setdefault("links", []).append({"rel": "prev", "href": prev_url})
+        for rel, href in build_pagination_links(request, offset, limit, total_count, raw=True):
+            coll_dict.setdefault("links", []).append({"rel": rel, "href": href})
 
         return JSONResponse(content=coll_dict)

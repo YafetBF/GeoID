@@ -15,7 +15,6 @@ apps:
     triggers:
       - src/**
       - docker/Dockerfile
-      - docker/scripts/start.sh
     env:
       NAME: my-project-api
       CPU: "2"
@@ -29,14 +28,12 @@ apps:
     triggers:
       - src/**
       - docker/Dockerfile
-      - docker/scripts/start.sh
     env:
       NAME: my-project-worker
       CPU: "2"
       RAM: "4Gi"
       MIN_INSTANCES: "1"
       MAX_INSTANCES: "5"
-      WORKER_CONCURRENCY: "4"
       SCOPE: worker_service
 
   - id: my-project-ingestion-job
@@ -44,7 +41,6 @@ apps:
     triggers:
       - src/**
       - docker/Dockerfile
-      - docker/scripts/start-task.sh
     env:
       NAME: my-project-ingestion-job
       CPU: "4"

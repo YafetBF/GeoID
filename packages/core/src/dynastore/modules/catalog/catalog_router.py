@@ -127,14 +127,19 @@ fuse against that regression.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from dynastore.models.protocols.entity_store import (
     CatalogStore,
     EntityStoreCapability,
 )
+from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routed_resolver import resolve_routed
-from dynastore.modules.storage.routing_config import CatalogRoutingConfig, Operation
+from dynastore.modules.storage.routing_config import (
+    CatalogRoutingConfig,
+    Operation,
+    OperationDriverEntry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,27 +221,33 @@ async def _routed_catalog_drivers(
     operation: str,
     catalog_id: str,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     db_resource: Optional[Any] = None,
-) -> Optional[List[CatalogStore]]:
-    """Config-driven CatalogStore list for an operation.
+) -> Optional[List[Tuple[OperationDriverEntry, CatalogStore]]]:
+    """Config-driven ``(entry, driver)`` pairs for an operation.
 
-    Returns the ordered :class:`CatalogStore` instances configured under
+    Returns the ordered ``(OperationDriverEntry, CatalogStore)`` pairs from
     ``CatalogRoutingConfig.operations[operation]``, or ``None`` when the
-    routing config could not be consulted (early boot — caller falls back
-    to :func:`_resolve_catalog_store_drivers` discovery).
+    routing config could not be consulted (early boot — caller falls back to
+    :func:`_resolve_catalog_store_drivers` discovery).  The entry is surfaced
+    so callers can inspect ``write_mode`` and ``secondary_index`` without a
+    separate lookup, enabling the routing-driven sync/async split in the
+    WRITE fan-out.
     """
     resolved = await resolve_routed(
         CatalogRoutingConfig, operation, catalog_id, collection_id=None,
+        hints=hints,
         db_resource=db_resource,
     )
     if not resolved:
         return None
-    return [driver for _entry, driver in resolved]
+    return resolved
 
 
 async def get_catalog_metadata(
     catalog_id: str,
     *,
+    hints: FrozenSet[Hint] = frozenset(),
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
     drivers: Optional[List[CatalogStore]] = None,
@@ -255,6 +266,18 @@ async def get_catalog_metadata(
     can pass a filtered subset; default resolution discovers every
     registered driver.
 
+    **Dispatch semantics depend on whether hints are supplied.**
+
+    *No hints (empty frozenset):* existing merge-all behaviour — every
+    driver in the resolved list contributes its domain slice.  This is
+    the default path and is preserved byte-identical.
+
+    *Non-empty hints:* first-non-None semantics — the hint-filtered
+    ordered driver list is iterated sequentially; the first driver
+    returning a truthy result wins.  An ES miss (None/empty) advances
+    to the next driver (PG), ensuring PG always answers if ES has no
+    indexed copy.
+
     **Sequential fan-out (load-bearing).**  Earlier versions used
     ``asyncio.gather`` here, but when the caller passes a shared
     ``db_resource`` (a live asyncpg ``Connection``), concurrent
@@ -268,14 +291,19 @@ async def get_catalog_metadata(
     """
     if drivers is None:
         routed = await _routed_catalog_drivers(
-            Operation.READ, catalog_id, db_resource=db_resource,
+            Operation.READ, catalog_id,
+            hints=hints,
+            db_resource=db_resource,
         )
         # READ deliberately does NOT run drivers through
         # ``_filter_capable``: ``_safe_get`` below is forgiving — a
         # driver that doesn't actually answer the READ returns ``None``
         # and the merge falls through to the next one.  Filtering would
         # mask partial-coverage drivers that DO answer for some keys.
-        drivers = routed if routed is not None else _resolve_catalog_store_drivers()
+        drivers = (
+            [d for _, d in routed] if routed is not None
+            else _resolve_catalog_store_drivers()
+        )
     if not drivers:
         return None
 
@@ -295,6 +323,14 @@ async def get_catalog_metadata(
     # Sequential to avoid asyncpg single-wire deadlock when db_resource
     # is a shared Connection (see docstring).  Per-driver latency is
     # additive but dominated by the round-trip anyway (~1-2ms each).
+    if hints:
+        # Hinted path: first-non-None wins (ES → PG fallback chain).
+        for driver in drivers:
+            result = await _safe_get(driver)
+            if result:
+                return result
+        return None
+
     results: List[Optional[Dict[str, Any]]] = []
     for driver in drivers:
         results.append(await _safe_get(driver))
@@ -307,6 +343,29 @@ async def get_catalog_metadata(
         any_found = True
         merged.update(result)
     return merged if any_found else None
+
+
+def _is_secondary_index(driver: CatalogStore) -> bool:
+    """True for async secondary-index drivers (e.g. the catalog ES indexer).
+
+    Such drivers are reindexed asynchronously off the
+    ``catalog_metadata_changed`` outbox event emitted after the fan-out (see
+    :func:`_emit_catalog_metadata_changed`), so a *synchronous* write failure
+    here — e.g. the ES client being unavailable during catalog provisioning —
+    must degrade to that async path instead of aborting the canonical PG write.
+    Primary stores (PG core / STAC) stay fatal.
+
+    Identified by ``is_catalog_indexer`` on the driver class, the same marker
+    the ES catalog driver sets to auto-default into the WRITE operation as a
+    secondary index.  Secondary-index drivers (ES) never share the caller's PG
+    ``db_resource``, so swallowing their failure cannot corrupt the outer
+    transaction.
+
+    Tested via identity (``is True``) so the canonical PG drivers — and any
+    ``MagicMock`` stand-in whose attribute access auto-vivifies a truthy mock —
+    are correctly treated as primary (fatal-on-failure).
+    """
+    return getattr(driver, "is_catalog_indexer", False) is True
 
 
 async def upsert_catalog_metadata(
@@ -358,13 +417,28 @@ async def upsert_catalog_metadata(
             Operation.WRITE, catalog_id, db_resource=db_resource,
         )
         if routed is not None:
-            # Parity with the discovery branch: a config-pinned driver that
-            # does not declare WRITE must be dropped, not invoked.
-            drivers = _filter_capable(routed, EntityStoreCapability.WRITE)
+            # Routing-driven sync/async split. Secondary-index entries
+            # (secondary_index=True — co-stamped write_mode=ASYNC,
+            # on_failure=OUTBOX by _self_register_indexers_into, e.g.
+            # catalog_elasticsearch_driver) are owned by the async reindex
+            # path: _resolve_catalog_indexers resolves exactly the
+            # secondary_index entries off the catalog_metadata_changed event
+            # emitted after this loop. The synchronous fan-out is their exact
+            # complement — every NON-secondary primary entry, regardless of
+            # write_mode — so no primary write is ever silently dropped while
+            # the secondary ES write (with its HEAD/GET/PUT?refresh=wait_for
+            # round-trips) is kept off the synchronous catalog write path.
+            sync_primary = [d for e, d in routed if not e.secondary_index]
+            drivers = _filter_capable(sync_primary, EntityStoreCapability.WRITE)
         else:
-            drivers = _filter_capable(
+            # Discovery fallback (early boot, ConfigsProtocol unavailable):
+            # consult the is_catalog_indexer ClassVar since there is no routing
+            # entry to read write_mode from.  Primary mechanism is the routing
+            # entry; this ClassVar check is the unrouted-only fallback.
+            all_capable = _filter_capable(
                 _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
             )
+            drivers = [d for d in all_capable if not _is_secondary_index(d)]
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["catalog_write"]:
             logger.warning(
@@ -374,9 +448,25 @@ async def upsert_catalog_metadata(
             _MISSING_DRIVERS_LOGGED["catalog_write"] = True
         return
     for driver in drivers:
-        await driver.upsert_catalog_metadata(
-            catalog_id, metadata, db_resource=db_resource,
-        )
+        try:
+            await driver.upsert_catalog_metadata(
+                catalog_id, metadata, db_resource=db_resource,
+            )
+        except Exception as exc:
+            # Injected-driver path (drivers= provided directly by caller):
+            # degrade on secondary-index drivers rather than aborting the
+            # canonical write.  On the routed path, secondary-index drivers
+            # are excluded above, so this branch only fires for injected test
+            # scenarios or for discovery-fallback drivers whose ClassVar marks
+            # them as secondary.
+            if not _is_secondary_index(driver):
+                raise
+            logger.warning(
+                "catalog %s: secondary-index driver %s unavailable during "
+                "synchronous upsert_catalog_metadata (%s); degrading to async "
+                "reindex via the catalog_metadata_changed event",
+                catalog_id, type(driver).__name__, exc,
+            )
     await _emit_catalog_metadata_changed(
         catalog_id=catalog_id,
         drivers=drivers,
@@ -411,13 +501,19 @@ async def delete_catalog_metadata(
             Operation.WRITE, catalog_id, db_resource=db_resource,
         )
         if routed is not None:
-            # Parity with the discovery branch: a config-pinned driver that
-            # does not declare WRITE must be dropped, not invoked.
-            drivers = _filter_capable(routed, EntityStoreCapability.WRITE)
+            # Mirror upsert: the synchronous fan-out is the complement of the
+            # reindex-owned set — every non-secondary primary entry, regardless
+            # of write_mode. Secondary-index entries are excluded; the
+            # catalog_metadata_changed event emitted below triggers async
+            # propagation via the reindex_listener.
+            sync_primary = [d for e, d in routed if not e.secondary_index]
+            drivers = _filter_capable(sync_primary, EntityStoreCapability.WRITE)
         else:
-            drivers = _filter_capable(
+            # Discovery fallback: ClassVar marker is the unrouted-only fallback.
+            all_capable = _filter_capable(
                 _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
             )
+            drivers = [d for d in all_capable if not _is_secondary_index(d)]
     if not drivers:
         if not _MISSING_DRIVERS_LOGGED["catalog_delete"]:
             logger.warning(
@@ -427,9 +523,21 @@ async def delete_catalog_metadata(
             _MISSING_DRIVERS_LOGGED["catalog_delete"] = True
         return
     for driver in drivers:
-        await driver.delete_catalog_metadata(
-            catalog_id, soft=soft, db_resource=db_resource,
-        )
+        try:
+            await driver.delete_catalog_metadata(
+                catalog_id, soft=soft, db_resource=db_resource,
+            )
+        except Exception as exc:
+            # See upsert comment: degrade on secondary-index drivers (injected
+            # path only — routed path never calls secondary-index drivers here).
+            if not _is_secondary_index(driver):
+                raise
+            logger.warning(
+                "catalog %s: secondary-index driver %s unavailable during "
+                "synchronous delete_catalog_metadata (%s); degrading to async "
+                "reindex via the catalog_metadata_changed event",
+                catalog_id, type(driver).__name__, exc,
+            )
     await _emit_catalog_metadata_changed(
         catalog_id=catalog_id,
         drivers=drivers,

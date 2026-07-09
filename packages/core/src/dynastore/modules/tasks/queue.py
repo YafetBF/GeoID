@@ -32,9 +32,7 @@ import asyncio
 import logging
 from typing import Optional, Tuple
 
-
-from dynastore.tools.async_utils import signal_bus, PgListenBridge
-from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.tools.async_utils import register_listen_channel
 
 logger = logging.getLogger(__name__)
 
@@ -96,52 +94,14 @@ def _notification_transform(
     return (channel, payload)
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-async def start_queue_listener(
-    engine: DbResource,
-    shutdown_event: asyncio.Event,
-    channel: str = NEW_TASK_QUEUED,
-    poll_timeout: float = 30.0,
-) -> None:
-    """
-    Starts the queue listener using PgListenBridge for zero-polling
-    notification delivery.
-
-    Every instance opens its own lightweight LISTEN connection.
-    PgListenBridge handles auto-reconnect and periodic health signals.
-    """
-    from dynastore.modules.db_config.query_executor import is_async_resource
-
-    if not is_async_resource(engine):
-        logger.info("QueueListener: Sync engine — periodic signal mode.")
-        while not shutdown_event.is_set():
-            await asyncio.sleep(poll_timeout)
-            await signal_bus.emit(NEW_TASK_QUEUED)
-        logger.info("QueueListener: Stopped.")
-        return
-
-    bridge = PgListenBridge(
-        channels=[NEW_TASK_QUEUED, TASK_STATUS_CHANGED, EVENTS_CHANNEL, CANCEL_REQUESTED],
-        signal_bus=signal_bus,
-        health_timeout=poll_timeout,
-        transform=_notification_transform,
-    )
-
-    bridge_task = asyncio.create_task(bridge.run(engine), name="pg_listen_bridge")
-
-    try:
-        await shutdown_event.wait()
-    except asyncio.CancelledError:
-        logger.info("QueueListener: Cancelled.")
-    finally:
-        await bridge.stop()
-        bridge_task.cancel()
-        try:
-            await bridge_task
-        except asyncio.CancelledError:
-            pass
-
-    logger.info("QueueListener: Stopped.")
+# Register the task-queue channels with the shared notification hub. Each maps
+# through ``_notification_transform`` above. The single bridge is owned by
+# ``modules/db_config/notification_hub.py``; this module no longer opens its own
+# LISTEN connection. PLATFORM_CONFIG_CHANGED is owned by db_config, not here.
+for _task_channel in (
+    NEW_TASK_QUEUED,
+    TASK_STATUS_CHANGED,
+    EVENTS_CHANNEL,
+    CANCEL_REQUESTED,
+):
+    register_listen_channel(_task_channel, _notification_transform)

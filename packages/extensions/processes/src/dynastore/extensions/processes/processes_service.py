@@ -21,10 +21,14 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Union, Any, Optional, cast
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, FrozenSet, List, Union, Any, Optional
 
 import jsonschema as _jsonschema_scope_gate  # noqa: F401  # SCOPE gate: extension_processes requires jsonschema
 _ = _jsonschema_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
+
+if TYPE_CHECKING:
+    from dynastore.extensions.processes.config import ProcessesPluginConfig
 
 from pydantic import ValidationError
 
@@ -47,23 +51,24 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse  # noqa: E402
 from dynastore.extensions.tools.language_utils import get_language  # noqa: E402
-from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.response_i18n import localize_response_dict, resolve_links, resolve_localized  # noqa: E402
+from dynastore.extensions.tools.problem_details import ProblemDetails, ProblemException  # noqa: E402
 from dynastore.tools.json import CustomJSONEncoder  # noqa: E402
-from dynastore.models.protocols import CatalogsProtocol
-from dynastore.tools.discovery import get_protocol
-
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
 from dynastore.tools.discovery import get_protocols
 
 import dynastore.modules.processes.processes_module as processes_module
 from dynastore.modules.tasks import tasks_module
+from dynastore.modules.tasks.tasks_module import _resolve_catalog_schema
 from dynastore.modules.tasks.models import (
     Task,
     TaskStatusEnum,
 )
 from dynastore.modules.tasks.execution import execution_engine
+from dynastore.modules.tasks.reconciliation import reconcile_task_liveness
+from dynastore.modules.tasks.liveness import resolve_log_source
+from dynastore.models.tasks import LogPage
 from dynastore.modules.processes import models
 from dynastore.modules.processes.inventory import (
     build_process_inventory_entries,
@@ -71,9 +76,9 @@ from dynastore.modules.processes.inventory import (
     parse_scope_filter,
 )
 from dynastore.models.auth_models import SYSTEM_USER_ID
-from dynastore.models.driver_context import DriverContext
 from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
 from dynastore.extensions.tools.url import enforce_https  # noqa: E402
+from dynastore.tasks import get_task_config, task_kind as _task_kind
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +95,27 @@ def _external_url(url: Any) -> str:
     no-op otherwise (local/dev), so the inner hop stays unaffected.
     """
     return enforce_https(str(url))
+
+
+async def _get_processes_config(catalog_id: Optional[str] = None) -> "ProcessesPluginConfig":
+    """Fetch ``ProcessesPluginConfig`` via the platform configs service.
+
+    These job/log-listing routes are module-level ``@router`` functions (not
+    ``ProcessesService`` methods), so ``OGCServiceMixin._get_plugin_config``
+    isn't reachable via ``self``. Falls back to a default-constructed config
+    when the configs service is unavailable, mirroring that helper.
+    """
+    from dynastore.extensions.processes.config import ProcessesPluginConfig
+    from dynastore.models.protocols import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    try:
+        configs_svc = get_protocol(ConfigsProtocol)
+        if configs_svc is not None:
+            return await configs_svc.get_config(ProcessesPluginConfig, catalog_id)
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+    return ProcessesPluginConfig()
 
 # --- OGC Processes Conformance URIs ---
 PROCESSES_CONFORMANCE = [
@@ -463,13 +489,26 @@ def _localize_status_info(si: models.StatusInfo, language: str) -> dict:
     return data
 
 
-@router.get(
-    "/conformance",
-    response_model=Conformance,
-    name="get_processes_conformance",
-)
-async def get_processes_conformance() -> Conformance:
-    return Conformance(conformsTo=PROCESSES_CONFORMANCE)
+def _localize_job_list(jl: models.JobList, language: str) -> dict:
+    """Serialize a JobList and resolve title/description/links to *language*."""
+    data = jl.model_dump(by_alias=True, exclude_none=True)
+    localize_response_dict(data, language, text_fields=("title", "description"), link_keys=("links",))
+    for job in data.get("jobs", []):
+        if "title" in job:
+            job["title"] = resolve_localized(job["title"], language)
+            if job["title"] is None:
+                del job["title"]
+        if "description" in job:
+            job["description"] = resolve_localized(job["description"], language)
+            if job["description"] is None:
+                del job["description"]
+        if "message" in job:
+            job["message"] = resolve_localized(job["message"], language)
+            if job["message"] is None:
+                del job["message"]
+        if "links" in job:
+            job["links"] = resolve_links(job["links"], language)
+    return data
 
 
 @router.get(
@@ -653,6 +692,13 @@ async def execute_process(
     # never acquire DB resources or emit events.
     process = await _lookup_process_or_404(process_id)
     _validate_process_scope_or_raise(process, catalog_id=None, collection_id=None)
+    # Defence-in-depth: ensure the task registry agrees this is a process.
+    _cfg = get_task_config(process_id)
+    if _cfg is not None and _task_kind(_cfg) != "process":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{process_id}' is not a process; use the Tasks API.",
+        )
 
     principal = getattr(request.state, "principal", None)
     caller_id = str(principal.id) if principal else SYSTEM_USER_ID
@@ -673,7 +719,7 @@ async def execute_process(
     except Exception as e:
         _handle_execution_exception(process_id, e)
 
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -696,6 +742,13 @@ async def execute_process_catalog(
     """
     process = await _lookup_process_or_404(process_id)
     _validate_process_scope_or_raise(process, catalog_id=catalog_id, collection_id=None)
+    # Defence-in-depth: ensure the task registry agrees this is a process.
+    _cfg = get_task_config(process_id)
+    if _cfg is not None and _task_kind(_cfg) != "process":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{process_id}' is not a process; use the Tasks API.",
+        )
     execution_request = _inject_path_into_inputs(
         execution_request, catalog_id=catalog_id, collection_id=None
     )
@@ -719,7 +772,7 @@ async def execute_process_catalog(
     except Exception as e:
         _handle_execution_exception(process_id, e)
 
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -745,6 +798,13 @@ async def execute_process_collection(
     _validate_process_scope_or_raise(
         process, catalog_id=catalog_id, collection_id=collection_id
     )
+    # Defence-in-depth: ensure the task registry agrees this is a process.
+    _cfg = get_task_config(process_id)
+    if _cfg is not None and _task_kind(_cfg) != "process":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{process_id}' is not a process; use the Tasks API.",
+        )
     execution_request = _inject_path_into_inputs(
         execution_request, catalog_id=catalog_id, collection_id=collection_id
     )
@@ -768,7 +828,7 @@ async def execute_process_collection(
     except Exception as e:
         _handle_execution_exception(process_id, e)
 
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 def _task_to_status_info(task: Task, request: Request) -> models.StatusInfo:
@@ -816,7 +876,8 @@ def _handle_execution_exception(process_id: str, e: Exception):
 
 
 def _handle_execution_result(
-    result: Union[Task, models.StatusInfo, Any], request: Request, language: str = "en"
+    result: Union[Task, models.StatusInfo, Any], request: Request, language: str = "en",
+    preferred_mode: Optional[models.JobControlOptions] = None,
 ):
     if isinstance(result, Task):
         # ASYNC_EXECUTE: The runner returned a new task object.
@@ -848,10 +909,14 @@ def _handle_execution_result(
         links = _get_job_links(result, request)
         status_info = models.task_to_status_info(result, links=links)
 
+        headers = {"Location": _external_url(job_status_url)}
+        if preferred_mode == models.JobControlOptions.ASYNC_EXECUTE:
+            headers["Preference-Applied"] = "respond-async"
+
         return Response(
             content=json.dumps(_localize_status_info(status_info, language), cls=CustomJSONEncoder),
             status_code=status.HTTP_201_CREATED,
-            headers={"Location": _external_url(job_status_url)},
+            headers=headers,
             media_type="application/json",
         )
     else:
@@ -889,17 +954,6 @@ def _handle_execution_result(
             )
 
 
-async def _resolve_catalog_schema(catalog_id: str, conn: AsyncConnection) -> str:
-    """Resolve the physical PG schema for a catalog."""
-    catalogs = get_protocol(CatalogsProtocol)
-    if not catalogs:
-        raise HTTPException(status_code=500, detail="CatalogsProtocol not available.")
-    catalogs = cast(CatalogsProtocol, catalogs)
-    schema = await catalogs.resolve_physical_schema(catalog_id, ctx=DriverContext(db_resource=conn))
-    if not schema:
-        raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
-    return schema
-
 
 async def _get_job_internal(job_id: uuid.UUID, catalog_id: str, conn: AsyncConnection):
     schema = await _resolve_catalog_schema(catalog_id, conn)
@@ -914,10 +968,22 @@ async def _get_job_internal(job_id: uuid.UUID, catalog_id: str, conn: AsyncConne
     # existence + scoping, then read uncached and verify the task belongs to
     # this catalog's schema (task_id is a globally-unique UUIDv7).
     task = await tasks_module.get_task_by_id_unscoped(conn, job_id)
-    if not task or task.schema_name != schema:
+    if not task or task.catalog_id != schema:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found in schema '{schema}'.",
+        )
+    if task.type != "process":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
+    try:
+        task = await reconcile_task_liveness(conn, task, schema=schema)
+    except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+        logger.warning(
+            "reconcile_task_liveness failed for job %s: %s — serving unreconciled status.",
+            job_id, e,
         )
     return task
 
@@ -948,6 +1014,21 @@ async def get_job_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found.",
         )
+    if task.type != "process":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
+    try:
+        # Unscoped route: no separately-resolved tenant schema in hand, so
+        # reuse the already-fetched task's own catalog_id (real rows always
+        # have one — the reserved 'platform'/'system' sentinels included).
+        task = await reconcile_task_liveness(conn, task, schema=task.catalog_id or "")
+    except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+        logger.warning(
+            "reconcile_task_liveness failed for job %s: %s — serving unreconciled status.",
+            job_id, e,
+        )
     si = _task_to_status_info(task, request)
     return JSONResponse(
         content=_localize_status_info(si, language),
@@ -969,6 +1050,11 @@ async def get_job_results(
     """
     task = await tasks_module.get_task_by_id_unscoped(conn, job_id)
     if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
+    if task.type != "process":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found.",
@@ -1060,6 +1146,261 @@ async def get_job_results_catalog(
     return _handle_job_results(task, job_id)
 
 
+# --- Vendor extension: Job Logs (GET /jobs/{id}/logs) at 3 scopes ---
+#
+# NOT part of OGC API - Processes core (log surfaces are out of scope for
+# the standard) — a dynastore-specific convenience, kept out of the
+# /conformance declaration. Best-effort: an unmapped owner (in-process
+# runner), or any read failure on the owning runner's side (including a
+# missing IAM permission), returns an empty LogPage with an explanatory
+# ``note`` rather than a 404/500.
+
+async def _job_logs_response(
+    task: Task, *, limit: int, cursor: Optional[str], order: str, request: Request
+) -> JSONResponse:
+    src = resolve_log_source(task.owner_id)
+    if src is None:
+        page = LogPage(entries=[], note="no remote log source for this job")
+    else:
+        try:
+            page = await src.fetch_logs(task, limit=limit, cursor=cursor, order=order)
+        except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+            logger.warning(
+                "get_job_logs: fetch_logs failed for job %s: %s", task.task_id, e,
+            )
+            page = LogPage(entries=[], note="log fetch failed unexpectedly")
+
+    content = page.model_dump(mode="json")
+    if page.next_cursor:
+        next_url = str(
+            request.url.replace_query_params(cursor=page.next_cursor, limit=limit, order=order)
+        )
+        content["links"] = [
+            {
+                "href": _external_url(next_url),
+                "rel": "next",
+                "type": "application/json",
+                "title": "Next page",
+            }
+        ]
+    return JSONResponse(content=content)
+
+
+@router.get(
+    "/jobs/{job_id}/logs",
+    name="get_job_logs",
+)
+async def get_job_logs(
+    job_id: uuid.UUID,
+    request: Request,
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of log entries to return. Omitted falls back to "
+            "the configured default; a value above the configured maximum "
+            "is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
+    cursor: Optional[str] = None,
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    conn: AsyncConnection = Depends(get_async_connection),
+) -> JSONResponse:
+    """Best-effort remote execution logs for a job (System context, vendor extension)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config()
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.logs_default_limit,
+        max_limit=processes_config.logs_max_limit,
+    )
+
+    task = await tasks_module.get_task_by_id_unscoped(conn, job_id)
+    if not task or task.type != "process":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
+    return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
+
+
+@router.get(
+    "/catalogs/{catalog_id}/jobs/{job_id}/logs",
+    name="get_job_logs_catalog",
+)
+async def get_job_logs_catalog(
+    catalog_id: str,
+    job_id: uuid.UUID,
+    request: Request,
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of log entries to return. Omitted falls back to "
+            "the configured default; a value above the configured maximum "
+            "is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
+    cursor: Optional[str] = None,
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    conn: AsyncConnection = Depends(get_async_connection),
+) -> JSONResponse:
+    """Best-effort remote execution logs for a job (Catalog context, vendor extension)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.logs_default_limit,
+        max_limit=processes_config.logs_max_limit,
+    )
+
+    task = await _get_job_internal(job_id, catalog_id, conn)
+    return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
+
+
+@router.get(
+    "/catalogs/{catalog_id}/collections/{collection_id}/jobs/{job_id}/logs",
+    name="get_job_logs_collection",
+)
+async def get_job_logs_collection(
+    catalog_id: str,
+    collection_id: str,
+    job_id: uuid.UUID,
+    request: Request,
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of log entries to return. Omitted falls back to "
+            "the configured default; a value above the configured maximum "
+            "is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
+    cursor: Optional[str] = None,
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    conn: AsyncConnection = Depends(get_async_connection),
+) -> JSONResponse:
+    """Best-effort remote execution logs for a job (Collection context, vendor extension)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.logs_default_limit,
+        max_limit=processes_config.logs_max_limit,
+    )
+
+    task = await _get_job_internal(job_id, catalog_id, conn)
+    if task.collection_id and task.collection_id != collection_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' does not belong to collection '{collection_id}'.",
+        )
+    return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
+
+
+# Best-effort liveness-reconcile budget for list endpoints (#2818): a page
+# of healthy jobs must pay zero probe latency, so only rows that LOOK lapsed
+# (mirrors reconcile_task_liveness's own guard — ACTIVE/RUNNING status with a
+# locked_until already in the past) are probed, and at most this many per
+# request so a page full of lapsed rows still bounds total added latency to
+# _LIST_RECONCILE_MAX_PROBES * reconcile_task_liveness's own per-probe budget.
+_LIST_RECONCILE_MAX_PROBES = 5
+_LIST_RECONCILE_STATUSES = frozenset({TaskStatusEnum.ACTIVE, TaskStatusEnum.RUNNING})
+
+
+async def _reconcile_lapsed_list_tasks(
+    conn: AsyncConnection, tasks: List[Task], *, schema: str
+) -> List[Task]:
+    """Heal stale-``running`` rows on a jobs list page.
+
+    ``get_job_status`` / ``_get_job_internal`` already self-heal a single job
+    on read via :func:`reconcile_task_liveness`; the list endpoints built
+    ``StatusInfo`` straight off ``tasks_module.list_tasks`` and never healed,
+    so a job discovered via the documented ``GET /jobs`` path could show a
+    stale ``running`` status forever between periodic reconciler passes.
+    Shared by ``list_jobs`` / ``list_jobs_catalog`` / ``list_jobs_collection``
+    so the probing policy lives in exactly one place.
+
+    Mirrors the single-job path's semantics — same reconciler, same
+    per-probe timeout budget — but pre-filters to rows that look lapsed
+    (avoiding a wasted call on the common case of an all-healthy page) and
+    caps the number of probes so total added latency stays bounded no matter
+    how many lapsed rows a page contains. A probe failure/timeout is
+    swallowed by ``reconcile_task_liveness`` itself; on top of that this
+    helper never lets a probe error fail the list request — the original row
+    is kept and logged.
+    """
+    now = datetime.now(timezone.utc)
+    probes_left = _LIST_RECONCILE_MAX_PROBES
+    healed: List[Task] = []
+    for task in tasks:
+        if (
+            probes_left > 0
+            and task.status in _LIST_RECONCILE_STATUSES
+            and task.locked_until is not None
+            and task.locked_until < now
+        ):
+            probes_left -= 1
+            try:
+                task = await reconcile_task_liveness(conn, task, schema=schema)
+            except Exception as e:  # noqa: BLE001 — best-effort; never fail the list
+                logger.warning(
+                    "reconcile_task_liveness failed for job %s during list: %s "
+                    "— serving unreconciled status.",
+                    task.task_id, e,
+                )
+        healed.append(task)
+    return healed
+
+
+def _build_job_list_response(
+    request: Request, tasks: List[Task], limit: int, offset: int, language: str
+) -> JSONResponse:
+    """Build the OGC ``JobList`` response (self/prev/next links + localized
+    body) shared by all three ``list_jobs*`` scopes below. ``tasks`` is
+    already fetched (and liveness-reconciled) by the caller — only the
+    ``tasks_module.list_tasks(...)`` args differ per scope.
+    """
+    jobs = [_task_to_status_info(t, request) for t in tasks]
+    links = [
+        models.Link(
+            href=_external_url(request.url),
+            rel="self",
+            type="application/json",
+            title="This document",
+        )
+    ]
+    if len(tasks) == limit:
+        next_url = str(request.url.replace_query_params(offset=offset + limit, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(next_url),
+                rel="next",
+                type="application/json",
+                title="Next page",
+            )
+        )
+    if offset > 0:
+        prev_offset = max(0, offset - limit)
+        prev_url = str(request.url.replace_query_params(offset=prev_offset, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(prev_url),
+                rel="prev",
+                type="application/json",
+                title="Previous page",
+            )
+        )
+    job_list = models.JobList(jobs=jobs, links=links)
+    return JSONResponse(
+        content=_localize_job_list(job_list, language),
+        headers={"Content-Language": language},
+    )
+
+
 # --- OGC Part 1: List Jobs (GET /jobs) at 3 scopes ---
 
 @router.get(
@@ -1068,17 +1409,32 @@ async def get_job_results_catalog(
 )
 async def list_jobs(
     request: Request,
-    limit: int = Query(20, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of jobs to return. Omitted falls back to the "
+            "configured default; a value above the configured maximum is "
+            "clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     offset: int = Query(0, ge=0),
     conn: AsyncConnection = Depends(get_async_connection),
     language: str = Depends(get_language),
 ) -> JSONResponse:
     """Lists jobs (System context)."""
-    tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
-    return JSONResponse(
-        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
-        headers={"Content-Language": language},
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config()
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.jobs_default_limit,
+        max_limit=processes_config.jobs_max_limit,
     )
+
+    tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
+    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema="public")
+    return _build_job_list_response(request, tasks, limit, offset, language)
 
 
 @router.get(
@@ -1088,18 +1444,33 @@ async def list_jobs(
 async def list_jobs_catalog(
     catalog_id: str,
     request: Request,
-    limit: int = Query(20, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of jobs to return. Omitted falls back to the "
+            "configured default; a value above the configured maximum is "
+            "clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     offset: int = Query(0, ge=0),
     conn: AsyncConnection = Depends(get_async_connection),
     language: str = Depends(get_language),
 ) -> JSONResponse:
     """Lists jobs (Catalog context)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.jobs_default_limit,
+        max_limit=processes_config.jobs_max_limit,
+    )
+
     schema = await _resolve_catalog_schema(catalog_id, conn)
     tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
-    return JSONResponse(
-        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
-        headers={"Content-Language": language},
-    )
+    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema=schema)
+    return _build_job_list_response(request, tasks, limit, offset, language)
 
 
 @router.get(
@@ -1110,19 +1481,40 @@ async def list_jobs_collection(
     catalog_id: str,
     collection_id: str,
     request: Request,
-    limit: int = Query(20, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of jobs to return. Omitted falls back to the "
+            "configured default; a value above the configured maximum is "
+            "clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     offset: int = Query(0, ge=0),
     conn: AsyncConnection = Depends(get_async_connection),
     language: str = Depends(get_language),
 ) -> JSONResponse:
-    """Lists jobs (Collection context). Filters by collection_id."""
-    schema = await _resolve_catalog_schema(catalog_id, conn)
-    all_tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
-    filtered = [t for t in all_tasks if getattr(t, "collection_id", None) == collection_id]
-    return JSONResponse(
-        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in filtered],
-        headers={"Content-Language": language},
+    """Lists jobs (Collection context). Filters by collection_id at the DB layer."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.jobs_default_limit,
+        max_limit=processes_config.jobs_max_limit,
     )
+
+    schema = await _resolve_catalog_schema(catalog_id, conn)
+    tasks = await tasks_module.list_tasks(
+        conn,
+        schema=schema,
+        limit=limit,
+        offset=offset,
+        kind="process",
+        collection_id=collection_id,
+    )
+    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema=schema)
+    return _build_job_list_response(request, tasks, limit, offset, language)
 
 
 # --- OGC Part 1: Dismiss Job (DELETE /jobs/{id}) at 3 scopes ---
@@ -1420,7 +1812,7 @@ async def start_job(
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -1449,7 +1841,7 @@ async def start_job_catalog(
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -1479,21 +1871,54 @@ async def start_job_collection(
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
+
+
+# Process ids whose §7.13 results document must carry ONLY declared output
+# ids — no ``message`` alongside them. ``result_message.reference_result``
+# (the shared helper file-export tasks use) always bundles a human-facing
+# ``message`` next to the declared output for the job *status* document; the
+# *results* document historically surfaced it too. That's a frozen contract for
+# already-released processes (``dwh_join`` in particular — released customer
+# integrations read ``message`` there and must keep working). New processes
+# designed against the strict OGC API - Processes Part 1 §7.13 schema opt in
+# here instead of changing the shared helper or any existing process's output.
+_STRICT_RESULTS_PROCESSES = frozenset({"joins_export"})
 
 
 def _handle_job_results(task: Task, job_id: uuid.UUID):
     if task.status == TaskStatusEnum.FAILED:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job '{job_id}' failed and has no results. See status for error.",
+        raise ProblemException(
+            ProblemDetails(
+                type="http://www.opengis.net/def/exceptions/ogcapi-processes-1/1.0/job-results-failed",
+                title="Job failed",
+                status=status.HTTP_404_NOT_FOUND,
+                detail=f"Job '{job_id}' failed and has no results. See status for error.",
+            )
         )
     if task.status != TaskStatusEnum.COMPLETED:
         raise HTTPException(
             status_code=status.HTTP_202_ACCEPTED,
             detail=f"Job '{job_id}' is not complete. Current status: {task.status}",
         )
-    return task.outputs or {}
+    # ``task.outputs`` is already the results body: file-export tasks store it
+    # via ``result_message.reference_result`` as the declared output id keyed to
+    # a {href, type} link, alongside the legacy human-facing ``message`` the
+    # existing (customer) contract surfaces.
+    outputs = task.outputs or {}
+    if task.task_type in _STRICT_RESULTS_PROCESSES:
+        declared_outputs = None
+        cfg = get_task_config(task.task_type)
+        if cfg is not None and cfg.definition is not None:
+            declared_outputs = getattr(cfg.definition, "outputs", None)
+        if declared_outputs is not None:
+            outputs = {k: v for k, v in outputs.items() if k in declared_outputs}
+        else:
+            # Registry lookup unavailable (e.g. a remote-runner context that
+            # hasn't discovered tasks) — fall back to dropping the one known
+            # non-output key rather than serving an unfiltered document.
+            outputs = {k: v for k, v in outputs.items() if k != "message"}
+    return outputs
 
 
 class ProcessesService(ExtensionProtocol, OGCServiceMixin):
@@ -1510,6 +1935,25 @@ class ProcessesService(ExtensionProtocol, OGCServiceMixin):
     protocol_description = "Process discovery and execution per OGC API - Processes"
     router = router
 
+    # OGCServiceMixin static-page wiring: static_dir lets the inherited
+    # _serve_page_template() locate this extension's own static/ directory.
+    # static_prefix is intentionally left unset — the @expose_static
+    # decorator on provide_static_files below already contributes the
+    # "processes" StaticAsset, so setting both would double-register it.
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+
+    def __init__(self, app: Optional[FastAPI] = None):
+        self.app = app
+        # Processes has no pre-existing landing page ("/") — only
+        # /conformance migrates onto the shared handler here. Adding a new
+        # "/" route would be a distinct behavior change (and would need its
+        # own IAM policy grant, since processes_policies() only allows GET on
+        # conformance/processes/jobs today) — out of scope for this
+        # migration (Refs #2692).
+        self.register_ogc_standard_routes(
+            include_landing=False, conformance_name="get_processes_conformance"
+        )
+
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
         from dynastore.tools.discovery import register_plugin
@@ -1520,21 +1964,11 @@ class ProcessesService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
     # Web page contribution (WebPageContributor / StaticAssetProvider)
     # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
+    # get_web_pages / get_static_assets / get_notebooks / _serve_page_template
+    # are provided by OGCServiceMixin (static_dir above opts this service
+    # into the default wiring); only the @expose_static-decorated
+    # provide_static_files and the @expose_web_page-decorated browser page
+    # handler stay here.
 
     @expose_static("processes")
     def provide_static_files(self) -> List[str]:
@@ -1554,14 +1988,6 @@ class ProcessesService(ExtensionProtocol, OGCServiceMixin):
     )
     async def provide_processes_browser(self, request: Request):
         return await self._serve_page_template("processes_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
 
 

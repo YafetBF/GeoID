@@ -64,37 +64,72 @@ class SidecarRegistry:
     _catalog_registry: ClassVar[Dict[str, Type[Any]]] = {}
     _catalog_defaults_loaded: bool = False
 
+    # Optional items-tier sidecars (e.g. 'stac_metadata') whose backing
+    # extension has already been confirmed not-installed in this process.
+    # `_ensure_defaults` runs on essentially every engine/config snapshot
+    # rebuild (per catalog, per rebuild, per instance boot), so without this
+    # cache a slim SCOPE re-attempts the import and re-logs the same
+    # ImportError on every single call (#2988). This set makes the
+    # "not installed" fact get logged once per sidecar name, per process.
+    _unavailable_optional_sidecars: ClassVar[set] = set()
+
     @classmethod
     def _ensure_defaults(cls):
         """Initialize default sidecars with local imports to avoid circularity."""
-        import logging
-        logger = logging.getLogger(__name__)
-
         # Check if core sidecars are already registered to avoid wiping external ones
         if "geometries" not in cls._registry:
             from dynastore.modules.storage.drivers.pg_sidecars.geometries import GeometriesSidecar
             cls._registry["geometries"] = GeometriesSidecar
-            
+
         if "attributes" not in cls._registry:
             from dynastore.modules.storage.drivers.pg_sidecars.attributes import (
                 FeatureAttributeSidecar,
             )
             cls._registry["attributes"] = FeatureAttributeSidecar
-            
+
         if "item_metadata" not in cls._registry:
             from dynastore.modules.storage.drivers.pg_sidecars.item_metadata import (
                 ItemMetadataSidecar,
             )
             cls._registry["item_metadata"] = ItemMetadataSidecar
 
-        if "stac_metadata" not in cls._registry:
+        if (
+            "stac_metadata" not in cls._registry
+            and "stac_metadata" not in cls._unavailable_optional_sidecars
+        ):
+            stac_module = "dynastore.extensions.stac.stac_items_sidecar"
             try:
                 from dynastore.extensions.stac.stac_items_sidecar import StacItemsSidecar
                 cls._registry["stac_metadata"] = StacItemsSidecar
                 logger.debug("SidecarRegistry: Successfully registered 'stac_metadata' sidecar")
+            except ModuleNotFoundError as e:
+                # `e.name` is the deepest package/module the import machinery
+                # failed to find, which is an ANCESTOR of `stac_module` (or
+                # `stac_module` itself) when the extension simply isn't
+                # installed on this image — e.g. a slim SCOPE reports
+                # `e.name == "dynastore.extensions.stac"`, not the leaf
+                # sidecar module. Only treat it as "genuinely missing" when
+                # it's on that ancestor chain; anything else means some
+                # OTHER module the (installed) extension imports internally
+                # is broken, which is a real defect and must keep warning
+                # loudly instead of being cached away.
+                is_extension_missing = e.name is not None and (
+                    stac_module == e.name or stac_module.startswith(e.name + ".")
+                )
+                if is_extension_missing:
+                    cls._unavailable_optional_sidecars.add("stac_metadata")
+                    logger.info(
+                        "SidecarRegistry: 'stac_metadata' sidecar not available in "
+                        f"this process, will not retry: {e}"
+                    )
+                else:
+                    logger.warning(
+                        f"SidecarRegistry: Failed to register 'stac_metadata' sidecar: {e}"
+                    )
             except ImportError as e:
-                logger.debug(f"SidecarRegistry: Failed to register 'stac_metadata' sidecar: {e}")
-                pass  # STAC extension not installed
+                logger.warning(
+                    f"SidecarRegistry: Failed to register 'stac_metadata' sidecar: {e}"
+                )
 
     @classmethod
     def get_sidecar(
@@ -190,9 +225,12 @@ class SidecarRegistry:
         """Clears all registered sidecars. Useful for test isolation.
 
         Note: defaults are re-registered lazily on next `_ensure_defaults()` call.
+        Also resets the optional-sidecar "not available" cache so a test that
+        monkeypatches its way around the missing extension gets a clean retry.
         """
         logger.debug("SidecarRegistry cleared.")
         cls._registry.clear()
+        cls._unavailable_optional_sidecars.clear()
 
     # ------------------------------------------------------------------
     # Catalog-tier domain slices (folded from the former catalog-tier registry)

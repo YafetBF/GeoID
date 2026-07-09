@@ -35,6 +35,30 @@ import pytest
 # Service structure
 # ---------------------------------------------------------------------------
 
+def test_package_exports_service_class():
+    """The extension __init__ exports ConnectedSystemsService in __all__."""
+    import dynastore.extensions.connected_systems as pkg
+
+    assert hasattr(pkg, "ConnectedSystemsService")
+    assert "ConnectedSystemsService" in pkg.__all__
+
+
+def test_config_tiers_platform_and_catalog_only():
+    """ConnectedSystemsPluginConfig must not expose a collection-tier override surface."""
+    from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+
+    tiers = ConnectedSystemsPluginConfig.effective_tiers()
+    assert "platform" in tiers
+    assert "catalog" in tiers
+    assert "collection" not in tiers, "connected_systems must not be configurable at collection scope"
+
+
+def test_config_address():
+    from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+
+    assert ConnectedSystemsPluginConfig._address == ("platform", "extensions", "connected_systems")
+
+
 def test_service_inherits_ogc_mixin():
     from dynastore.extensions.connected_systems.consys_service import ConnectedSystemsService
     from dynastore.extensions.ogc_base import OGCServiceMixin
@@ -296,6 +320,22 @@ def test_observations_brin_index_ddl():
     assert "phenomenon_time" in CONSYS_OBSERVATIONS_IDX_DDL
 
 
+def test_systems_geometry_gist_index_ddl():
+    from dynastore.modules.connected_systems.ddl import CONSYS_SYSTEMS_GEOM_IDX_DDL
+
+    assert "systems_geometry_idx" in CONSYS_SYSTEMS_GEOM_IDX_DDL
+    assert "GIST" in CONSYS_SYSTEMS_GEOM_IDX_DDL
+    assert "geometry" in CONSYS_SYSTEMS_GEOM_IDX_DDL
+
+
+def test_deployments_geometry_gist_index_ddl():
+    from dynastore.modules.connected_systems.ddl import CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+
+    assert "deployments_geometry_idx" in CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+    assert "GIST" in CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+    assert "geometry" in CONSYS_DEPLOYMENTS_GEOM_IDX_DDL
+
+
 # ---------------------------------------------------------------------------
 # DB functions — async stubs (no live DB)
 # ---------------------------------------------------------------------------
@@ -303,13 +343,12 @@ def test_observations_brin_index_ddl():
 @pytest.mark.asyncio
 async def test_list_systems_calls_query():
     from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
 
     conn = AsyncMock()
-    with patch.object(
-        consys_db._list_systems_query, "execute", new_callable=AsyncMock, return_value=[]
-    ):
+    with patch.object(DQLQuery, "execute", new_callable=AsyncMock, return_value=[]):
         result = await consys_db.list_systems(conn, "cat1", limit=10, offset=0)
-    assert result == []
+    assert result == ([], 0)
 
 
 @pytest.mark.asyncio
@@ -327,12 +366,105 @@ async def test_list_datastreams_calls_query():
 @pytest.mark.asyncio
 async def test_list_observations_calls_query():
     from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
+
+    conn = AsyncMock()
+    with patch.object(DQLQuery, "execute", new_callable=AsyncMock, return_value=[]):
+        result = await consys_db.list_observations(conn, "cat1", "ds-001", limit=10, offset=0)
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_observations_with_datetime_filter():
+    from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
 
     conn = AsyncMock()
     with patch.object(
-        consys_db._list_observations_query, "execute", new_callable=AsyncMock, return_value=[]
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
     ):
-        result = await consys_db.list_observations(conn, "cat1", "ds-001", limit=10, offset=0)
+        result = await consys_db.list_observations(
+            conn, "cat1", "ds-001", limit=10, offset=0, datetime="2025-06-01/2025-06-25"
+        )
+        assert result == []
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "phenomenon_time" in call_args
+        assert "start_dt" in call_args
+        assert "end_dt" in call_args
+
+
+@pytest.mark.asyncio
+async def test_list_observations_with_open_interval():
+    from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
+
+    conn = AsyncMock()
+    with patch.object(
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
+    ):
+        result = await consys_db.list_observations(
+            conn, "cat1", "ds-001", limit=10, offset=0, datetime="../2025-06-25"
+        )
+        assert result == []
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "phenomenon_time" in call_args
+        assert "end_dt" in call_args
+
+
+@pytest.mark.asyncio
+async def test_list_systems_with_bbox():
+    from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
+
+    conn = AsyncMock()
+    bbox = (10.0, 40.0, 15.0, 45.0)
+    
+    with patch.object(
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
+    ) as mock_execute:
+        result = await consys_db.list_systems(conn, "cat1", limit=10, offset=0, bbox=bbox)
+        
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "ST_Intersects" in call_args
+        assert "ST_MakeEnvelope" in call_args
+        mock_execute.assert_called_once()
+
+    assert result == ([], 0)
+
+
+@pytest.mark.asyncio
+async def test_list_observations_with_bbox():
+    from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
+
+    conn = AsyncMock()
+    bbox = (10.0, 40.0, 15.0, 45.0)
+    
+    with patch.object(
+        DQLQuery, "__init__", return_value=None
+    ) as mock_init, patch.object(
+        DQLQuery, "execute", new_callable=AsyncMock, return_value=[]
+    ) as mock_execute:
+        result = await consys_db.list_observations(
+            conn, "cat1", "ds-001", limit=10, offset=0, bbox=bbox
+        )
+        
+        mock_init.assert_called_once()
+        call_args = str(mock_init.call_args)
+        assert "ST_Intersects" in call_args
+        assert "ST_MakeEnvelope" in call_args
+        assert "consys.systems" in call_args
+        mock_execute.assert_called_once()
+    
     assert result == []
 
 
@@ -420,3 +552,36 @@ def test_datastream_create_model():
         system_id=uuid.uuid4(),
     )
     assert ds.observed_property == "precipitation"
+
+
+# ---------------------------------------------------------------------------
+# list_systems endpoint — numberMatched wiring (#2699)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_systems_endpoint_wires_number_matched():
+    """GET /consys/systems must report numberMatched/numberReturned, not a
+    bare array — the endpoint-level fix for issue #2699."""
+    from dynastore.extensions.connected_systems.consys_service import ConnectedSystemsService
+    from dynastore.modules.connected_systems.models import System, SystemList
+
+    svc = ConnectedSystemsService()
+    svc._require_catalog_ready = AsyncMock(return_value=None)
+    svc._resolve_internal_catalog_id = AsyncMock(return_value="internal-cat1")
+
+    page = [
+        System(id=__import__("uuid").uuid4(), system_id="s1", name="Station 1", catalog_id="internal-cat1"),
+        System(id=__import__("uuid").uuid4(), system_id="s2", name="Station 2", catalog_id="internal-cat1"),
+    ]
+    with patch(
+        "dynastore.extensions.connected_systems.consys_service.consys_db.list_systems",
+        new_callable=AsyncMock,
+        return_value=(page, 7),
+    ):
+        result = await svc.list_systems(catalog_id="cat1", limit=2, offset=0, conn=AsyncMock())
+
+    assert isinstance(result, SystemList)
+    assert result.numberMatched == 7
+    assert result.numberReturned == 2
+    assert [s.system_id for s in result.systems] == ["s1", "s2"]
+    assert all(s.catalog_id == "cat1" for s in result.systems)

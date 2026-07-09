@@ -20,15 +20,17 @@
 
 Drives deadline-insensitive periodic jobs off ``tasks.maintenance_schedule``
 (jobs 4–12 from the #1911 spec), replacing ALL pg_cron registrations:
-events DLQ/reaper/alert, tenant-logs prune, system-logs prune, IAM prune,
-and the three task-queue jobs (stuck-task reaper, partition-create, retention).
+events DLQ/reaper/alert, IAM prune, and the three task-queue jobs (stuck-task
+reaper, partition-create, retention). Tenant-logs / system-logs prune were
+retired with PG log persistence (#2749) — logs are Elasticsearch-only now,
+and this supervisor also drives their ES-side retention (``es_logs_retention``,
+#2797), the one job in this module with no PG work of its own.
 
 Architecture contract
 ---------------------
-- One background loop per process; a pg session-level advisory lock (held
-  via ``pg_advisory_leadership`` on a dedicated AUTOCOMMIT connection —
-  never a pool checkout or an open transaction held across work) ensures
-  exactly one pod fleet-wide performs the jobs.
+- One background loop per process; a lease-table leadership row (held via
+  ``lease_leadership`` — no pinned connection, safe under transaction-mode
+  pooling) ensures exactly one pod fleet-wide performs the jobs.
 - Tick behaviour: reclaim stale jobs → fetch due jobs → for each due job:
   mark_running, run with a bounded per-job statement_timeout, mark_done.
   A job raising an exception records status='error' and lets others proceed
@@ -46,37 +48,100 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional, Tuple, Union
 
+from pydantic import Field
+
+from dynastore.models.mutability import Mutable
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.catalog.db_init.maintenance_schedule import (
     MaintenanceScheduleRepository,
 )
 from dynastore.modules.db_config.locking_tools import (
     check_extension_exists,
-    pg_advisory_leadership,
 )
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
+    background_managed_transaction,
     managed_transaction,
+)
+from dynastore.modules.tasks.durable.lock_registry import (
+    SUPERVISOR_ADVISORY_LOCK_KEY as _SUPERVISOR_ADVISORY_LOCK_KEY,
+)
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
 )
 from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Advisory lock key — must not collide with SoftDeleteReaper (0x5D3A7E1F_C2B84961)
-# or any other leader-elected loop.
+# Configuration
 # ---------------------------------------------------------------------------
 
-_SUPERVISOR_ADVISORY_LOCK_KEY = 0x4D41494E_54454E41  # "MAINTENA" in ASCII hex
+
+class HealthAlertConfig(PluginConfig):
+    """Configuration for the maintenance health watchdog job."""
+
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "catalog")
+
+    pending_age_seconds: Mutable[int] = Field(
+        default=3600,
+        ge=60,
+        description=(
+            "Age threshold (seconds) for stale PENDING events. "
+            "Default: 3600 (1 hour). Events pending longer trigger an alert."
+        ),
+    )
+
+    dead_letter_threshold: Mutable[int] = Field(
+        default=100,
+        ge=0,
+        description=(
+            "Count threshold for DEAD_LETTER queues. "
+            "Default: 100. DLQ sizes exceeding this trigger an alert."
+        ),
+    )
+
+
+async def load_health_alert_config() -> HealthAlertConfig:
+    """Load ``HealthAlertConfig`` from the platform config store.
+
+    Falls back to the default instance if the store is unavailable or
+    the config has not been set.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is not None:
+            cfg = await config_mgr.get_config(HealthAlertConfig)
+            if isinstance(cfg, HealthAlertConfig):
+                return cfg
+    except Exception as exc:
+        logger.warning(
+            "maintenance_supervisor: failed to load HealthAlertConfig "
+            "(%s) — using defaults.", exc,
+        )
+    return HealthAlertConfig()
+
+
+# ---------------------------------------------------------------------------
+# Advisory lock key — see modules/tasks/durable/lock_registry.py, the
+# central registry of every leader-elected loop's key (collision avoidance
+# happens there, not via cross-file comments).
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Job names — must match the strings passed to repo.upsert_job at startup.
 # ---------------------------------------------------------------------------
 
-JOB_TENANT_LOGS_PRUNE = "tenant_logs_prune"
-JOB_SYSTEM_LOGS_PRUNE = "system_logs_prune"
 JOB_IAM_PRUNE = "iam_prune"
 JOB_TASK_REAPER = "task_reaper"
 JOB_TASK_PARTITION_CREATE = "task_partition_create"
@@ -85,6 +150,8 @@ JOB_EVENTS_PARTITION_CREATE = "events_partition_create"
 JOB_EVENTS_RETENTION = "events_retention"
 JOB_STORAGE_PARTITION_CREATE = "storage_partition_create"
 JOB_STORAGE_RETENTION = "storage_retention"
+JOB_HEALTH_ALERT = "health_alert"
+JOB_ES_LOGS_RETENTION = "es_logs_retention"
 
 # Obsolete supervisor job names retired by #1807 renames. An environment that
 # booted a prior build holds these rows in tasks.maintenance_schedule;
@@ -103,6 +170,12 @@ _OBSOLETE_SCHEDULE_JOBS = (
     "events_dlq_prune",
     "events_stuck_reaper",
     "events_pending_alert",
+    # PG log persistence removed entirely (#2749) — logs are
+    # Elasticsearch-only now, so these prune jobs no longer exist to
+    # dispatch. Pruned here so an already-deployed schedule row does not
+    # make get_due_jobs surface an unknown job_name forever.
+    "tenant_logs_prune",
+    "system_logs_prune",
 )
 
 # pg_cron job names this supervisor supersedes. On a non-fresh deploy these may
@@ -124,8 +197,6 @@ _SUPERSEDED_TENANT_LOG_PREFIX = "monthly_cleanup_logs_"
 _SUPERSEDED_TASK_REAPER_PREFIX = "dynastore-task-reaper-"
 
 # Cadences (seconds)
-_CADENCE_TENANT_LOGS = 2592000    # monthly (30 days)
-_CADENCE_SYSTEM_LOGS = 2592000    # monthly (30 days)
 _CADENCE_IAM_PRUNE = 86400        # daily
 _CADENCE_TASK_REAPER = 60         # every minute (matches old "* * * * *")
 _CADENCE_TASK_PARTITION_CREATE = 86400   # daily (idempotent CREATE IF NOT EXISTS)
@@ -134,6 +205,8 @@ _CADENCE_EVENTS_PARTITION_CREATE = 86400   # daily
 _CADENCE_EVENTS_RETENTION = 86400          # daily
 _CADENCE_STORAGE_PARTITION_CREATE = 86400    # daily
 _CADENCE_STORAGE_RETENTION = 86400           # daily
+_CADENCE_HEALTH_ALERT = 300                  # every 5 minutes
+_CADENCE_ES_LOGS_RETENTION = 86400           # daily
 
 # Bounded-batch DELETE size — no single DELETE removes more than this many rows.
 _PRUNE_BATCH = 1000
@@ -150,8 +223,8 @@ _STALE_AFTER_SECONDS = 600  # 10 minutes (5× the 60 s task_reaper cadence)
 _JOB_STATEMENT_TIMEOUT_MS = 60_000  # 60 seconds
 
 # Total wall-clock cap for a single dispatched job.  Covers jobs that loop
-# internally (e.g. _run_tenant_logs_prune across thousands of schemas) or
-# stall waiting for IO.  Chosen as 15× the longest per-statement timeout so
+# internally across many schemas or stall waiting for IO.  Chosen as 15× the
+# longest per-statement timeout so
 # a legitimate slow run across many schemas still completes; an actual hung
 # job is cancelled well before it wedges the supervisor for a full cycle.
 JOB_DISPATCH_TIMEOUT_SECONDS = 900  # 15 minutes
@@ -203,58 +276,6 @@ async def _bounded_batch_delete(
 # ---------------------------------------------------------------------------
 # Individual job implementations
 # ---------------------------------------------------------------------------
-
-
-async def _list_active_catalog_schemas(conn: Any) -> list[str]:
-    """Return physical_schema for all non-deleted catalogs."""
-    rows = await DQLQuery(
-        "SELECT physical_schema FROM catalog.catalogs WHERE deleted_at IS NULL ORDER BY physical_schema",
-        result_handler=ResultHandler.ALL,
-    ).execute(conn)
-    return [r[0] for r in rows] if rows else []
-
-
-async def _run_tenant_logs_prune(conn: Any) -> int:
-    """Delete tenant log rows older than 1 year across all active catalogs.
-
-    Each schema is pruned in an independent try/except so a concurrently
-    dropped catalog schema does not abort the remaining schemas.  A WARNING
-    is emitted per failed schema so operators can investigate; the loop
-    always continues to the next schema.
-    """
-    schemas = await _list_active_catalog_schemas(conn)
-    total = 0
-    for schema in schemas:
-        # Schema name is an identifier, not a value; interpolate directly.
-        sql = (
-            f'DELETE FROM "{schema}".logs '
-            f'WHERE ctid IN ('
-            f'  SELECT ctid FROM "{schema}".logs '
-            f'  WHERE "timestamp" < NOW() - INTERVAL \'1 year\' '
-            f'  LIMIT :batch_size'
-            f')'
-        )
-        try:
-            total += await _bounded_batch_delete(conn, sql)
-        except Exception as exc:
-            logger.warning(
-                "maintenance_supervisor: tenant_logs_prune skipping schema %r: %s",
-                schema, exc,
-            )
-    return total
-
-
-async def _run_system_logs_prune(conn: Any) -> int:
-    """Delete system_logs rows older than 1 year."""
-    sql = (
-        'DELETE FROM "catalog"."system_logs" '
-        'WHERE ctid IN ('
-        '  SELECT ctid FROM "catalog"."system_logs" '
-        '  WHERE "timestamp" < NOW() - INTERVAL \'1 year\' '
-        '  LIMIT :batch_size'
-        ')'
-    )
-    return await _bounded_batch_delete(conn, sql)
 
 
 async def _run_iam_prune(conn: Any) -> int:
@@ -400,7 +421,7 @@ async def _report_reaped_failures(engine: Any) -> int:
         WHERE t.timestamp = r.timestamp AND t.task_id = r.task_id
         RETURNING t.task_id, t.task_type, t.caller_id, t.inputs, t.error_message;
     """
-    async with managed_transaction(engine) as conn:
+    async with background_managed_transaction(engine) as conn:
         rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(conn)
 
     if not rows:
@@ -578,6 +599,168 @@ async def _run_storage_retention(conn: Any) -> int:
     return 0
 
 
+async def _run_health_alert(conn: Any) -> int:
+    """Check maintenance health and emit alerts for anomalies.
+
+    Restores the watchdogs lost in the pg_cron → MaintenanceSupervisor migration.
+    Checks three conditions and emits structured events / logs at ERROR level:
+    1. Sustained errors in maintenance_schedule jobs
+    2. Stale PENDING events older than threshold
+    3. DEAD_LETTER counts over threshold
+
+    Returns the number of alerts emitted (0-3).
+    """
+    alerts = 0
+    schema = _TASKS_SCHEMA
+    cfg = await load_health_alert_config()
+
+    # 1. Check for any maintenance job whose last recorded run ended in error
+    #    within the past hour.  The schedule table stores only the most-recent
+    #    status per job (no per-run history), so the check is "any error in the
+    #    past hour", not a consecutive-failure count.
+    error_jobs = await DQLQuery(
+        """
+        SELECT job_name, last_error, last_run_at
+        FROM tasks.maintenance_schedule
+        WHERE last_status = 'error'
+          AND last_run_at IS NOT NULL
+          AND last_run_at > NOW() - INTERVAL '1 hour'
+        """,
+        result_handler=ResultHandler.ALL_DICTS,
+    ).execute(conn)
+
+    if error_jobs:
+        for job in error_jobs:
+            logger.error(
+                "maintenance_supervisor: ALERT - job %s in error state: %s",
+                job["job_name"],
+                job["last_error"],
+            )
+        alerts += 1
+
+        try:
+            from dynastore.modules.catalog.event_service import emit_event
+            await emit_event(
+                "maintenance.health_alert",
+                alert_type="job_error",
+                job_errors=[
+                    {"job_name": j["job_name"], "last_error": j["last_error"]}
+                    for j in error_jobs
+                ],
+            )
+        except Exception as emit_exc:
+            logger.error(
+                "maintenance_supervisor: failed to emit maintenance.health_alert: %s",
+                emit_exc,
+            )
+
+    # 2. Check for stale PENDING events (older than threshold)
+    pending_threshold = cfg.pending_age_seconds
+    stale_pending = await DQLQuery(
+        f"""
+        SELECT COUNT(*) as cnt
+        FROM {schema}.events
+        WHERE status = 'PENDING'
+          AND created_at < NOW() - INTERVAL '1 second' * :threshold
+        """,
+        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    ).execute(conn, threshold=pending_threshold)
+
+    stale_count = int(stale_pending) if stale_pending else 0
+    if stale_count > 0:
+        logger.error(
+            "maintenance_supervisor: ALERT - %d PENDING events older than %ds",
+            stale_count,
+            pending_threshold,
+        )
+        alerts += 1
+
+        try:
+            from dynastore.modules.catalog.event_service import emit_event
+            await emit_event(
+                "maintenance.health_alert",
+                alert_type="stale_pending_events",
+                stale_count=stale_count,
+                threshold_seconds=pending_threshold,
+            )
+        except Exception as emit_exc:
+            logger.error(
+                "maintenance_supervisor: failed to emit maintenance.health_alert: %s",
+                emit_exc,
+            )
+
+    # 3. Check DEAD_LETTER counts in tasks and events
+    dlq_threshold = cfg.dead_letter_threshold
+
+    tasks_dlq = await DQLQuery(
+        f"""
+        SELECT COUNT(*) as cnt FROM {schema}.tasks
+        WHERE status = 'DEAD_LETTER'
+        """,
+        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    ).execute(conn)
+    tasks_dlq_count = int(tasks_dlq) if tasks_dlq else 0
+
+    events_dlq = await DQLQuery(
+        f"""
+        SELECT COUNT(*) as cnt FROM {schema}.events
+        WHERE status = 'DEAD_LETTER'
+        """,
+        result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    ).execute(conn)
+    events_dlq_count = int(events_dlq) if events_dlq else 0
+
+    if tasks_dlq_count > dlq_threshold or events_dlq_count > dlq_threshold:
+        logger.error(
+            "maintenance_supervisor: ALERT - DEAD_LETTER counts exceed threshold: "
+            "tasks=%d, events=%d (threshold=%d)",
+            tasks_dlq_count,
+            events_dlq_count,
+            dlq_threshold,
+        )
+        alerts += 1
+
+        try:
+            from dynastore.modules.catalog.event_service import emit_event
+            await emit_event(
+                "maintenance.health_alert",
+                alert_type="dead_letter_overflow",
+                tasks_dlq_count=tasks_dlq_count,
+                events_dlq_count=events_dlq_count,
+                threshold=dlq_threshold,
+            )
+        except Exception as emit_exc:
+            logger.error(
+                "maintenance_supervisor: failed to emit maintenance.health_alert: %s",
+                emit_exc,
+            )
+
+    return alerts
+
+
+# ---------------------------------------------------------------------------
+# ES log index retention (#2797)
+# ---------------------------------------------------------------------------
+
+
+async def _run_es_logs_retention() -> int:
+    """Delete monthly ES log indices older than ``LogServiceConfig.retention_months``.
+
+    ES-only work — no PG connection involved, unlike every other job in this
+    dispatch table. ``retention_months`` is re-read on every tick (mirrors
+    ``_run_health_alert``'s ``load_health_alert_config()`` — Mutable fields
+    are meant to take effect without a restart), not captured once at
+    startup like the task reaper's ``hard_cap``. Lazy-imported so
+    ``modules/catalog`` stays importable on a SCOPE without
+    ``module_elasticsearch`` installed.
+    """
+    from dynastore.modules.catalog.log_service_config import load as load_log_service_config
+    from dynastore.modules.elasticsearch.log_retention import run_es_logs_retention
+
+    cfg = await load_log_service_config()
+    return await run_es_logs_retention(cfg.retention_months)
+
+
 # ---------------------------------------------------------------------------
 # Job dispatch table
 # ---------------------------------------------------------------------------
@@ -593,10 +776,6 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
     Returns the number of rows affected (0 if not applicable).
     Raises on unexpected errors so the caller can record status='error'.
     """
-    if job_name == JOB_TENANT_LOGS_PRUNE:
-        return await _run_tenant_logs_prune(conn)
-    if job_name == JOB_SYSTEM_LOGS_PRUNE:
-        return await _run_system_logs_prune(conn)
     if job_name == JOB_IAM_PRUNE:
         return await _run_iam_prune(conn)
     if job_name == JOB_TASK_REAPER:
@@ -613,6 +792,10 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
         return await _run_storage_partition_create(conn)
     if job_name == JOB_STORAGE_RETENTION:
         return await _run_storage_retention(conn)
+    if job_name == JOB_HEALTH_ALERT:
+        return await _run_health_alert(conn)
+    if job_name == JOB_ES_LOGS_RETENTION:
+        return await _run_es_logs_retention()
     raise ValueError(f"maintenance_supervisor: unknown job_name {job_name!r}")
 
 
@@ -621,18 +804,19 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
 # ---------------------------------------------------------------------------
 
 
-class MaintenanceSupervisor:
+class MaintenanceSupervisor(PeriodicService):
     """Leader-elected supervisor that drives periodic maintenance jobs.
 
-    Call ``start(shutdown_event)`` from CatalogModule.lifespan to schedule the
-    background loop.  The supervisor holds a session-level pg advisory lock on
-    a dedicated ``managed_transaction`` connection; exactly one pod fleet-wide
-    wins the lock per cadence.
-
-    Jobs are registered via ``repo.upsert_job`` at startup; the supervisor
-    reads ``tasks.maintenance_schedule`` on every tick (no caching — it is
-    the mutable source of truth).
+    Implements ``PeriodicService``: ``BackgroundSupervisor`` handles leadership
+    election via ``_SUPERVISOR_ADVISORY_LOCK_KEY`` and the 60 s cadence.  Each
+    tick calls ``run_once()`` which reads ``tasks.maintenance_schedule`` (no
+    caching — it is the mutable source of truth) and dispatches every due job
+    in its own bounded transaction.
     """
+
+    name = "maintenance_supervisor"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
 
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialise with resolved job config values.
@@ -642,49 +826,12 @@ class MaintenanceSupervisor:
                                  tasks_module.get_hard_retry_cap()
         """
         self._config = config
-        self._task: Optional[asyncio.Task[Any]] = None
+        self.cadence_seconds = 60.0
+        self.lock_key: Optional[Union[int, str]] = _SUPERVISOR_ADVISORY_LOCK_KEY
 
-    def start(self, shutdown_event: asyncio.Event) -> None:
-        """Schedule the supervisor loop as an asyncio background task."""
-        self._task = asyncio.create_task(
-            self._loop(shutdown_event),
-            name="maintenance_supervisor",
-        )
-
-    async def stop(self) -> None:
-        """Cancel and await the background task."""
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
-
-    async def _loop(self, shutdown_event: asyncio.Event) -> None:
-        """Leader-elected outer loop — exits when shutdown_event is set."""
-        from dynastore.tools.async_utils import run_leader_loop
-
-        def _acquire_leadership():
-            return pg_advisory_leadership(
-                get_engine(),
-                _SUPERVISOR_ADVISORY_LOCK_KEY,
-                name="MaintenanceSupervisor",
-            )
-
-        async def _on_leader() -> None:
-            await self.run_once()
-            # Cadence sleep: re-evaluate leadership every 60 s (inner cadence).
-            # The outer run_leader_loop cadence_seconds controls the outer retry.
-            await asyncio.sleep(60.0)
-
-        await run_leader_loop(
-            acquire_leadership=_acquire_leadership,
-            on_leader=_on_leader,
-            name="MaintenanceSupervisor",
-            cadence_seconds=60.0,
-            is_shutdown=shutdown_event.is_set,
-        )
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One full supervisor tick: reclaim stale, then dispatch due jobs."""
+        await self.run_once()
 
     async def run_once(self) -> None:
         """One full supervisor tick: reclaim stale, then dispatch due jobs.
@@ -702,7 +849,7 @@ class MaintenanceSupervisor:
 
         # Step 1: reclaim stale jobs (crashed leader mid-run).
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 reclaimed = await repo.reclaim_stale_jobs(
                     conn, now=now, stale_after_seconds=_STALE_AFTER_SECONDS
                 )
@@ -718,7 +865,7 @@ class MaintenanceSupervisor:
 
         # Step 2: fetch due jobs.
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 due_jobs = await repo.get_due_jobs(conn, now=now)
         except Exception as exc:
             logger.warning(
@@ -749,13 +896,13 @@ class MaintenanceSupervisor:
         we skip dispatch entirely and do not call mark_done — the other leader
         owns the completion record.
         """
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
             claimed = await repo.mark_running(conn, job_name, now=tick_now)
 
         if not claimed:
-            logger.warning(
+            logger.debug(
                 "maintenance_supervisor: job %r already claimed by another leader "
-                "— skipping this tick.",
+                "this tick (expected outcome of normal leader handoff) — skipping.",
                 job_name,
             )
             return
@@ -765,7 +912,7 @@ class MaintenanceSupervisor:
         error: Optional[str] = None
 
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 await _set_statement_timeout(conn, _JOB_STATEMENT_TIMEOUT_MS)
                 rows = await asyncio.wait_for(
                     _dispatch_job(job_name, conn, self._config),
@@ -805,7 +952,7 @@ class MaintenanceSupervisor:
 
         finished_at = datetime.now(tz=timezone.utc)
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 await repo.mark_done(
                     conn,
                     job_name,
@@ -873,8 +1020,6 @@ async def register_supervisor_jobs(engine: Any) -> None:
     """
     repo = MaintenanceScheduleRepository()
     jobs = [
-        (JOB_TENANT_LOGS_PRUNE, _CADENCE_TENANT_LOGS),
-        (JOB_SYSTEM_LOGS_PRUNE, _CADENCE_SYSTEM_LOGS),
         (JOB_IAM_PRUNE, _CADENCE_IAM_PRUNE),
         (JOB_TASK_REAPER, _CADENCE_TASK_REAPER),
         (JOB_TASK_PARTITION_CREATE, _CADENCE_TASK_PARTITION_CREATE),
@@ -883,6 +1028,8 @@ async def register_supervisor_jobs(engine: Any) -> None:
         (JOB_EVENTS_RETENTION, _CADENCE_EVENTS_RETENTION),
         (JOB_STORAGE_PARTITION_CREATE, _CADENCE_STORAGE_PARTITION_CREATE),
         (JOB_STORAGE_RETENTION, _CADENCE_STORAGE_RETENTION),
+        (JOB_HEALTH_ALERT, _CADENCE_HEALTH_ALERT),
+        (JOB_ES_LOGS_RETENTION, _CADENCE_ES_LOGS_RETENTION),
     ]
     async with managed_transaction(engine) as conn:
         for job_name, cadence in jobs:

@@ -304,6 +304,7 @@ def pushdown_read_select(
     is_stac: bool,
     geometry_field: Optional[str],
     skip_geometry: bool,
+    write_bbox: bool = False,
 ) -> Optional[List[Any]]:
     """Narrow a wildcard read ``SELECT`` to exactly what ``feature_type`` exposes.
 
@@ -344,6 +345,14 @@ def pushdown_read_select(
     so it is re-prepended here for the row-projected read path (the tile path
     injects geometry separately) unless the caller asked to skip it
     (``returnGeometry=false`` / ``skipGeometry=true``).
+
+    When geometry is skipped but the collection's geometry sidecar keeps a
+    ``bbox_geom`` envelope column (``write_bbox=True``, the default), the four
+    scalar ``ST_XMin``/``ST_YMin``/``ST_XMax``/``ST_YMax`` fields are projected
+    in its place — the same envelope columns the STAC search hydration query
+    already uses — so ``GeometriesSidecar._map_row_to_feature`` can still
+    populate ``feature.bbox`` cheaply, without ever touching the full geometry
+    column (#2899).
     """
     from dynastore.models.query_builder import FieldSelection
 
@@ -368,6 +377,14 @@ def pushdown_read_select(
     result: List[Any] = []
     if geometry_field and not skip_geometry:
         result.append(FieldSelection(field=geometry_field))
+    elif geometry_field and skip_geometry and write_bbox:
+        # #2899: geometry is skipped, but the sidecar's bbox_geom envelope
+        # column can still supply feature.bbox — project the cheap scalar
+        # bounds instead of leaving bbox unset.
+        result.extend(
+            FieldSelection(field=name)
+            for name in ("bbox_xmin", "bbox_ymin", "bbox_xmax", "bbox_ymax")
+        )
     result.extend(projected)
 
     if not result:
@@ -378,8 +395,61 @@ def pushdown_read_select(
     return result
 
 
+class ItemsCountConfig(PluginConfig):
+    """Performance configuration for ``numberMatched`` computation.
+
+    Controls whether large collections use a PostgreSQL planner estimate
+    (``pg_class.reltuples``, O(1)) or an exact ``SELECT count(*)`` for the
+    OGC API Features ``numberMatched`` field.
+
+    For collections below ``exact_count_threshold`` rows the exact count is
+    always used so small collections remain accurate.  For larger collections
+    the planner estimate is returned when ``estimate_count=True``; it is
+    approximate but returns in microseconds instead of scanning the whole
+    table.
+
+    OGC API — Features Part 1 §7.15 permits ``numberMatched`` to be omitted
+    or approximate; only ``numberReturned`` (the actual page size) must be
+    exact.  Set at platform or catalog scope to tune the threshold globally;
+    override at collection scope for collections that need a different policy.
+    """
+
+    _address: ClassVar[Tuple[str, ...]] = (
+        "platform",
+        "catalog",
+        "collection",
+        "items",
+        "count",
+    )
+
+    estimate_count: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "When True (default), collections above ``exact_count_threshold`` "
+            "rows receive an approximate ``numberMatched`` derived from the "
+            "PostgreSQL planner statistic (``pg_class.reltuples``), which is "
+            "O(1) regardless of collection size. "
+            "When False, an exact ``SELECT count(*)`` is always executed "
+            "(original behavior, safe for small collections, expensive above "
+            "~50k rows under concurrent load)."
+        ),
+    )
+
+    exact_count_threshold: Mutable[int] = Field(
+        default=50_000,
+        description=(
+            "Row-count threshold below which an exact ``SELECT count(*)`` is "
+            "executed even when ``estimate_count=True``. Above this threshold "
+            "the planner estimate is returned as ``numberMatched``. "
+            "Default 50 000 keeps exact counts for small-to-medium collections "
+            "while protecting large collections from full-table scans."
+        ),
+    )
+
+
 __all__ = [
     "ItemsReadPolicy",
+    "ItemsCountConfig",
     "project_select_for_feature_type",
     "pushdown_read_select",
     "is_user_readable_schema_field",

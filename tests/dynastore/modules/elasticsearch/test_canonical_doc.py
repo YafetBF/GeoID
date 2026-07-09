@@ -196,6 +196,12 @@ def test_access_section_passthrough_and_omitted_when_empty():
 # ---------------------------------------------------------------------------
 
 def test_geometry_and_bbox_pass_through():
+    """Geometry round-trips through the #2769 sphere-normalization step
+    (orient/validate + antimeridian split), which parses via shapely and
+    re-emits ``mapping()`` — coordinate tuples/floats instead of the input's
+    lists/ints, but the same ring, already CCW-wound so normalization is
+    otherwise a no-op. bbox is untouched (normalization only touches
+    ``geometry``)."""
     geom = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}
     bbox = [0.0, 0.0, 1.0, 1.0]
     doc = build_canonical_index_doc(
@@ -203,7 +209,9 @@ def test_geometry_and_bbox_pass_through():
         catalog_id="c", collection_id="k",
         geometry=geom, bbox=bbox,
     )
-    assert doc["geometry"] == geom
+    assert doc["geometry"]["type"] == "Polygon"
+    ring = doc["geometry"]["coordinates"][0]
+    assert [list(pt) for pt in ring] == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]
     assert doc["bbox"] == bbox
 
 
@@ -657,7 +665,7 @@ def test_validity_string_bounds_pass_through_without_isoformat():
 def test_stac_reserved_members_assets_stored_and_round_trips():
     """assets from stac_reserved_members survive the canonical doc and unproject."""
     from dynastore.modules.elasticsearch.items_projection import unproject_item_from_es
-    from dynastore.models.shared_models import Feature
+    from dynastore.models.ogc import Feature
 
     assets = {
         "data": {
@@ -688,7 +696,7 @@ def test_stac_reserved_members_assets_stored_and_round_trips():
 def test_stac_reserved_members_stac_extensions_stored_and_round_trips():
     """stac_extensions from stac_reserved_members survive canonical doc and unproject."""
     from dynastore.modules.elasticsearch.items_projection import unproject_item_from_es
-    from dynastore.models.shared_models import Feature
+    from dynastore.models.ogc import Feature
 
     exts = [
         "https://stac-extensions.github.io/eo/v1.0.0/schema.json",
@@ -712,7 +720,7 @@ def test_stac_reserved_members_stac_extensions_stored_and_round_trips():
 def test_stac_reserved_members_assets_and_extensions_together():
     """Full ES-only STAC round-trip: assets + stac_extensions survive write→read."""
     from dynastore.modules.elasticsearch.items_projection import unproject_item_from_es
-    from dynastore.models.shared_models import Feature
+    from dynastore.models.ogc import Feature
 
     assets = {"thumbnail": {"href": "https://example.com/thumb.png", "roles": ["thumbnail"]}}
     exts = ["https://stac-extensions.github.io/eo/v1.0.0/schema.json"]

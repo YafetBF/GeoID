@@ -17,6 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import fnmatch
+import importlib.util
 import logging
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from contextlib import asynccontextmanager
@@ -208,206 +209,205 @@ async def _is_es_active(catalog_id: str, collection_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class ElasticsearchModule(ModuleProtocol):
-    """
-    Ensures the platform-wide ES indices/aliases exist and exposes
-    bulk-reindex orchestration entry points.
-
-    Catalog, collection, and item secondary-index propagation are all driven by
-    the routing-config rails today — items via ``IndexDispatcher.fan_out_bulk``
-    reading ``ItemsRoutingConfig``/``CollectionRoutingConfig`` (#820), catalogs
-    via ``ReindexWorker`` consuming ``CATALOG_METADATA_CHANGED`` events and
-    fanning out to the secondary-index ``WRITE`` entries (``secondary_index=True``)
-    in ``CatalogRoutingConfig.operations[WRITE]``. The legacy
-    listener path that dispatched ``elasticsearch_index``/``elasticsearch_delete``
-    tasks on catalog/collection lifecycle events was retired in #825 — it ran
-    in parallel to the canonical rails and was the source of the misleading
-    "Indexing collection …" log line that surfaced #810.
-
-    Privacy is per-collection (#733, #1047) — expressed via the presence of
-    ``items_elasticsearch_private_driver`` in the per-collection
-    ``ItemsRoutingConfig``. The items-private driver owns its per-tenant
-    index plus DENY policy management. Collection and catalog envelopes for
-    private catalogs are PG-only — no ES private index at those tiers (#1047).
-    Per-catalog privacy presets write catalog-scope routing configs that
-    cascade to newly-created collections.
+    """Platform-level Elasticsearch singleton: shared client, index templates.
+    
+    Must start before CatalogModule (priority=20) so ES drivers are available
+    in DriverRegistry when routing_driven_cascade_owner registers (see #2377).
     """
 
-    priority: int = 50
+    priority: int = 18
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
         from dynastore.modules.elasticsearch import client as es_client
         await es_client.init()
-
-        # Register log backend for batch log persistence
-        from dynastore.modules.elasticsearch.log_backend import ElasticsearchLogBackend
-        from dynastore.modules.elasticsearch.mappings import LOG_MAPPING, get_log_index_name
-
-        log_backend = ElasticsearchLogBackend()
-        from dynastore.tools.discovery import register_plugin
-        register_plugin(log_backend)
-
-        # Ensure log index exists
-        es = es_client.get_client()
-        if es is not None:
-            index_name = get_log_index_name(es_client.get_index_prefix())
-            try:
-                if not await es.indices.exists(index=index_name):
-                    await es.indices.create(index=index_name, body={"mappings": LOG_MAPPING})
-                    logger.info("ElasticsearchModule: Created log index '%s'.", index_name)
-            except Exception as exc:
-                logger.warning(
-                    "ElasticsearchModule: Could not ensure log index '%s': %s",
-                    index_name,
-                    exc,
+        try:
+            # Register log backend for batch log persistence — optional; only
+            # available when the logs extension is installed in this SCOPE.
+            if importlib.util.find_spec("dynastore.extensions.logs") is not None:
+                from dynastore.modules.elasticsearch.log_backend import ElasticsearchLogBackend
+                from dynastore.modules.elasticsearch.mappings import (
+                    LOG_INDEX_SETTINGS,
+                    LOG_MAPPING,
+                    get_log_index_name,
                 )
 
-        # Ensure platform-wide shared indexes + the regular-items alias exist.
-        # Per-tenant indexes (dynastore-items-{cat}) are created on demand by
-        # the regular items driver's ensure_storage; the platform creates only
-        # the shared collection/catalog indexes here so reads against them
-        # never hit "index_not_found_exception" before the first write.
-        if es is not None:
-            from dynastore.modules.elasticsearch.aliases import (
-                ensure_public_alias_exists,
-            )
-            from dynastore.modules.elasticsearch.mappings import (
-                CATALOG_MAPPING,
-                COLLECTION_MAPPING,
-            )
+                log_backend = ElasticsearchLogBackend()
+                from dynastore.tools.discovery import register_plugin
+                register_plugin(log_backend)
 
-            # Over-broad-template fail-fast: a composable template with
-            # data_stream=true and index_patterns matching `{prefix}-collections`
-            # or `{prefix}-catalogs` would auto-convert those indices to data
-            # streams on first create, breaking every subsequent metadata
-            # upsert. PR #172 catches the SYMPTOM (existing stream); this
-            # catches the CAUSE so a fresh-cluster deploy doesn't cycle back
-            # into the same broken state after the operator deletes the
-            # stream. Observed on review env 2026-05-01 — template
-            # `dynastore_logs` with patterns=['dynastore-*'].
-            prefix = es_client.get_index_prefix()
-            offending_templates = await _find_overbroad_dynastore_data_stream_templates(
-                es, prefix,
-            )
-            if offending_templates:
-                lines = [
-                    f"  - {name}: index_patterns={patterns}"
-                    for name, patterns in offending_templates
-                ]
-                msg = (
-                    "ElasticsearchModule: cluster has data-stream-emitting "
-                    "composable template(s) whose index_patterns match the "
-                    "platform's metadata indices ('{prefix}-collections' / "
-                    "'{prefix}-catalogs'). Catalog/collection writes will fail "
-                    "with 'only write ops with op_type=create are allowed in "
-                    "data streams' as soon as those indices are auto-created.\n"
-                    "Offending templates:\n"
-                    + "\n".join(lines)
-                    + "\n"
-                    "Tighten each template's index_patterns to exclude the "
-                    f"metadata indices (e.g. ['{prefix}-logs-*'] for the "
-                    "logs backend), then redeploy."
-                ).format(prefix=prefix)
-                logger.error(msg)
-                raise RuntimeError(msg)
+                # Ensure this month's log index exists (#2797: monthly
+                # indices — get_log_index_name() defaults to "now", so this
+                # warms up the current month at every boot; write_batch also
+                # ensures it lazily should this run straddle a month
+                # rollover).
+                es_for_log = es_client.get_client()
+                if es_for_log is not None:
+                    index_name = get_log_index_name(es_client.get_index_prefix())
+                    try:
+                        if not await es_for_log.indices.exists(index=index_name):
+                            await es_for_log.indices.create(
+                                index=index_name,
+                                body={"mappings": LOG_MAPPING, "settings": LOG_INDEX_SETTINGS},
+                            )
+                            logger.info("ElasticsearchModule: Created log index '%s'.", index_name)
+                    except Exception as exc:
+                        logger.warning(
+                            "ElasticsearchModule: Could not ensure log index '%s': %s",
+                            index_name,
+                            exc,
+                        )
+            else:
+                logger.debug(
+                    "ElasticsearchModule: logs extension not installed — skipping ES log backend."
+                )
 
-            for shared_name, mapping in (
-                (f"{es_client.get_index_prefix()}-collections", COLLECTION_MAPPING),
-                (f"{es_client.get_index_prefix()}-catalogs",    CATALOG_MAPPING),
-            ):
+            # Ensure platform-wide shared indexes + the regular-items alias exist.
+            # Per-tenant indexes (dynastore-items-{cat}) are created on demand by
+            # the regular items driver's ensure_storage; the platform creates only
+            # the shared collection/catalog indexes here so reads against them
+            # never hit "index_not_found_exception" before the first write.
+            es = es_client.get_client()
+            if es is not None:
+                from dynastore.modules.elasticsearch.aliases import (
+                    ensure_public_alias_exists,
+                )
+                from dynastore.modules.elasticsearch.mappings import (
+                    CATALOG_MAPPING,
+                    COLLECTION_MAPPING,
+                )
+
+                # Over-broad-template fail-fast: a composable template with
+                # data_stream=true and index_patterns matching `{prefix}-collections`
+                # or `{prefix}-catalogs` would auto-convert those indices to data
+                # streams on first create, breaking every subsequent metadata
+                # upsert. PR #172 catches the SYMPTOM (existing stream); this
+                # catches the CAUSE so a fresh-cluster deploy doesn't cycle back
+                # into the same broken state after the operator deletes the
+                # stream. Observed on review env 2026-05-01 — template
+                # `dynastore_logs` with patterns=['dynastore-*'].
+                prefix = es_client.get_index_prefix()
+                offending_templates = await _find_overbroad_dynastore_data_stream_templates(
+                    es, prefix,
+                )
+                if offending_templates:
+                    lines = [
+                        f"  - {name}: index_patterns={patterns}"
+                        for name, patterns in offending_templates
+                    ]
+                    msg = (
+                        "ElasticsearchModule: cluster has data-stream-emitting "
+                        "composable template(s) whose index_patterns match the "
+                        "platform's metadata indices ('{prefix}-collections' / "
+                        "'{prefix}-catalogs'). Catalog/collection writes will fail "
+                        "with 'only write ops with op_type=create are allowed in "
+                        "data streams' as soon as those indices are auto-created.\n"
+                        "Offending templates:\n"
+                        + "\n".join(lines)
+                        + "\n"
+                        "Tighten each template's index_patterns to exclude the "
+                        f"metadata indices (e.g. ['{prefix}-logs-*'] for the "
+                        "logs backend), then redeploy."
+                    ).format(prefix=prefix)
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+
+                for shared_name, mapping in (
+                    (f"{es_client.get_index_prefix()}-collections", COLLECTION_MAPPING),
+                    (f"{es_client.get_index_prefix()}-catalogs",    CATALOG_MAPPING),
+                ):
+                    try:
+                        # Data-stream fail-fast: indices.exists() returns True for
+                        # both regular indices AND data streams, so a stream that
+                        # snuck in (cluster-side index template, ISM policy, manual
+                        # creation) would silently take precedence here. Data
+                        # streams reject the upserts the collection/catalog
+                        # drivers issue ("only write ops with op_type=create are
+                        # allowed in data streams" — observed on review env
+                        # 2026-04-30 against `{prefix}-collections`). The
+                        # platform requires regular mutable indices for
+                        # collection/catalog metadata; refuse to start when a
+                        # stream is in the way.
+                        if await _is_data_stream(es, shared_name):
+                            msg = (
+                                f"ElasticsearchModule: '{shared_name}' is a "
+                                "data stream, but the platform requires a "
+                                "regular index for mutable metadata upserts. "
+                                f"Delete it before redeploy: "
+                                f"DELETE /_data_stream/{shared_name}"
+                            )
+                            logger.error(msg)
+                            raise RuntimeError(msg)
+                        if not await es.indices.exists(index=shared_name):
+                            await es.indices.create(
+                                index=shared_name, body={"mappings": mapping},
+                            )
+                            logger.info(
+                                "ElasticsearchModule: Created shared index '%s'.",
+                                shared_name,
+                            )
+                        else:
+                            await _warn_if_mapping_drifted(es, shared_name, mapping)
+                    except RuntimeError:
+                        # Re-raise our explicit fail-fast — must surface to the
+                        # operator, never get swallowed by the broad except below.
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "ElasticsearchModule: Could not ensure shared index "
+                            "'%s': %s", shared_name, exc,
+                        )
+
+                # Public items alias name (e.g. `dynastore-items`) collides with
+                # the legacy singleton index name from before PR-B's topology
+                # rework. If a stale physical index by that name exists, ES
+                # will reject every attempt to create the alias — silently
+                # leaving search broken with `index_or_alias_not_found`.
+                # Fail-fast at startup with a clear remediation message so the
+                # operator wipes the stale index before retrying.
+                from dynastore.modules.elasticsearch.mappings import get_public_items_alias
+
+                alias_name = get_public_items_alias(es_client.get_index_prefix())
                 try:
-                    # Data-stream fail-fast: indices.exists() returns True for
-                    # both regular indices AND data streams, so a stream that
-                    # snuck in (cluster-side index template, ISM policy, manual
-                    # creation) would silently take precedence here. Data
-                    # streams reject the upserts the collection/catalog
-                    # drivers issue ("only write ops with op_type=create are
-                    # allowed in data streams" — observed on review env
-                    # 2026-04-30 against `{prefix}-collections`). The
-                    # platform requires regular mutable indices for
-                    # collection/catalog metadata; refuse to start when a
-                    # stream is in the way.
-                    if await _is_data_stream(es, shared_name):
-                        msg = (
-                            f"ElasticsearchModule: '{shared_name}' is a "
-                            "data stream, but the platform requires a "
-                            "regular index for mutable metadata upserts. "
-                            f"Delete it before redeploy: "
-                            f"DELETE /_data_stream/{shared_name}"
-                        )
-                        logger.error(msg)
-                        raise RuntimeError(msg)
-                    if not await es.indices.exists(index=shared_name):
-                        await es.indices.create(
-                            index=shared_name, body={"mappings": mapping},
-                        )
-                        logger.info(
-                            "ElasticsearchModule: Created shared index '%s'.",
-                            shared_name,
-                        )
-                    else:
-                        await _warn_if_mapping_drifted(es, shared_name, mapping)
-                except RuntimeError:
-                    # Re-raise our explicit fail-fast — must surface to the
-                    # operator, never get swallowed by the broad except below.
-                    raise
+                    exists = await es.indices.exists(index=alias_name)
+                    is_alias = await es.indices.exists_alias(name=alias_name)
                 except Exception as exc:
                     logger.warning(
-                        "ElasticsearchModule: Could not ensure shared index "
-                        "'%s': %s", shared_name, exc,
+                        "ElasticsearchModule: alias-collision pre-check failed for "
+                        "'%s': %s — proceeding without fail-fast", alias_name, exc,
+                    )
+                    exists = False
+                    is_alias = True
+                if exists and not is_alias:
+                    msg = (
+                        f"ElasticsearchModule: physical index '{alias_name}' "
+                        f"exists where alias is required. Delete it before "
+                        f"redeploy: DELETE /{alias_name}"
+                    )
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+
+                try:
+                    await ensure_public_alias_exists()
+                except Exception as exc:
+                    logger.warning(
+                        "ElasticsearchModule: ensure_public_alias_exists raised: %s",
+                        exc,
                     )
 
-            # Public items alias name (e.g. `dynastore-items`) collides with
-            # the legacy singleton index name from before PR-B's topology
-            # rework. If a stale physical index by that name exists, ES
-            # will reject every attempt to create the alias — silently
-            # leaving search broken with `index_or_alias_not_found`.
-            # Fail-fast at startup with a clear remediation message so the
-            # operator wipes the stale index before retrying.
-            from dynastore.modules.elasticsearch.mappings import get_public_items_alias
-
-            alias_name = get_public_items_alias(es_client.get_index_prefix())
+            # Auto-provision the logs dashboard into OpenSearch Dashboards / Kibana.
+            # No-op when KIBANA_UPSTREAM_URL is unset; never raises.
+            from dynastore.modules.elasticsearch.dashboards_provisioner import (
+                provision_dashboards,
+            )
             try:
-                exists = await es.indices.exists(index=alias_name)
-                is_alias = await es.indices.exists_alias(name=alias_name)
-            except Exception as exc:
+                await provision_dashboards()
+            except Exception as exc:  # defensive — provisioner already swallows internally
                 logger.warning(
-                    "ElasticsearchModule: alias-collision pre-check failed for "
-                    "'%s': %s — proceeding without fail-fast", alias_name, exc,
-                )
-                exists = False
-                is_alias = True
-            if exists and not is_alias:
-                msg = (
-                    f"ElasticsearchModule: physical index '{alias_name}' "
-                    f"exists where alias is required. Delete it before "
-                    f"redeploy: DELETE /{alias_name}"
-                )
-                logger.error(msg)
-                raise RuntimeError(msg)
-
-            try:
-                await ensure_public_alias_exists()
-            except Exception as exc:
-                logger.warning(
-                    "ElasticsearchModule: ensure_public_alias_exists raised: %s",
+                    "ElasticsearchModule: dashboard provisioning raised unexpectedly: %s",
                     exc,
                 )
 
-        # Auto-provision the logs dashboard into OpenSearch Dashboards / Kibana.
-        # No-op when KIBANA_UPSTREAM_URL is unset; never raises.
-        from dynastore.modules.elasticsearch.dashboards_provisioner import (
-            provision_dashboards,
-        )
-        try:
-            await provision_dashboards()
-        except Exception as exc:  # defensive — provisioner already swallows internally
-            logger.warning(
-                "ElasticsearchModule: dashboard provisioning raised unexpectedly: %s",
-                exc,
-            )
-
-        try:
             yield
         finally:
             await es_client.close()

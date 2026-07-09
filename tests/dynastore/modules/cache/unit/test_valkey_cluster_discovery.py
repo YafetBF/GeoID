@@ -128,6 +128,26 @@ def test_build_valkey_client_cluster_no_remap_by_default() -> None:
     assert "address_remap" not in kwargs
 
 
+def test_build_valkey_client_cluster_wires_max_connections() -> None:
+    """``max_connections`` (#2961) reaches each per-node pool in cluster mode.
+
+    ``pool_kwargs`` is built once and shared into ``cluster_kwargs`` — this
+    pins that the cap survives the cluster-mode filter step alongside the
+    other pool tunables.
+    """
+    with patch("valkey.asyncio.cluster.ValkeyCluster") as MockCluster:
+        build_valkey_client(
+            cluster_mode=True,
+            discovery_host="10.132.0.9",
+            discovery_port=6379,
+            max_connections=100,
+        )
+
+    MockCluster.assert_called_once()
+    _args, kwargs = MockCluster.call_args
+    assert kwargs["max_connections"] == 100
+
+
 # --------------------------------------------------------------------------
 # build_valkey_client — cluster discovery routes through ValkeyCluster(host=..)
 # --------------------------------------------------------------------------
@@ -183,22 +203,21 @@ def test_build_valkey_client_cluster_without_discovery_host_falls_back_to_from_u
 
 
 # --------------------------------------------------------------------------
-# ValkeyCacheBackend — legacy env-fallback path retains socket hardening
+# build_valkey_client — the single client builder retains socket hardening
 # --------------------------------------------------------------------------
 
 
-def test_legacy_backend_url_path_propagates_socket_hardening() -> None:
-    """The ``url=``-only legacy bootstrap path must still harden the socket.
+def test_build_valkey_client_propagates_socket_hardening() -> None:
+    """The single client builder must harden the socket.
 
-    Regression cover: CacheModule's legacy fallback (used when
-    ``DBConfigModule`` is not in the SCOPE so ``app_state.engine_cache``
-    is absent) builds ``ValkeyCacheBackend(url=...)`` directly. The
-    socket_timeout / TCP keepalive params must reach the connection pool
-    even via that path, or the un-hardened-socket regression that
-    #720 / #724 closed for the engine-driven mode re-opens here.
+    Regression cover: ``build_valkey_client`` — the one client-construction
+    path (``ValkeyEngineConfig.engine_init`` calls it, ``CacheModule`` wraps
+    the result) — must propagate socket_timeout / TCP keepalive params to the
+    connection pool, or the un-hardened-socket regression that #720 / #724
+    closed re-opens.
     """
     cfg = ValkeyEngineConfig()
-    backend = ValkeyCacheBackend(
+    _client, pool = build_valkey_client(
         url="valkey://localhost:6379",
         socket_connect_timeout=cfg.socket_connect_timeout_seconds,
         socket_timeout=cfg.socket_timeout_seconds,
@@ -206,7 +225,7 @@ def test_legacy_backend_url_path_propagates_socket_hardening() -> None:
         tcp_keepalive_interval=cfg.tcp_keepalive_interval_seconds,
         tcp_keepalive_count=cfg.tcp_keepalive_count,
     )
-    pool_kwargs = backend._pool.connection_kwargs  # type: ignore[union-attr]
+    pool_kwargs = pool.connection_kwargs  # type: ignore[union-attr]
     assert pool_kwargs["socket_timeout"] == cfg.socket_timeout_seconds
     assert pool_kwargs["socket_connect_timeout"] == cfg.socket_connect_timeout_seconds
     assert pool_kwargs["socket_keepalive"] is True

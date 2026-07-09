@@ -25,6 +25,29 @@ FieldSelection(field="geom", transformation="ST_SRID", alias="_srid")
 
 `ST_SRID` is included in the `ALLOWED_TRANSFORMATIONS` allowlist in `query_builder.py`. Removing it from the allowlist (or forgetting to add it) causes all spatial searches to return `400 Bad Request`.
 
+## Collection Listings
+
+`GET /stac/catalogs/{catalog_id}/collections` is served by a bounded
+PG-backed collection-search path, not by hydrating every collection through the
+full collection generator. Each returned Collection includes deterministic
+`self`, `root`, `parent`, and `items` links, and the fast path still surfaces
+stored collection STAC metadata such as `assets`, `item_assets`, `providers`,
+`summaries`, `stac_extensions`, `cube:dimensions`, `cube:variables`, and the
+declared `extent` when those values are present in the collection metadata or
+its fallback `extra_metadata`. This keeps list responses useful for STAC
+clients without making the request scale with catalog size.
+
+## Geometry Fidelity
+
+Harvest does not simplify source STAC items before handing them to the storage
+layer. The selected storage backend then controls fidelity: a PostgreSQL primary
+keeps the exact stored geometry, while an Elasticsearch search projection may
+index a simplified geometry by default for large or complex features. Dynamic
+contributors may enrich STAC responses at read time. Clients that need the exact
+stored geometry can request the exact-geometry route with
+`hints=geometry_exact`; the default STAC listing and search paths favor the fast
+searchable projection when available.
+
 ## The `asset_factory`
 A key feature of the generator is the `add_dynamic_assets` function. This is a forward-looking mechanism for service chaining.
 

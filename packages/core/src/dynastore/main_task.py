@@ -21,6 +21,7 @@ import logging
 import argparse
 import json
 import traceback
+import typing
 from datetime import timedelta
 from types import SimpleNamespace
 import sys
@@ -44,15 +45,51 @@ _VISIBILITY_TIMEOUT = timedelta(
     seconds=int(os.getenv("TASK_VISIBILITY_TIMEOUT_SECONDS", "300"))
 )
 
+# Task statuses that indicate the task itself failed.  When a Cloud Run Job
+# retry arrives and cannot claim such a task it must exit non-zero so the
+# execution is recorded as FAILED — not as a false SUCCEEDED — in the GCP
+# console.
+_FAIL_EXIT_STATUSES: frozenset[str] = frozenset({"FAILED", "DEAD_LETTER"})
 
-async def _heartbeat_loop(engine, task_id: uuid.UUID, interval_seconds: float) -> None:
+
+def _exit_code_for_unclaimed_status(status: str | None) -> int:
+    """Return the process exit code for a Cloud Run execution that could not
+    claim its task row because the row is already terminal or held by a live
+    peer.
+
+    FAILED / DEAD_LETTER → 1: the task failed; the retry must not be recorded
+    as SUCCEEDED in the Cloud Run console (false green).
+
+    All other statuses (COMPLETED, DISMISSED, ACTIVE with a live foreign lease,
+    PENDING, or unknown / lookup failure) → 0: the work is done, was cancelled,
+    or a peer execution is still running.  This duplicate execution should step
+    aside quietly.
+    """
+    return 1 if status in _FAIL_EXIT_STATUSES else 0
+
+
+async def _heartbeat_loop(
+    engine, task_id: uuid.UUID, interval_seconds: float, schema: str
+) -> None:
     """Extend locked_until every interval_seconds while the task runs.
 
     On Cloud Run job preempt (SIGTERM) the asyncio task tree is cancelled,
     this coroutine stops, locked_until lapses, and the maintenance reaper resets
     the row to PENDING (retry_count + 1) for another worker to pick up.
+
+    Also re-persists the latest worker-reported progress (tracked by
+    ``dynastore.tasks.progress_state``) through the normal ``update_task``
+    path on this same cadence. Task reporters already write ``progress`` to
+    the DB on their own cadence (e.g. once per processed batch); doing it
+    again here is a belt-and-braces measure so a SIGTERM landing between two
+    reporter writes still leaves the most recently known value on the row —
+    exactly what a reconciled ``failed`` row surfaces to a client poll.
     """
-    from dynastore.modules.tasks.tasks_module import heartbeat_tasks
+    from dynastore.modules.tasks.tasks_module import heartbeat_tasks, update_task
+    from dynastore.modules.tasks.models import TaskUpdate
+    from dynastore.tasks.progress_state import get_progress
+
+    last_persisted_progress: typing.Optional[int] = None
     while True:
         await asyncio.sleep(interval_seconds)
         try:
@@ -60,49 +97,91 @@ async def _heartbeat_loop(engine, task_id: uuid.UUID, interval_seconds: float) -
         except Exception as e:
             logger.warning(f"Heartbeat failed for task {task_id}: {e}")
 
+        progress = get_progress(task_id)
+        if progress is not None and progress != last_persisted_progress:
+            try:
+                await update_task(
+                    engine, task_id, TaskUpdate(progress=progress), schema=schema
+                )
+                last_persisted_progress = progress
+            except Exception as e:
+                logger.warning(f"Progress persist failed for task {task_id}: {e}")
+
+
+def _resolve_payload_model(target_task: object, task_name: str) -> type:
+    """Return the pydantic model annotated on ``target_task.run``'s ``payload``.
+
+    Uses ``typing.get_type_hints`` rather than the raw ``__annotations__`` dict
+    so that PEP 563 / ``from __future__ import annotations`` string annotations
+    are resolved to the live class.  Without this, a task module that stringizes
+    its annotations yields the *string* ``"TaskPayload[...]"`` instead of the
+    class, and both ``.model_validate`` and ``.__name__`` raise AttributeError —
+    aborting every Cloud Run Job execution for that task.
+
+    Raises ``TypeError`` if ``run`` is missing, its hints can't be resolved, or
+    it has no ``payload`` annotation.
+    """
+    run_method = getattr(target_task, "run", None)
+    if run_method is None:
+        raise TypeError(f"Task '{task_name}' has no `run` method.")
+    try:
+        hints = typing.get_type_hints(run_method)
+    except Exception as exc:
+        raise TypeError(
+            f"Task '{task_name}': failed to resolve type hints for its "
+            f"`run` method: {exc}"
+        ) from exc
+    payload_model = hints.get("payload")
+    if payload_model is None:
+        raise TypeError(
+            f"Task '{task_name}' has a `run` method without a 'payload' "
+            "type annotation."
+        )
+    return payload_model
+
 
 async def report_failure(task_id: str, schema: str, error_message: str):
     """
     Attempts to report a fatal failure to the database.
-    This helper initializes just enough of the module system to update the task status.
+
+    Last-resort fallback (#2887): reached from a bare ``asyncio.run()`` in the
+    ``__main__`` handler, after ``main()`` itself has already unwound and the
+    in-lifecycle attempt (inside ``main()``) either failed or never got a
+    chance to run. Standing up the FULL module graph here — Tiles,
+    MovingFeatures, Stats, ConnectedSystems, a fresh DB engine/pool, a fresh ES
+    client, and a second ``BackgroundSupervisor`` — purely to flip one row to
+    FAILED is itself expensive enough to tip an already memory-pressured
+    process into OOM. Writing the FAILED status only needs a DB connection and
+    the ``tasks`` table UPDATE, so this opens its own bare, ``NullPool``-backed
+    async engine and calls ``update_task`` directly — the same minimal-footprint
+    pattern ``StorageDrainTask.run()`` / ``EventDrainTask.run()`` already use to
+    build their own engines without any module bootstrap.
     """
     if not task_id or not schema:
         logger.error("Cannot report failure to DB: task_id or schema missing.")
         return
 
+    engine = None
     try:
-        from dynastore import modules
-        from dynastore.modules.tasks.models import TaskUpdate, TaskStatusEnum
+        from dynastore.modules.db_config.db_config import DBConfig
+        from dynastore.modules.db_config.db_timeout_config import create_task_engine
+        from dynastore.modules.tasks.models import TaskStatusEnum, TaskUpdate
+        from dynastore.modules.tasks.tasks_module import update_task
 
-        app_state = SimpleNamespace()
-        # Initialize foundational modules for reporting (failsafe)
-        from dynastore.tasks.bootstrap import bootstrap_task_env
-        bootstrap_task_env(app_state)
+        engine = create_task_engine(DBConfig)
 
-        async with modules.lifespan(app_state):
-            logger.info(f"Reporting failure for task '{task_id}' in schema '{schema}'...")
-            from dynastore.modules import get_protocol
-            from dynastore.models.protocols import DatabaseProtocol, TasksProtocol
-
-            db = get_protocol(DatabaseProtocol)
-            if not db:
-                logger.warning("DatabaseProtocol implementation not found. Cannot report failure to DB.")
-                return
-            engine = db.engine
-
-            tasks_mgr = get_protocol(TasksProtocol)
-            if not tasks_mgr:
-                logger.warning("TasksProtocol implementation not found. Cannot report failure to DB.")
-                return
-
-            update_data = TaskUpdate(
-                status=TaskStatusEnum.FAILED,
-                error_message=f"Fatal Runner Error: {error_message}"
-            )
-            await tasks_mgr.update_task(engine, uuid.UUID(task_id), update_data, schema=schema)
-            logger.info(f"Successfully reported failure for task '{task_id}'.")
+        logger.info(f"Reporting failure for task '{task_id}' in schema '{schema}'...")
+        update_data = TaskUpdate(
+            status=TaskStatusEnum.FAILED,
+            error_message=f"Fatal Runner Error: {error_message}"
+        )
+        await update_task(engine, uuid.UUID(task_id), update_data, schema=schema)
+        logger.info(f"Successfully reported failure for task '{task_id}'.")
     except Exception as e:
         logger.critical(f"Failed to report failure to database: {e}", exc_info=True)
+    finally:
+        if engine is not None:
+            await engine.dispose()
 
 async def main(task_name: str, payload: dict, schema: str):
     """
@@ -134,6 +213,16 @@ async def main(task_name: str, payload: dict, schema: str):
 
     # Create a simple app_state object. The lifespan managers will populate it.
     app_state = SimpleNamespace()
+
+    # Ephemeral Cloud Run Job pods run a single task then exit.  At production
+    # scale hundreds of these pods may run concurrently.  Long-lived
+    # dispatcher-side background loops (starting with the task-capability
+    # registry heartbeat, #2271) must NOT start inside job pods: each would
+    # open its own DB connection and hammer configs.task_capability_registry
+    # with writes and lock contention.  The flag is read by TasksModule.lifespan
+    # to gate those loops.
+    app_state.ephemeral_job = True
+
     task_id_str = payload.get("task_id")
     task_id_uuid = uuid.UUID(task_id_str) if task_id_str else None
 
@@ -156,15 +245,15 @@ async def main(task_name: str, payload: dict, schema: str):
 
                 logging.info(f"--- [main_task.py] Loaded task '{task_name}' successfully. ---")
 
-                # Introspect the `run` method's type hints to find the expected payload model.
-                payload_model = None
-                run_method = getattr(target_task, 'run', None)
-                if run_method and 'payload' in run_method.__annotations__:
-                    payload_model = run_method.__annotations__['payload']
-                if not payload_model:
-                    raise TypeError(f"Task '{task_name}' has a `run` method without a 'payload' type annotation.")
+                # Resolve the expected payload model from the `run` method's
+                # type hints (handles PEP 563 string annotations — see
+                # _resolve_payload_model).
+                payload_model = _resolve_payload_model(target_task, task_name)
 
-                logging.info(f"--- [main_task.py] Task '{task_name}' expects payload of type '{payload_model.__name__}'. ---")
+                logging.info(
+                    f"--- [main_task.py] Task '{task_name}' expects payload of "
+                    f"type '{getattr(payload_model, '__name__', payload_model)}'. ---"
+                )
                 logging.debug(f"--- [main_task.py] Payload: {payload} ---")
                 # Validate the incoming dictionary against the task's expected payload model.
                 validate_payload = payload_model.model_validate(payload)
@@ -195,21 +284,41 @@ async def main(task_name: str, payload: dict, schema: str):
                         _VISIBILITY_TIMEOUT,
                     )
                     if claimed_row is None:
-                        # Lost claim: the row is already terminal, or ACTIVE
-                        # with a live lease held by another execution. This is
-                        # the #726 guard — a Cloud Run Job spawned by a reaper
-                        # re-enqueue (lease lapsed mid-cold-start) must NOT
-                        # re-run a task another execution already finished or
-                        # is finishing. Exit cleanly; the lifespans unwind.
+                        # The row is already terminal or ACTIVE with a live
+                        # foreign lease (#726 guard — no double-run).  Look up
+                        # the current status so we exit with the right code:
+                        # a Cloud Run retry finding FAILED / DEAD_LETTER must
+                        # exit 1 so the execution is not recorded as SUCCEEDED.
+                        _unclaimed_status: str | None = None
+                        try:
+                            _current_task = await tasks_mgr.get_task(
+                                engine, task_id_uuid, schema
+                            )
+                            _unclaimed_status = (
+                                _current_task.status.value
+                                if _current_task
+                                else None
+                            )
+                        except Exception as _lookup_err:
+                            logger.warning(
+                                "--- [main_task.py] Task %s not claimable and "
+                                "status lookup failed (%s); treating as "
+                                "non-failure (exit 0). ---",
+                                task_id_uuid, _lookup_err,
+                            )
+                        _exit_code = _exit_code_for_unclaimed_status(_unclaimed_status)
                         logger.warning(
-                            f"--- [main_task.py] Task {task_id_uuid} not claimable "
-                            f"(already terminal or owned by a live execution) — "
-                            f"skipping execution, no double-run. ---"
+                            "--- [main_task.py] Task %s not claimable "
+                            "(status=%s, exit_code=%d) — skipping execution, "
+                            "no double-run. ---",
+                            task_id_uuid, _unclaimed_status, _exit_code,
                         )
+                        if _exit_code != 0:
+                            sys.exit(_exit_code)
                         return
                     interval = _VISIBILITY_TIMEOUT.total_seconds() / 3
                     hb_task = asyncio.create_task(
-                        _heartbeat_loop(engine, task_id_uuid, interval)
+                        _heartbeat_loop(engine, task_id_uuid, interval, schema)
                     )
                     logger.info(
                         f"--- [main_task.py] Took ownership of task {task_id_uuid} "
@@ -223,7 +332,9 @@ async def main(task_name: str, payload: dict, schema: str):
 
                 try:
                     logger.info(f"--- [main_task.py] Executing task: '{task_name}' ---")
-                    res = await target_task.run(payload=validate_payload)
+                    from dynastore.tools.execution_context import task_run_scope
+                    with task_run_scope(catalog=schema):
+                        res = await target_task.run(payload=validate_payload)
                     logger.info(f"--- [main_task.py] Task '{task_name}' returned: {res} ---")
 
                     # Success: mark COMPLETED in the same row that GcpJobRunner created.
@@ -289,10 +400,22 @@ async def main(task_name: str, payload: dict, schema: str):
                 except PermanentTaskFailure as exc:
                     if task_id_uuid is not None and engine is not None:
                         from dynastore.modules.tasks.tasks_module import fail_task
-                        await fail_task(
+                        _fail_updated = await fail_task(
                             engine, task_id_uuid, datetime.now(timezone.utc),
                             str(exc), retry=False,
                         )
+                        if not _fail_updated:
+                            # fail_task's guarded UPDATE matched no row (already
+                            # terminal / reclaimed). Log loudly so this isn't a
+                            # silent zombie ACTIVE row — this exception still
+                            # propagates to the outer handler below, which
+                            # decides whether the report_failure() fallback runs.
+                            logger.warning(
+                                "--- [main_task.py] fail_task() was a no-op for "
+                                "task %s (guarded write matched no row); status "
+                                "may still be stale. ---",
+                                task_id_uuid,
+                            )
                         logger.error(
                             f"--- [main_task.py] Task {task_id_uuid} permanently failed: {exc} ---"
                         )
@@ -330,12 +453,33 @@ async def main(task_name: str, payload: dict, schema: str):
                         # silently masking the row as FAILED with no retry accounting.
                         from dynastore.modules.tasks.tasks_module import fail_task
                         from datetime import datetime, timezone
-                        await fail_task(
+                        _fail_updated = await fail_task(
                             engine, uuid.UUID(task_id_str),
                             datetime.now(timezone.utc), f"Runtime Error: {str(e)}",
                             retry=True,
                         )
-                        logger.info("Successfully reported failure to DB via fail_task.")
+                        if _fail_updated:
+                            logger.info("Successfully reported failure to DB via fail_task.")
+                            # Signal to the outer __main__ handler that this failure
+                            # was already recorded.  The outer handler checks this
+                            # attribute before calling report_failure(), which would
+                            # otherwise open a second full modules.lifespan() in the
+                            # same process — paying the ~40s bootstrap cost again and
+                            # triggering "already instantiated … reusing" warnings.
+                            e._failure_already_reported = True  # type: ignore[attr-defined]
+                        else:
+                            # Guarded UPDATE matched no row — do NOT claim success
+                            # and do NOT stamp the sentinel, so the outer __main__
+                            # handler falls through to report_failure() (its
+                            # unconditional update_task write) instead of leaving
+                            # the row ACTIVE with a truthfully-uncaptured failure.
+                            logger.warning(
+                                "--- [main_task.py] fail_task() was a no-op for "
+                                "task %s (guarded write matched no row); leaving "
+                                "the failure unreported so __main__ falls through "
+                                "to report_failure(). ---",
+                                task_id_str,
+                            )
                 except Exception as report_error:
                     logger.error(f"Failed to report failure within lifecycle: {report_error}. Falling back to external reporter.")
             raise
@@ -401,6 +545,10 @@ if __name__ == "__main__":
     except Exception as e:
         full_error = f"{e}\n{traceback.format_exc()}"
         logger.critical(f"An unexpected fatal error occurred: {full_error}")
-        if task_id:
+        if task_id and not getattr(e, '_failure_already_reported', False):
+            # The in-lifecycle handler (inside main()) reports via fail_task()
+            # when it can reach the DB through the active module stack.  When
+            # it succeeds it stamps _failure_already_reported on the exception
+            # to avoid a second full modules.lifespan() bootstrap here.
             asyncio.run(report_failure(task_id, args.schema, str(e)))
         sys.exit(1)

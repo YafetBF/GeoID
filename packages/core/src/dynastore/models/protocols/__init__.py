@@ -51,6 +51,7 @@ from dynastore.models.protocols.eventing import EventingProtocol
 from dynastore.models.protocols.gcp_provisioning import GcpCatalogProvisioning
 from dynastore.models.protocols.events import EventsProtocol
 from dynastore.models.protocols.tasks import TasksProtocol
+from dynastore.models.protocols.temp_dir import TempDirProtocol, DefaultTempDir, TASK_DIR_PREFIX
 from dynastore.models.protocols.task_queue import TaskQueueProtocol
 from dynastore.models.protocols.event_bus import EventBusProtocol
 from dynastore.models.protocols.event_driver import EventDriverProtocol
@@ -91,6 +92,9 @@ from dynastore.models.protocols.asset_contrib import (
     ResourceRef,
 )
 from dynastore.models.protocols.conformance import ConformanceContributor
+from dynastore.models.protocols.scaling_signal import ScalingSignalProtocol
+from dynastore.models.protocols.platform_scaling import PlatformScalingProtocol
+from dynastore.models.protocols.metrics_backend import MetricsBackendProtocol, MetricKind
 from dynastore.models.protocols.catalog_source import (
     CatalogListProvider,
     CatalogOption,
@@ -134,6 +138,10 @@ from dynastore.models.protocols.asset_upload import (
     UploadStatus,
     UploadStatusResponse,
 )
+from dynastore.models.resolved_ids import (
+    ResolvedCatalogIds,
+    ResolvedCollectionIds,
+)
 # Export auth_models for convenience
 from dynastore.models.auth_models import (
     SYSTEM_USER_ID,
@@ -164,6 +172,9 @@ __all__ = [
     "GcpCatalogProvisioning",
     "EventsProtocol",
     "TasksProtocol",
+    "TempDirProtocol",
+    "DefaultTempDir",
+    "TASK_DIR_PREFIX",
     "TaskQueueProtocol",
     "EventBusProtocol",
     "EventDriverProtocol",
@@ -201,6 +212,10 @@ __all__ = [
     "CollectionPipelineProtocol",
     "CatalogPipelineProtocol",
     "ConformanceContributor",
+    "ScalingSignalProtocol",
+    "PlatformScalingProtocol",
+    "MetricsBackendProtocol",
+    "MetricKind",
     "CatalogListProvider",
     "CatalogOption",
     "WebPageContributor",
@@ -224,6 +239,9 @@ __all__ = [
     "UploadTicket",
     "UploadStatus",
     "UploadStatusResponse",
+    # Resolved IDs
+    "ResolvedCatalogIds",
+    "ResolvedCollectionIds",
     # Auth models
     "SYSTEM_USER_ID",
     "PolicyBundle",

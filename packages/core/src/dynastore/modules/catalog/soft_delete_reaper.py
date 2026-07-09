@@ -44,19 +44,26 @@ Architecture contract
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Union
 
 from pydantic import Field
 
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
-from dynastore.modules.db_config.locking_tools import pg_advisory_leadership
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
     managed_transaction,
+)
+from dynastore.modules.tasks.durable.lock_registry import (
+    SOFT_DELETE_REAPER_ADVISORY_LOCK_KEY as _REAPER_ADVISORY_LOCK_KEY,
+)
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
 )
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.protocol_helpers import get_engine
@@ -66,8 +73,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key for leader election — must not collide with other loops.
-_REAPER_ADVISORY_LOCK_KEY = 0x5D3A7E1F_C2B84961  # deterministic constant
+# Advisory lock key for leader election — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# leader-elected loop's key.
 
 
 class SoftDeleteReaperConfig(PluginConfig):
@@ -152,7 +160,7 @@ FOR UPDATE SKIP LOCKED
 # Returns (catalog_id, collection_id) pairs for collections whose deleted_at
 # has aged past the grace interval and have no in-flight cascade task.
 _OVERDUE_COLLECTIONS_SQL = """
-SELECT cat.id AS catalog_id, col.id AS collection_id, cat.physical_schema
+SELECT cat.id AS catalog_id, col.id AS collection_id
 FROM catalog.catalogs cat
 JOIN LATERAL (
     SELECT id
@@ -178,58 +186,27 @@ ORDER BY cat.id, col.id
 """
 
 
-class SoftDeleteReaper:
+class SoftDeleteReaper(PeriodicService):
     """Periodic reaper that promotes soft-deleted entities to hard-deleted.
 
-    Call ``start(shutdown_event)`` from a module lifespan to launch the
-    background loop.  Only one instance should run per process; leader
-    election via a pg advisory lock ensures exactly one instance runs
-    fleet-wide.
+    Implements ``PeriodicService``: ``BackgroundSupervisor`` handles leadership
+    election via ``_REAPER_ADVISORY_LOCK_KEY`` and the configured cadence.
+    Each tick calls ``run_once()`` which scans for entities past the grace
+    window and hard-deletes them via the existing force-delete path.
     """
+
+    name = "soft_delete_reaper"
+    leadership = Leadership.LEADER_ONLY
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
 
     def __init__(self, config: SoftDeleteReaperConfig) -> None:
         self._config = config
-        self._task: Optional[asyncio.Task[Any]] = None
+        self.cadence_seconds = config.reaper_interval_seconds
+        self.lock_key: Optional[Union[int, str]] = _REAPER_ADVISORY_LOCK_KEY
 
-    def start(self, shutdown_event: asyncio.Event) -> None:
-        """Schedule the reaper loop as an asyncio background task."""
-        self._task = asyncio.create_task(
-            self._loop(shutdown_event),
-            name="soft_delete_reaper",
-        )
-
-    async def stop(self) -> None:
-        """Cancel and await the background task."""
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
-
-    async def _loop(self, shutdown_event: asyncio.Event) -> None:
-        """Leader-elected outer loop — exits when shutdown_event is set."""
-        from dynastore.tools.async_utils import run_leader_loop
-
-        def _acquire_leadership():
-            return pg_advisory_leadership(
-                get_engine(),
-                _REAPER_ADVISORY_LOCK_KEY,
-                name="SoftDeleteReaper",
-            )
-
-        async def _on_leader() -> None:
-            await self.run_once()
-            await asyncio.sleep(self._config.reaper_interval_seconds)
-
-        await run_leader_loop(
-            acquire_leadership=_acquire_leadership,
-            on_leader=_on_leader,
-            name="SoftDeleteReaper",
-            cadence_seconds=self._config.reaper_interval_seconds,
-            is_shutdown=shutdown_event.is_set,
-        )
+    async def tick(self, ctx: ServiceContext) -> None:
+        """One reaper scan across catalogs and collections."""
+        await self.run_once()
 
     async def run_once(self) -> None:
         """Perform one full reaper scan across catalogs and collections.
@@ -330,27 +307,27 @@ class SoftDeleteReaper:
             )
             return
 
-        for catalog_id, physical_schema in catalog_ids:
+        for catalog_id in catalog_ids:
             await self._reap_collections_in_schema(
-                catalog_id, physical_schema, grace_seconds, limit, catalogs_svc
+                catalog_id, catalog_id, grace_seconds, limit, catalogs_svc
             )
 
     async def _list_active_catalog_ids(
         self, engine: "DbResource"
-    ) -> list[tuple[str, str]]:
-        """Return (catalog_id, physical_schema) for all non-deleted catalogs."""
+    ) -> list[str]:
+        """Return catalog ids (= schema names) for all non-deleted catalogs."""
         async with managed_transaction(engine) as conn:
             rows = await DQLQuery(
-                "SELECT id, physical_schema FROM catalog.catalogs "
+                "SELECT id FROM catalog.catalogs "
                 "WHERE deleted_at IS NULL ORDER BY id",
                 result_handler=ResultHandler.ALL,
             ).execute(conn)
-        return [(r[0], r[1]) for r in rows] if rows else []
+        return [r[0] for r in rows] if rows else []
 
     async def _reap_collections_in_schema(
         self,
         catalog_id: str,
-        physical_schema: str,
+        schema: str,
         grace_seconds: int,
         limit: int,
         catalogs_svc: Any,
@@ -363,7 +340,7 @@ class SoftDeleteReaper:
         # The LATERAL join query uses a literal schema name; build it safely.
         query_sql = (
             "SELECT col.id AS collection_id "
-            f'FROM "{physical_schema}".collections col '
+            f'FROM "{schema}".collections col '
             "WHERE col.deleted_at IS NOT NULL "
             "  AND col.deleted_at + (:grace_seconds || ' seconds')::INTERVAL < NOW() "
             "  AND NOT EXISTS ( "
@@ -395,7 +372,7 @@ class SoftDeleteReaper:
             logger.exception(
                 "soft_delete_reaper: failed to query collections in "
                 "schema %r (catalog %r).",
-                physical_schema, catalog_id,
+                schema, catalog_id,
             )
             return
 

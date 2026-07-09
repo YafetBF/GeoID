@@ -18,7 +18,7 @@
 
 """Input model for the stac_harvest OGC Process."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -32,6 +32,25 @@ _LEGACY_BACKEND_TO_DRIVERS = {
     "es_pg": RoutingDrivers.PG_ES,
     "pg": RoutingDrivers.PG,
 }
+
+
+class StacHarvestCursor(BaseModel):
+    """Resume position within a harvest walk, stamped by the harvest loop (#3034).
+
+    ``collection_id`` is the *source* collection id currently in progress
+    (``None`` before the first collection starts, or between two collections
+    in a full-catalog harvest). ``items_href`` is the STAC ``rel=next`` items
+    page URL to resume from within that collection (``None`` means start it
+    from the beginning). ``done`` marks that collection's item walk as fully
+    drained, so a resumed catalog walk skips it and moves to the next one.
+
+    Populated automatically after each items-page batch write commits — never
+    set this on submit.
+    """
+
+    collection_id: Optional[str] = None
+    items_href: Optional[str] = None
+    done: bool = False
 
 
 class StacHarvestRequest(BaseModel):
@@ -83,6 +102,24 @@ class StacHarvestRequest(BaseModel):
             "(dynastore stores only the href, never the bytes)."
         ),
     )
+    skip_empty_collections: bool = Field(
+        default=False,
+        description=(
+            "When True, probe each source collection's item stream before "
+            "creating local collection metadata and skip collections whose "
+            "item walk yields no items. Fetch failures are not treated as "
+            "empty collections."
+        ),
+    )
+    kind: Optional[Literal["VECTOR", "RASTER", "RECORDS"]] = Field(
+        default=None,
+        description=(
+            "Optional dynastore collection kind to set before writing harvested "
+            "collections. When omitted, the harvester infers RASTER from STAC "
+            "raster extension metadata or COG/raster data assets and otherwise "
+            "leaves the platform default in place."
+        ),
+    )
     drivers: RoutingDrivers = Field(
         default=RoutingDrivers.ES,
         description=(
@@ -92,6 +129,28 @@ class StacHarvestRequest(BaseModel):
             "PG primary + async ES secondary; ``pg`` uses PG only; ``pg_pes`` "
             "writes PG primary + private ES secondary.  Legacy ``storage_backend`` "
             "(es / es_pg / pg) is still accepted and mapped to this field."
+        ),
+    )
+    external_id_as_feature_id: bool = Field(
+        default=True,
+        description=(
+            "Wire-shape for each harvested collection: when True (the default) "
+            "the harvested item id round-trips the source STAC id — dynastore "
+            "stores it as the ``external_id`` and pins each collection's "
+            "``ItemsReadPolicy.feature_type.external_id_as_feature_id`` so both "
+            "STAC and OGC Features expose that source id (so a link back to the "
+            "upstream catalog resolves). Set False to expose the internal geoid "
+            "instead; the source id stays available as the ``external_id`` "
+            "property."
+        ),
+    )
+    resume: Optional[StacHarvestCursor] = Field(
+        default=None,
+        description=(
+            "Resume cursor stamped by the harvest loop after each completed "
+            "items page (#3034) — do not set on submit. A retry of this task "
+            "after a timeout/kill resumes the walk from here instead of "
+            "restarting the whole source catalog from the beginning."
         ),
     )
 

@@ -35,10 +35,20 @@ async def get_features_for_rendering(
     height: int,
     bbox_srid: int = 4326, # Defaults to OGC:CRS84 per OGC API Maps Req 18
     datetime_str: Optional[str] = None,
-    subset_params: Optional[Dict[str, Any]] = None
+    subset_params: Optional[Dict[str, Any]] = None,
+    physical_schema: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetches geometries and attributes for rendering, with full filter capabilities.
+
+    ``schema`` is the LOGICAL catalog_id and is used only for driver/config
+    resolution (``get_driver``/``resolve_physical_table``/``get_driver_config``,
+    whose ``catalog_id`` params want the logical id). Raw SQL identifiers must be
+    qualified with ``physical_schema`` — the resolved PHYSICAL schema, which can
+    differ from the catalog_id — mirroring the tiles path
+    (``tiles_module._get_schema`` → ``resolve_physical_schema``). When
+    ``physical_schema`` is None we fall back to ``schema`` (legacy behaviour /
+    physically-unresolved catalogs).
 
     Optimizations:
     1. Decouples Input BBOX CRS (bbox_srid) from Output Map CRS.
@@ -62,6 +72,12 @@ async def get_features_for_rendering(
         GeometriesSidecarConfig,
     )
 
+    # Physical schema != catalog_id: the physical table lives in the resolved
+    # PHYSICAL schema, not in a schema literally named after the logical
+    # catalog_id. Callers resolve it via CatalogsProtocol.resolve_physical_schema
+    # (see tiles_module._get_schema); fall back to ``schema`` when unresolved.
+    sql_schema = physical_schema or schema
+
     def _resolve_source_srid(layer_cfg: Any) -> int:
         # Sidecars are PG-driver-internal — driver_sidecars() returns []
         # for non-PG resolved layer configs and we fall back to 4326.
@@ -74,24 +90,39 @@ async def get_features_for_rendering(
             4326,
         )
 
-    async def _resolve_collection_meta(collection: str) -> tuple[List[str], int]:
+    async def _resolve_collection_meta(collection: str) -> tuple[str, List[str], int]:
         drv = await get_driver(Operation.READ, schema, collection)
+        # ``collection_id`` is not guaranteed to be the physical table name —
+        # resolve it the same way every other physical read/write path does
+        # (see ``CatalogsProtocol.resolve_physical_table`` / GeoID #2325).
+        # Querying/rendering against the raw collection id verbatim
+        # false-negatives (or renders an empty/wrong table) whenever the
+        # physical table diverges from the collection id.
+        physical_table = collection
+        if hasattr(drv, "resolve_physical_table"):
+            resolved = await drv.resolve_physical_table(  # type: ignore[attr-defined]
+                schema, collection, db_resource=conn
+            )
+            physical_table = resolved or collection
         cols, cfg = await asyncio.gather(
-            shared_queries.get_table_column_names(conn, schema, collection),
+            # Raw SQL qualifier → physical schema; driver config → logical id.
+            shared_queries.get_table_column_names(conn, sql_schema, physical_table),
             drv.get_driver_config(schema, collection),
         )
-        return cols, _resolve_source_srid(cfg)
+        return physical_table, cols, _resolve_source_srid(cfg)
 
     # Single-collection (the hot path) keeps its previous one-pass shape; the
     # multi-collection path resolves metadata for every arm in parallel and
     # asserts homogeneity before building the UNION.
     if len(collections) == 1:
-        table_columns, source_srid = await _resolve_collection_meta(collections[0])
+        physical_table, table_columns, source_srid = await _resolve_collection_meta(collections[0])
+        physical_tables = [physical_table]
     else:
         metas = await asyncio.gather(*(_resolve_collection_meta(c) for c in collections))
-        table_columns, source_srid = metas[0]
+        physical_tables = [m[0] for m in metas]
+        table_columns, source_srid = metas[0][1], metas[0][2]
         base_cols = set(table_columns)
-        for collection, (cols, srid) in zip(collections[1:], metas[1:]):
+        for collection, (_, cols, srid) in zip(collections[1:], metas[1:]):
             if set(cols) != base_cols:
                 raise ValueError(
                     f"Heterogeneous multi-collection map request: column sets differ "
@@ -123,7 +154,9 @@ async def get_features_for_rendering(
     
     # 2. Transform that envelope to the Source CRS to use with the Spatial Index
     source_envelope_sql = f"ST_Transform({bbox_envelope_sql}, {source_srid})"
-    spatial_filter = f"ST_Intersects(geom, {source_envelope_sql})"
+    # ``geom`` lives on the geometries sidecar (aliased ``g`` below), never on
+    # the hub table itself — see the JOINs built per collection below.
+    spatial_filter = f"ST_Intersects(g.geom, {source_envelope_sql})"
     
     # 3. Calculate Simplification Tolerance (Generalization)
     # Tolerance = (Width of BBOX in Source Units) / (Image Width in Pixels)
@@ -131,19 +164,32 @@ async def get_features_for_rendering(
     # We add a CASE to prevent division by zero or a zero tolerance, which causes a PostGIS error.
     resolution_sql = f"GREATEST( (ST_XMax({source_envelope_sql}) - ST_XMin({source_envelope_sql})) / GREATEST(:img_width, 1), 1e-9 )"
 
-    union_queries = []   
-    for collection in collections:
+    union_queries = []
+    for collection, physical_table in zip(collections, physical_tables):
         # We simplify the geometry in PostGIS before sending it to Python.
         # This significantly boosts performance for large datasets.
+        # ``layer`` stays the (external-facing) collection id; the FROM
+        # clause uses the resolved physical table, which may diverge from it.
+        #
+        # The hub table only carries ``geoid``/``transaction_time``/
+        # ``deleted_at`` (GeoID #2719) — ``geom`` and ``attributes`` live on
+        # the ``_geometries``/``_attributes`` sidecars and must be JOINed in,
+        # mirroring the PG driver's own query builder
+        # (``drivers/postgresql.py``, hub alias ``h`` / geometry alias ``g`` /
+        # attributes alias ``a``). This assumes the standard JSONB attributes
+        # sidecar (production default); COLUMNAR-mode attribute storage is
+        # not handled here.
         union_queries.append(f"""
-            SELECT 
-                '{collection}' as layer, 
+            SELECT
+                '{collection}' as layer,
                 ST_AsBinary(
-                    ST_SimplifyPreserveTopology(geom, {resolution_sql})
-                ) as geom, 
-                geoid, 
-                attributes
-            FROM "{schema}"."{collection}" 
+                    ST_SimplifyPreserveTopology(g.geom, {resolution_sql})
+                ) as geom,
+                h.geoid,
+                a.attributes
+            FROM "{sql_schema}"."{physical_table}" h
+            JOIN "{sql_schema}"."{physical_table}_geometries" g ON h.geoid = g.geoid
+            JOIN "{sql_schema}"."{physical_table}_attributes" a ON h.geoid = a.geoid
             WHERE {spatial_filter} AND ({where_clause})
         """)
 

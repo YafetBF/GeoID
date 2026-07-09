@@ -16,14 +16,22 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Pyogrio-backed reader, registered as a fallback.
+"""Pyogrio-backed reader — preferred for the formats it declares.
 
-Sits strictly behind :class:`GdalOsgeoReader` (``priority=10``), which
-binds the **system** libgdal via ``osgeo.ogr``.  This reader hard-imports
-``pyogrio`` instead — pyogrio ships its own GDAL build in the PyPI wheel,
-so it provides a vector-read path in scopes that pull in ``geospatial_io``
-but not the ``module_gdal`` osgeo bindings.  ``priority=100`` keeps it a
-tail candidate.
+Sits strictly ahead of :class:`GdalOsgeoReader` (``priority=100``) for
+the extensions listed below, reading them in vectorized/Arrow-backed
+pages instead of the row-by-row OGR iteration ``GdalOsgeoReader`` uses
+— on an 8.4M-row GeoPackage that row-by-row path ran at ~27 rows/sec
+(GeoID #2964).  ``priority=10`` gives this reader first crack at its
+declared extensions; for any format outside that list ``can_read()``
+returns False and the registry falls through to ``GdalOsgeoReader``,
+which still covers the ~78 GDAL driver formats (Parquet, FlatGeobuf,
+OpenFileGDB, …) pyogrio's PyPI wheel doesn't support.
+
+Reads are paginated via ``pyogrio.read_dataframe(..., skip_features=,
+max_features=)`` — ``read_dataframe`` has no ``chunksize`` parameter,
+so passing one silently forwards as an unrecognised GDAL open option
+and returns a single, non-chunked ``GeoDataFrame``.
 """
 
 from __future__ import annotations
@@ -44,16 +52,25 @@ logger = logging.getLogger(__name__)
 
 
 class PyogrioReader(SourceReaderProtocol):
-    """Fallback reader backed by pyogrio's bundled GDAL."""
+    """Preferred reader (chunked/vectorized) for the formats it declares;
+    backed by pyogrio's bundled GDAL."""
 
     reader_id: ClassVar[str] = "pyogrio"
-    priority: ClassVar[int] = 100
+    priority: ClassVar[int] = 10
     extensions: ClassVar[Tuple[str, ...]] = (
-        # Keep the set small and overlapping with osgeo intentionally so an
-        # explicit ``hint=pyogrio`` (future) can pin it; osgeo's lower
-        # priority still wins for these by default.
+        # Formats pyogrio reads in vectorized/Arrow-backed pages —
+        # dramatically faster than GdalOsgeoReader's row-by-row OGR
+        # iteration (GeoID #2964).  Anything outside this list falls
+        # through to GdalOsgeoReader's broader driver coverage.
         ".geojson", ".json", ".gpkg", ".shp", ".csv",
     )
+
+    # Offset resume (GeoID #2958) is threaded into the pagination cursor
+    # below via pyogrio's own ``skip_features`` — which itself delegates to
+    # OGR's ``SetNextByIndex`` (native, O(1) for drivers advertising
+    # ``OLCFastSetNextByIndex``) rather than the caller discarding rows one
+    # at a time in Python.
+    supports_offset_seek: ClassVar[bool] = True
 
     @contextlib.contextmanager
     def open(
@@ -62,17 +79,60 @@ class PyogrioReader(SourceReaderProtocol):
         *,
         encoding: str = "utf-8",
         content_type: str | None = None,  # noqa: ARG002 — forwarded by registry, unused here
+        offset: int = 0,
         **opts: Any,
     ) -> Iterator[Iterable[dict]]:
-        import geopandas as gpd
+        path = _to_vsigs(uri, use_vsicache=bool(opts.get("use_vsicache", False)))
+        chunk_size: int = opts.get("read_batch_size", 1000)  # type: ignore[assignment]
 
-        path = _to_vsigs(uri)
-        gdf = gpd.read_file(path, engine="pyogrio", encoding=encoding)
-        logger.info("PyogrioReader: opened %r (%d features)", path, len(gdf))
-        # ``iterfeatures`` yields GeoJSON-shaped dicts
-        # (``{"type": "Feature", "properties": …, "geometry": …}``), matching
-        # the record shape the downstream upsert expects.
-        yield gdf.iterfeatures()
+        def _iter_chunks() -> Iterator[dict]:
+            # Stream in bounded chunks so the full source file is never
+            # materialised in memory at once.  On a 300+ MB admin-boundary
+            # dataset loading the entire GeoDataFrame in one call exhausts
+            # the container; paginating via skip_features/max_features
+            # keeps peak RSS proportional to chunk_size, not source-file
+            # size.  (``read_dataframe`` has no ``chunksize`` kwarg — it's
+            # not a chunked-generator API — so pagination is done here.)
+            #
+            # *offset* seeds the pagination cursor so resuming a partial
+            # ingestion (GeoID #2958) skips the already-ingested rows via
+            # pyogrio's native skip_features instead of the caller
+            # discarding them one at a time after the fact.
+            cursor = offset
+            while True:
+                chunk = pyogrio.read_dataframe(
+                    path, encoding=encoding,
+                    skip_features=cursor, max_features=chunk_size,
+                    # fid_as_index=True (GeoID #2964 follow-up): without it
+                    # each read_dataframe() call gets its own 0-based
+                    # RangeIndex, so chunk.iterfeatures()'s "id" restarts at
+                    # 0 on every page — the SECOND and every later chunk
+                    # then reuses the FIRST chunk's ids. prepare_record_for_
+                    # upsert (main_ingestion.py) falls back to this "id" as
+                    # the upsert identity whenever no column_mapping.
+                    # external_id is configured (GeoID #2709 tier 2), so on
+                    # any multi-chunk GeoPackage this silently collapsed
+                    # every "chunk_size"-th row onto the same upserted
+                    # record instead of inserting all of them. The real OGR
+                    # FID is globally unique and stable across pagination —
+                    # exactly the identity GdalOsgeoReader's feat.GetFID()
+                    # already surfaces — so using it here keeps the two
+                    # readers' output contracts identical.
+                    fid_as_index=True,
+                )
+                n = len(chunk)
+                if n == 0:
+                    break
+                yield from chunk.iterfeatures()
+                if n < chunk_size:
+                    break
+                cursor += chunk_size
+
+        logger.info(
+            "PyogrioReader: opened %r (chunked, chunk_size=%d%s)", path, chunk_size,
+            f", resuming at offset={offset} via native skip_features" if offset else "",
+        )
+        yield _iter_chunks()
 
     def feature_count(
         self, uri: str, *, content_type: str | None = None,  # noqa: ARG002

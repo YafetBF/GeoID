@@ -147,16 +147,32 @@ class GcpCatalogBucketConfig(PluginConfig):
     # (see ``GcpCatalogBucketConfig.register_apply_handler(...)`` below).
 
     # Immutable fields: Once the bucket is created, these cannot be changed.
-    location: Immutable[Optional[GcpLocation]] = Field(default=os.getenv("REGION", GcpLocation.EUROPE_WEST1), description="The GCP region where the bucket will be created (e.g., 'europe-west1'). If not set, defaults to the application's region.")  # type: ignore[assignment]
+    #
+    # ``default_factory`` (not a bare ``default=os.getenv(...)``) is a
+    # deliberate, reviewed exception to routing env-sourcing through a
+    # cold-boot seed preset (geoid#2830 C6): a plain ``Field(default=...)``
+    # expression is evaluated once at class-definition/import time, so it
+    # silently freezes whatever REGION was at that instant; the lambda below
+    # re-reads the environment on every bare construction instead. In
+    # practice this bare default is rarely reached anyway — the two
+    # fallback-construction call sites in ``bucket_service.py`` already pass
+    # ``location=GcpLocation(self.region)`` explicitly, and ``self.region``
+    # comes from ``GCPModule.get_region()``, which prefers GCP
+    # metadata-server/ADC identity auto-detection ahead of any config value
+    # (see ``modules/gcp/tools/service_account.py``). This field only
+    # backstops that when identity auto-detection is unavailable (e.g. local
+    # dev without a metadata server).
+    location: Immutable[Optional[GcpLocation]] = Field(default_factory=lambda: os.getenv("REGION", GcpLocation.EUROPE_WEST1), description="The GCP region where the bucket will be created (e.g., 'europe-west1'). If not set, defaults to the application's region.")  # type: ignore[assignment]
     storage_class: Immutable[GcsStorageClass] = Field(default=GcsStorageClass.STANDARD, description="The default storage class for objects in the bucket.")
 
     # Mutable fields
     provision_enabled: Mutable[bool] = Field(
         default=True,
         description=(
-            "When False, ``GCPModule._on_post_create_catalog`` skips bucket "
-            "creation and marks the catalog ready immediately — useful when "
-            "a catalog reuses an externally-managed bucket. This is a "
+            "When False, the ``gcp_config`` provisioner persists the deterministic "
+            "bucket name without creating a real GCS bucket — useful when a catalog "
+            "reuses an externally-managed bucket. When True, ``gcp_bucket`` and "
+            "``gcp_eventing`` provisioners drive full bucket creation. This is a "
             "per-catalog provisioning gate, NOT an extension exposure toggle "
             "(the GCP module is always-on at the protocol layer; the canonical "
             "toggle lives on ``GcpModuleConfig.enabled``)."
@@ -191,8 +207,18 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "gcp")
 
-    project_id: Mutable[str] = Field(default=os.getenv("PROJECT_ID", "local-project"), description="The GCP Project ID.")
-    region: Mutable[str] = Field(default=os.getenv("REGION", "europe-west1"), description="The default GCP region.")
+    # ``default_factory`` (not a bare ``default=os.getenv(...)``) is a
+    # deliberate, reviewed exception to routing env-sourcing through a
+    # cold-boot seed preset (geoid#2830 C6) — see the longer rationale on
+    # ``GcpCatalogBucketConfig.location`` above. Production project_id/region
+    # resolution is dominated by ``GCPModule.get_project_id()``/
+    # ``get_region()``, which prefer GCP metadata-server/ADC identity
+    # auto-detection ahead of this field entirely; these fields only
+    # backstop that when identity auto-detection is unavailable. An operator
+    # can always override the persisted value via the Configs API regardless
+    # of this default.
+    project_id: Mutable[str] = Field(default_factory=lambda: os.getenv("PROJECT_ID", "local-project"), description="The GCP Project ID.")
+    region: Mutable[str] = Field(default_factory=lambda: os.getenv("REGION", "europe-west1"), description="The default GCP region.")
 
     # Visibility and Propagation Tuning (Critical for tests)
     catalog_visibility_max_retries: Mutable[int] = Field(
@@ -232,6 +258,124 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
                     "cover the spawn→capture gap before leaving it to the "
                     "MaintenanceSupervisor task_reaper job."
     )
+    liveness_backstop_interval_seconds: Mutable[int] = Field(
+        default=60,
+        description="How often (seconds) the RUN_EVERYWHERE liveness backstop "
+                    "(#2771) scans for lapsed-lease Cloud Run task rows the "
+                    "LEADER_ONLY liveness reconciler has failed to reach. Runs on "
+                    "every pod regardless of leader election, so it keeps healing "
+                    "stuck jobs even when the leader loop is starved."
+    )
+    liveness_backstop_stale_multiplier: Mutable[float] = Field(
+        default=3.0,
+        description="A lapsed-lease row only trips the backstop once its lease has "
+                    "been expired for at least this many multiples of "
+                    "liveness_reconciler_interval_seconds — long enough that a "
+                    "healthy reconciler would certainly have already reached it, so "
+                    "ordinary cadence jitter between reconciler passes never fires "
+                    "the backstop."
+    )
+    liveness_staleness_grace_seconds: Mutable[int] = Field(
+        default=60,
+        description="geoid#2819: grace window (seconds) added on top of a bare "
+                    "lapsed lease before the non-locking staleness scan reports a "
+                    "row. Filters out rows that merely lapsed within the last tick "
+                    "or two, so only rows old enough that the FOR UPDATE SKIP "
+                    "LOCKED scan would certainly have already reached them are "
+                    "considered candidates for the visible-but-unclaimable check."
+    )
+    liveness_staleness_max_passes: Mutable[int] = Field(
+        default=2,
+        ge=1,
+        description="geoid#2819: number of consecutive reconciler passes a row may "
+                    "appear in the non-locking staleness scan without also being "
+                    "claimed by the FOR UPDATE SKIP LOCKED scan before it is logged "
+                    "as visible-but-unclaimable (loud warning) and a lock-free heal "
+                    "attempt is made via the same probe+owner-guarded-write path "
+                    "the on-demand GET healer (reconcile_task_liveness) uses."
+    )
+
+    # --- GCS retry and per-bucket circuit breaker ---
+    gcs_retry_max_attempts: Mutable[int] = Field(
+        default=3,
+        description=(
+            "Total attempt budget for transient GCS operation failures "
+            "(e.g. bucket CORS patch). 1 means no retry. Each non-final failure "
+            "emits a structured 'gcs_operation_retry' log line suitable for a "
+            "GCP log-based metric. Read per-call via the central cached config "
+            "getter — changes take effect immediately without a pod restart."
+        ),
+    )
+    gcs_breaker_failure_threshold: Mutable[int] = Field(
+        default=5,
+        description=(
+            "Consecutive transient GCS failures before the per-bucket circuit "
+            "breaker opens. Prevents hammering a wedged GCS endpoint during a "
+            "degradation event. Mirrors the indexer-breaker failure_threshold "
+            "semantics in CircuitBreaker. Changes apply live via the config-change "
+            "apply-handler — no pod restart required. Existing per-bucket circuit "
+            "state (open/half-open, failure counts) is preserved on update."
+        ),
+    )
+    gcs_breaker_cooldown_seconds: Mutable[float] = Field(
+        default=30.0,
+        description=(
+            "Seconds the per-bucket circuit breaker stays OPEN before allowing "
+            "a HALF_OPEN probe through. Mirrors the indexer-breaker "
+            "cooldown_seconds semantics in CircuitBreaker. Changes apply live via "
+            "the config-change apply-handler — no pod restart required. Existing "
+            "per-bucket circuit state is preserved on update."
+        ),
+    )
+
+class GcpTileCacheConfig(PluginConfig):
+    """Config for the GCS implementation of ``TileStorageProtocol``.
+
+    Addressed under the GCP module but organized by the protocol it backs
+    (``…/gcp/tile_storage``), so a different module/plugin implementing the same
+    ``TileStorageProtocol`` (e.g. an on-prem local-disk cache) declares its own
+    sibling config at ``("platform", "modules", "<module>", "tile_storage")``
+    rather than overloading the backend-agnostic ``TilesCachingConfig``. Keeping
+    the GCS bucket knob here means non-GCP deployments never see it.
+    """
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "gcp", "tile_storage")
+
+    cache_bucket: Mutable[Optional[str]] = Field(
+        default=None,
+        min_length=3,
+        max_length=222,
+        description=(
+            "Optional external/unmanaged GCS bucket for the tile cache. When "
+            "None (default) each catalog's tiles cache in its own provisioned "
+            "bucket. When set, ALL tile reads/writes/deletes use THIS bucket "
+            "instead, with ``catalog_id`` folded into the key prefix to preserve "
+            "per-catalog isolation in the shared bucket. geoid does not provision "
+            "or manage this bucket: it must already exist and the service account "
+            "must hold read/write on it (existence is verified on the write "
+            "path). Path within the bucket: "
+            "``{cache_prefix or TilesCachingConfig.key_prefix/catalog_id}/"
+            "{collection_id}/{tms_id}/{z}/{x}/{y}.{format}``."
+        ),
+    )
+
+    cache_prefix: Mutable[Optional[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Optional object-key prefix WITHIN ``cache_bucket`` (ignored when "
+            "``cache_bucket`` is None). When None (default) the prefix is "
+            "``{TilesCachingConfig.key_prefix}/{catalog_id}`` — the catalog_id "
+            "fold keeps catalogs isolated in a shared bucket. When set, this "
+            "exact prefix is used verbatim (no catalog fold), so an operator can "
+            "co-locate a catalog's tile cache with its source data — e.g. a "
+            "preset that ingests ``gs://bucket/dir/file.gpkg`` sets "
+            "``cache_prefix='dir/file/<catalog_id>'`` to land tiles in a folder "
+            "named after the source file, alongside it (the catalog_id segment "
+            "keeps catalogs isolated). Full key then: "
+            "``{cache_prefix}/{collection_id}/{tms_id}/{z}/{x}/{y}.{format}``."
+        ),
+    )
+
 
 class TriggeredAction(BaseModel):
     """Defines a process to be triggered by a GCS event."""

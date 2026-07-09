@@ -27,35 +27,49 @@ loaded-but-inactive provider can no longer wedge the catalog.
 Model
 -----
 
-- A module registers a *provisioner* with a stable ``key`` and an ``is_active``
-  predicate ``async (catalog_id, conn) -> bool``. The predicate decides, per
-  catalog, whether that provisioner has asynchronous setup work that the catalog
-  must wait for before it is usable.
+- A module registers a *provisioner* with a stable ``key``, an ``is_active``
+  predicate ``async (catalog_id, conn) -> bool``, a ``priority`` (lower runs
+  first; equal-priority provisioners are eligible to run in parallel), and a
+  ``scope`` (``"catalog"`` or ``"collection"``).
+- Optional ``provision`` and ``deprovision`` callables carry the provisioner's
+  actual setup/teardown logic; the registry stores them but does not invoke them
+  directly — that responsibility belongs to the executor task (PR2+).
 - At catalog creation the checklist is materialised from the *active*
   provisioners (:func:`ProvisioningRegistry.build_checklist`) — every active
   provisioner's key starts ``"pending"``. Building the full checklist up front
   means a step that completes early cannot prematurely flip the catalog ready
-  while a slower step is still outstanding (the barrier).
+  while a slower step is still outstanding (the barrier). Provisioners are
+  iterated in ``(priority, key)`` order so the resulting dict's insertion order
+  is deterministic.
 - An empty checklist means nothing must be awaited — the catalog is ready
   immediately.
 - Each provisioner marks its item terminal when its work finishes —
   synchronously, or later from its async task — via
   ``CatalogsProtocol.mark_provisioning_step``.
 - :func:`evaluate_checklist` is the terminal rule (the "default last" step):
-  when every item is terminal-good (``complete``/``skipped``) the catalog
-  becomes ``ready``; any ``failed`` item makes it ``failed``; otherwise it stays
-  ``provisioning``.
+  when every item is terminal-good (``complete``/``skipped``/``deferred``) the
+  catalog becomes ``ready``; any ``failed`` item makes it ``failed``; otherwise
+  it stays ``provisioning``.
 
 ``skipped`` vs ``failed``: a provisioner that, at execution time, discovers it
 is not actually able to act for this deployment (e.g. GCP enabled by config but
 the host has no usable credentials) marks its step ``skipped`` so the catalog
 still becomes ready. ``failed`` is reserved for a genuine provisioning error.
+
+``deferred`` (un-fao/GeoID#2678): a ``deferrable`` provisioner intentionally
+held back by a ``?hints=defer`` create. Unlike ``skipped`` (the provisioner
+decided at execution time it has nothing to do), ``deferred`` means "there
+IS work, it was deliberately not run yet" — a distinction
+``reset_checklist_for_reprovision`` uses to leave it alone on a generic
+reprovision run instead of folding it back in as ``pending``.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional
+from dataclasses import dataclass, field
+from itertools import groupby
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +79,15 @@ __all__ = [
     "STEP_FAILED",
     "STEP_SKIPPED",
     "STEP_DEGRADED",
+    "STEP_DEFERRED",
     "STATUS_PROVISIONING",
+    "STATUS_DELETING",
     "STATUS_READY",
     "STATUS_FAILED",
+    "SCOPE_CATALOG",
+    "SCOPE_COLLECTION",
+    "LocalizedText",
+    "Provisioner",
     "ProvisioningRegistry",
     "provisioning_registry",
     "evaluate_checklist",
@@ -83,18 +103,96 @@ STEP_SKIPPED = "skipped"
 # still reaches ``ready`` — the feature is unavailable but storage/STAC works.
 # Operators can repair via POST /catalog/catalogs/{id}/reprovision.
 STEP_DEGRADED = "degraded"
+# ``deferred``: a ``deferrable`` provisioner that was intentionally held back
+# by a ``?hints=defer`` create (un-fao/GeoID#2678). Terminal-good like
+# ``skipped`` — it never blocks readiness — but distinct so
+# ``reset_checklist_for_reprovision`` can tell "never ran, on purpose" from
+# "ran and finished"/"not applicable" and leave it alone on a generic
+# reprovision run instead of folding it back in as ``pending``. A caller that
+# wants the deferred work to actually run opts back in explicitly (the
+# ``catalog_provision`` task's ``include_deferred=True`` input).
+STEP_DEFERRED = "deferred"
 
 # Catalog-level ``provisioning_status`` values this module drives.
 STATUS_PROVISIONING = "provisioning"
+STATUS_DELETING = "deleting"
 STATUS_READY = "ready"
 STATUS_FAILED = "failed"
 
+# Scope constants: ``SCOPE_CATALOG`` provisioners run at catalog-creation time;
+# ``SCOPE_COLLECTION`` provisioners run at collection-creation time.
+SCOPE_CATALOG = "catalog"
+SCOPE_COLLECTION = "collection"
+
 # Terminal-good states: catalog flips to ``ready`` when all steps are in this set.
 # ``degraded`` is intentionally included — a degraded step must not block readiness.
-_TERMINAL_GOOD = frozenset({STEP_COMPLETE, STEP_SKIPPED, STEP_DEGRADED})
+# ``deferred`` is included too — a deferred-at-birth catalog must still reach
+# ``ready`` on its non-deferred steps alone (un-fao/GeoID#2678).
+_TERMINAL_GOOD = frozenset({STEP_COMPLETE, STEP_SKIPPED, STEP_DEGRADED, STEP_DEFERRED})
 
 # ``async (catalog_id, conn) -> bool``
 ProvisionerPredicate = Callable[[str, Optional[Any]], Awaitable[bool]]
+
+
+# Multilanguage text: a plain string or a ``{language-code: text}`` map (BCP-47
+# language tags, e.g. ``{"en": "GCP bucket", "fr": "Seau GCP"}``).  A plain
+# string is treated as English by convention.
+LocalizedText = Union[str, Dict[str, str]]
+
+
+@dataclass(frozen=True)
+class Provisioner:
+    """Immutable record describing a single registered provisioner.
+
+    Fields
+    ------
+    key
+        Stable identifier; appears as a key in the provisioning checklist.
+    is_active
+        Async predicate ``(catalog_id, conn) -> bool``. When it returns
+        ``True`` the provisioner contributes a ``"pending"`` entry to the
+        checklist for that catalog.
+    priority
+        Execution order hint (lower = earlier). Equal-priority provisioners
+        are eligible to run in parallel.  Defaults to ``100``.
+    scope
+        Either :data:`SCOPE_CATALOG` (runs at catalog-creation time) or
+        :data:`SCOPE_COLLECTION` (runs at collection-creation time).
+    deferrable
+        Marks this provisioner as *eligible to be deferred* past catalog
+        creation. It still runs at creation time by default; it is held back
+        only when the create request opts in with ``?hints=defer``
+        (:func:`build_checklist` / :func:`active_provisioners` called with
+        ``defer=True``). Deferring lets a catalog be created core-only (tenant
+        schema) and configured before its storage-backend provisioning runs —
+        e.g. a records-only catalog can set ``provision_enabled=false`` before
+        any GCS bucket is created — then provisioned by an explicit
+        ``catalog_provision`` task. Defaults to ``False`` (never deferrable;
+        always part of the creation-time checklist).
+    name
+        Human-readable display name for this provisioning step.  Accepts a
+        plain string (English) or a ``{lang: text}`` multilanguage map, e.g.
+        ``{"en": "GCP Bucket", "fr": "Seau GCP"}``.  Surfaces in the catalog
+        status API so a UI can label each checklist item.
+    description
+        Longer explanation of what this provisioner does.  Same multilanguage
+        format as ``name``.  Surfaces in the catalog status API.
+    provision
+        Optional callable carrying the provisioner's setup logic.  The
+        registry stores it; the executor task invokes it.
+    deprovision
+        Optional callable carrying the provisioner's teardown logic.
+    """
+
+    key: str
+    is_active: ProvisionerPredicate
+    priority: int = field(default=100)
+    scope: str = field(default=SCOPE_CATALOG)
+    deferrable: bool = field(default=False)
+    name: Optional[LocalizedText] = field(default=None)
+    description: Optional[LocalizedText] = field(default=None)
+    provision: Optional[Callable[..., Any]] = field(default=None)
+    deprovision: Optional[Callable[..., Any]] = field(default=None)
 
 
 def evaluate_checklist(checklist: Optional[Dict[str, str]]) -> Optional[str]:
@@ -102,14 +200,16 @@ def evaluate_checklist(checklist: Optional[Dict[str, str]]) -> Optional[str]:
 
     Returns:
         - :data:`STATUS_READY` when there are no items, or every item is
-          terminal-good (``complete``/``skipped``/``degraded``);
+          terminal-good (``complete``/``skipped``/``degraded``/``deferred``);
         - :data:`STATUS_FAILED` when any item is ``failed``;
         - ``None`` when at least one item is still ``pending`` (no change —
           the catalog stays ``provisioning``).
 
     ``degraded`` steps are terminal-good: the catalog becomes usable for
     storage/STAC even when a best-effort provisioning step (e.g. eventing)
-    could not complete.
+    could not complete. ``deferred`` steps are terminal-good too: a
+    ``?hints=defer`` create must still reach ``ready`` on its non-deferred
+    steps alone (un-fao/GeoID#2678).
     """
     if not checklist:
         return STATUS_READY
@@ -125,17 +225,69 @@ class ProvisioningRegistry:
     """Process-wide registry of catalog provisioners (one instance, below).
 
     Keyed by the provisioner ``key`` so a module re-registering (test reloads,
-    repeated lifespan) is naturally idempotent — the latest predicate wins.
+    repeated lifespan) is naturally idempotent — the latest registration wins.
+
+    Provisioners carry a ``priority`` and a ``scope``.  :meth:`build_checklist`
+    and :meth:`active_provisioners` filter by scope and iterate in
+    ``(priority, key)`` order so the output order is deterministic.
     """
 
     def __init__(self) -> None:
-        self._provisioners: Dict[str, ProvisionerPredicate] = {}
+        self._provisioners: Dict[str, Provisioner] = {}
 
-    def register(self, key: str, is_active: ProvisionerPredicate) -> None:
-        """Register (or replace) a provisioner contributing checklist item ``key``."""
+    def register(
+        self,
+        key: str,
+        is_active: ProvisionerPredicate,
+        *,
+        priority: int = 100,
+        scope: str = SCOPE_CATALOG,
+        deferrable: bool = False,
+        name: Optional[LocalizedText] = None,
+        description: Optional[LocalizedText] = None,
+        provision: Optional[Callable[..., Any]] = None,
+        deprovision: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        """Register (or replace) a provisioner contributing checklist item ``key``.
+
+        Parameters
+        ----------
+        key
+            Non-empty stable identifier; used as the checklist key.
+        is_active
+            Async predicate deciding, per catalog/collection, whether this
+            provisioner has work that must be awaited.
+        priority
+            Execution-order hint (lower = earlier).  Defaults to ``100``.
+        scope
+            :data:`SCOPE_CATALOG` or :data:`SCOPE_COLLECTION`.
+        deferrable
+            When ``True`` the provisioner may be held back from the
+            creation-time checklist on a deferred create (``?hints=defer``) and
+            run later by an explicit provision task. Defaults to ``False`` (runs
+            at creation time like any other provisioner).
+        name
+            Human-readable step name; plain string or ``{lang: text}`` map.
+        description
+            Longer explanation; plain string or ``{lang: text}`` map.
+        provision
+            Optional setup callable stored for use by the executor task.
+        deprovision
+            Optional teardown callable stored for use by the executor task.
+        """
         if not key:
             raise ValueError("provisioner key must be a non-empty string")
-        self._provisioners[key] = is_active
+        self._provisioners[key] = Provisioner(
+            key=key,
+            is_active=is_active,
+            priority=priority,
+            scope=scope,
+            deferrable=deferrable,
+            name=name,
+            description=description,
+            provision=provision,
+            deprovision=deprovision,
+        )
         logger.info("Registered catalog provisioner '%s'", key)
 
     def unregister(self, key: str) -> None:
@@ -148,27 +300,109 @@ class ProvisioningRegistry:
     def keys(self) -> list[str]:
         return list(self._provisioners.keys())
 
+    def _sorted_provisioners(
+        self, scope: str, *, defer: bool = False
+    ) -> list[Provisioner]:
+        """Return provisioners matching ``scope``, sorted by ``(priority, key)``.
+
+        By default every matching provisioner is returned. When ``defer`` is
+        set, provisioners marked ``deferrable`` are held back — this is the
+        ``?hints=defer`` create path; the default (and the explicit provision
+        task) includes them.
+        """
+        return sorted(
+            (
+                p
+                for p in self._provisioners.values()
+                if p.scope == scope and not (defer and p.deferrable)
+            ),
+            key=lambda p: (p.priority, p.key),
+        )
+
     async def build_checklist(
-        self, catalog_id: str, conn: Optional[Any] = None
+        self,
+        catalog_id: str,
+        conn: Optional[Any] = None,
+        *,
+        scope: str = SCOPE_CATALOG,
+        defer: bool = False,
     ) -> Dict[str, str]:
         """Materialise the checklist for ``catalog_id`` from active provisioners.
 
-        Every active provisioner's key maps to ``"pending"``. A predicate that
-        raises is treated as inactive (logged) — a misbehaving provisioner must
-        never block catalog readiness.
+        Only provisioners whose ``scope`` matches ``scope`` are considered.
+        They are evaluated in ``(priority, key)`` order so the resulting dict's
+        insertion order is deterministic.
+
+        By default every active provisioner participates and maps to
+        ``"pending"``. When ``defer`` is ``True`` (a ``?hints=defer`` create) an
+        active ``deferrable`` provisioner is NOT held back from the checklist
+        — it is recorded with the terminal ``"deferred"`` state instead
+        (un-fao/GeoID#2678). Persisting the decision this way, rather than
+        simply omitting the key, is what lets a later generic reprovision run
+        (:meth:`CatalogsProtocol.reset_checklist_for_reprovision`) recognise
+        the provisioner was intentionally held back and leave it alone instead
+        of folding it back in as ``pending``.
+
+        A predicate that raises is treated as inactive (logged) — a
+        misbehaving provisioner must never block catalog readiness.
         """
         checklist: Dict[str, str] = {}
-        for key, predicate in self._provisioners.items():
+        for provisioner in sorted(
+            (p for p in self._provisioners.values() if p.scope == scope),
+            key=lambda p: (p.priority, p.key),
+        ):
             try:
-                if await predicate(catalog_id, conn):
-                    checklist[key] = STEP_PENDING
+                if not await provisioner.is_active(catalog_id, conn):
+                    continue
             except Exception:  # noqa: BLE001 — a bad predicate can't wedge readiness
                 logger.warning(
                     "Provisioner '%s' is_active predicate failed for catalog '%s'; "
                     "treating as inactive.",
-                    key, catalog_id, exc_info=True,
+                    provisioner.key, catalog_id, exc_info=True,
                 )
+                continue
+            checklist[provisioner.key] = (
+                STEP_DEFERRED if (defer and provisioner.deferrable) else STEP_PENDING
+            )
         return checklist
+
+    async def active_provisioners(
+        self,
+        catalog_id: str,
+        conn: Optional[Any] = None,
+        *,
+        scope: str = SCOPE_CATALOG,
+        defer: bool = False,
+    ) -> List[List[Provisioner]]:
+        """Return the active provisioners for ``scope``, grouped by priority.
+
+        Each inner list contains provisioners that share the same ``priority``
+        and are eligible to run in parallel.  The outer list is ordered
+        ascending by priority (run group 0 first, then group 1, …).
+
+        ``defer`` mirrors :meth:`build_checklist`: when ``True`` the
+        ``deferrable`` provisioners are held back (the ``?hints=defer`` create
+        run), so the executor runs exactly the steps the checklist contains.
+
+        Provisioners whose ``is_active`` predicate returns ``False`` or raises
+        are excluded (same fail-soft semantics as :meth:`build_checklist`).
+        """
+        active: list[Provisioner] = []
+        for provisioner in self._sorted_provisioners(scope, defer=defer):
+            try:
+                if await provisioner.is_active(catalog_id, conn):
+                    active.append(provisioner)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Provisioner '%s' is_active predicate failed for catalog '%s'; "
+                    "excluding from active list.",
+                    provisioner.key, catalog_id, exc_info=True,
+                )
+
+        groups: List[List[Provisioner]] = []
+        for _, group in groupby(active, key=lambda p: p.priority):
+            groups.append(list(group))
+        return groups
 
 
 # Module-level singleton (mirrors ``lifecycle_registry``).

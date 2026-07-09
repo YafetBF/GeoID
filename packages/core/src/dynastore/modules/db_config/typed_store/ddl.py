@@ -18,9 +18,11 @@
 
 """DDL for the PostgreSQL :class:`TypedStore` backend.
 
-Three scope-specific tables + one content-addressed schema registry:
+Three scope-specific config tables. JSON schemas are not persisted — they are
+generated on demand from the registered class (``cls.model_json_schema()``);
+each config row carries the content-addressed ``schema_id`` (sha256) as a plain
+version tag for drift detection.
 
-* ``configs.schemas`` — global schema registry (content-addressed by sha256).
 * ``configs.platform_configs`` — global, keyed by ``ref_key`` (Cycle F.4c.1).
 * ``"<tenant_schema>".catalog_configs`` — per-tenant, keyed by ``ref_key``.
 * ``"<tenant_schema>".collection_configs`` — per-tenant, keyed by
@@ -52,21 +54,10 @@ COLLECTION_CONFIGS_TABLE = "collection_configs"
 PLATFORM_SCHEMAS_DDL = f"""
 CREATE SCHEMA IF NOT EXISTS {CONFIGS_SCHEMA};
 
-CREATE TABLE IF NOT EXISTS {CONFIGS_SCHEMA}.schemas (
-    schema_id    TEXT        PRIMARY KEY,
-    class_key    TEXT        NOT NULL,
-    schema_json  JSONB       NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by   TEXT
-);
-
-CREATE INDEX IF NOT EXISTS ix_schemas_class_key
-    ON {CONFIGS_SCHEMA}.schemas (class_key);
-
 CREATE TABLE IF NOT EXISTS {CONFIGS_SCHEMA}.platform_configs (
     ref_key     TEXT        PRIMARY KEY,
     class_key   TEXT        NOT NULL,
-    schema_id   TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
+    schema_id   TEXT        NOT NULL,
     config_data JSONB       NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -111,6 +102,46 @@ CREATE INDEX IF NOT EXISTS task_capability_registry_mandatory_idx
 """
 
 
+# Leader-lease table for transaction-mode-pooler-safe leader election.
+# Must live in the configs schema alongside platform_configs.  Created
+# idempotently at startup inside initialize_storage; never ALTER-ed in place.
+# The leading CREATE SCHEMA IF NOT EXISTS makes the DDL self-contained so it
+# survives a multi-worker cold-start race where the schema-create step is
+# skipped (same reasoning as TASK_CAPABILITY_REGISTRY_DDL above).
+LEADER_LEASE_DDL = """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.leader_lease (
+    lock_key    BIGINT      PRIMARY KEY,
+    lock_name   TEXT        NOT NULL,
+    owner       TEXT        NOT NULL,
+    epoch       BIGINT      NOT NULL DEFAULT 1,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+"""
+
+
+# Per-instance liveness heartbeat (geoid#2924). One row per running process
+# (keyed by the per-process instance id minted at import time — see
+# dynastore.modules.db_config.instance.get_instance_id), renewed on a cheap
+# cadence by every pod. configs.leader_lease only carries a row for whichever
+# pod currently holds a given lease, so it cannot answer "is this specific
+# instance alive" for a pod that never won an election; this table can. The
+# zombie-session reaper (modules/db/zombie_session_reaper.py) uses "no row, or
+# a row stale past a generous grace window" as proof an instance is gone.
+# Created idempotently alongside the other configs-schema tables; never
+# ALTER-ed in place.
+INSTANCE_LIVENESS_DDL = """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.instance_liveness (
+    instance_id TEXT        PRIMARY KEY,
+    service     TEXT        NOT NULL,
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
 def tenant_configs_ddl(tenant_schema: str) -> str:
     """Return idempotent DDL for the two per-tenant typed-config tables.
 
@@ -122,7 +153,7 @@ def tenant_configs_ddl(tenant_schema: str) -> str:
     CREATE TABLE IF NOT EXISTS "{tenant_schema}".catalog_configs (
         ref_key     TEXT        PRIMARY KEY,
         class_key   TEXT        NOT NULL,
-        schema_id   TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
+        schema_id   TEXT        NOT NULL,
         config_data JSONB       NOT NULL,
         updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -134,7 +165,7 @@ def tenant_configs_ddl(tenant_schema: str) -> str:
         collection_id TEXT        NOT NULL,
         ref_key       TEXT        NOT NULL,
         class_key     TEXT        NOT NULL,
-        schema_id     TEXT        NOT NULL REFERENCES {CONFIGS_SCHEMA}.schemas(schema_id),
+        schema_id     TEXT        NOT NULL,
         config_data   JSONB       NOT NULL,
         updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (collection_id, ref_key)

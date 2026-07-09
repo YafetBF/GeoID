@@ -74,6 +74,18 @@ class CachePluginConfig(PluginConfig):
         ),
     )
 
+    shared_backend_required: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, the shared Valkey backend is required for this "
+            "deployment: startup/reconnect probe failures are fatal or keep "
+            "the last healthy backend, and runtime failures must not silently "
+            "degrade distributed caches to local-only L1. Enable in "
+            "environments where cross-instance cache consistency is part of "
+            "the service contract."
+        ),
+    )
+
     oracle_inner_timeout_seconds: Mutable[float] = Field(
         default=0.5,
         ge=0.05,
@@ -85,5 +97,41 @@ class CachePluginConfig(PluginConfig):
             "response convoys peer dispatchers. On timeout the reaper "
             "fails-open (treats as live, never false-DLQs). "
             "0.5 s matches the db_pool_acquire slow-log threshold."
+        ),
+    )
+
+    slow_path_timeout_seconds: Mutable[float] = Field(
+        default=30.0,
+        ge=1,
+        le=120,
+        description=(
+            "Upper bound on a cache-miss slow path: per-key stampede lock "
+            "wait plus the factory rebuild call, for both "
+            "LocalCache.get_or_set() and the @cached decorator. Without this "
+            "a rebuild stalled behind a starved DB pool rides every queued "
+            "waiter to the caller's own timeout. On expiry, a stale value "
+            "still within its grace window is served instead (see "
+            "@cached(stale_grace=...))."
+        ),
+    )
+
+    max_concurrent_detached_rebuilds: Mutable[int] = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description=(
+            "Maximum number of detached cache-rebuild tasks (one per cache "
+            "key, see LocalCache.get_or_set()/@cached slow path) allowed to "
+            "run concurrently across the process. Each rebuild holds/queues "
+            "a DB connection for up to slow_path_timeout_seconds; under a "
+            "CPU-throttling storm dozens of simultaneous cache misses can "
+            "each spawn one, saturating the DB pool (#2900/#2902). Excess "
+            "rebuild candidates queue for a semaphore slot inside their own "
+            "detached task -- callers are unaffected since they already fall "
+            "back to a stale value or their own timeout while waiting. "
+            "Conservative default of 4 leaves headroom in the default pool "
+            "for foreground requests and the background-maintenance "
+            "semaphore. Hot-reloadable -- changes take effect immediately "
+            "without a pod restart. Must be in [1, 16]."
         ),
     )

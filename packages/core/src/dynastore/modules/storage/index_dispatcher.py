@@ -61,21 +61,25 @@ Phases
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
 from dynastore.models.protocols.indexer import (
     BulkResult,
     Indexer,
     IndexContext,
     IndexOp,
+    merge_bulk_results,
 )
-from dynastore.models.protocols.indexing import IndexableOp, OutboxStore
+from dynastore.models.protocols.indexing import IndexableOp
 from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     OperationDriverEntry,
+    WriteMode,
 )
+from dynastore.tools.execution_context import current_task_catalog, in_task_run
 
 
 # Public surface of the dispatcher accepts either the legacy
@@ -87,6 +91,16 @@ from dynastore.modules.storage.routing_config import (
 DispatchableOp = Union[IndexOp, IndexableOp]
 
 logger = logging.getLogger(__name__)
+
+# Mirrors TaskTableOutboxWriter.DEFAULT_CHUNK_SIZE; chunk the inline
+# in-task-run dispatch so a large batch never builds one oversized
+# driver call.
+INLINE_DISPATCH_CHUNK_SIZE = 500
+
+# Monotonic sequence stamped on every inline ``indexer.index_bulk`` call
+# (#2494 instrumentation) so a burst of same-second log lines can still be
+# ordered and counted per process.
+_INDEX_BULK_SEQUENCE = itertools.count(1)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +175,13 @@ class TaskTableOutboxWriter:
     The dedup_key is a stable hash of
     ``(indexer_id, entity_type, entity_id, op_type)`` so concurrent
     failures on the same item don't fan-out into multiple retry rows.
+
+    Deprecated: ``get_index_dispatcher()`` no longer wires this writer as
+    the default ``OUTBOX`` handler — see :class:`StoragePlaneOutboxWriter`,
+    which enqueues into the unified ``tasks.storage`` outbox instead. This
+    class stays importable/testable for the migration window (already
+    running deployments may still hold a reference to it) but new code
+    should not construct it as the dispatcher's ``outbox``.
     """
 
     TASK_TYPE = "index_propagation"
@@ -297,10 +318,10 @@ class TaskTableOutboxWriter:
             ctx.pg_conn,
             sql=f"""
                 INSERT INTO {task_schema}.tasks (
-                    task_id, schema_name, scope, caller_id, task_type, type,
+                    task_id, catalog_id, scope, caller_id, task_type, type,
                     execution_mode, inputs, collection_id, dedup_key, status
                 ) VALUES (
-                    :task_id, :schema_name, 'CATALOG', :caller_id, :task_type,
+                    :task_id, :catalog_id, 'CATALOG', :caller_id, :task_type,
                     'task', 'ASYNCHRONOUS', CAST(:inputs AS jsonb),
                     :collection_id, :dedup_key, 'PENDING'
                 )
@@ -308,7 +329,7 @@ class TaskTableOutboxWriter:
             """,
             params=dict(
                 task_id=task_id,
-                schema_name=schema_name,
+                catalog_id=schema_name,
                 caller_id=f"index_dispatcher:{indexer_id}",
                 task_type=self.TASK_TYPE,
                 inputs=json.dumps(inputs, cls=CustomJSONEncoder),
@@ -369,6 +390,106 @@ class TaskTableOutboxWriter:
         )
 
 
+class StoragePlaneOutboxWriter:
+    """Outbox backed by the storage-plane ``tasks.storage`` table.
+
+    Replaces :class:`TaskTableOutboxWriter` as the ``OUTBOX`` failure-
+    policy handler (un-fao/GeoID#2732 step 1) — the same durable-retry
+    concept, on the plane ``storage_drain`` already drains, instead of a
+    second ``tasks.tasks`` outbox living behind ``index_propagation``.
+
+    Writes id-only rows via :func:`~dynastore.modules.storage.storage_emit.enqueue_storage_op_id_only`
+    on the caller's PG connection so the enqueue commits / rolls back
+    atomically with the upstream data write (same co-transactionality
+    contract as the legacy writer). Upsert rows carry no payload — the
+    drain re-reads canonical PG state at replay time, which is fresher
+    than a payload frozen at enqueue time. Delete rows are written with
+    ``op='delete'``: the drain's id-only canonical-reread branch only
+    fires for ``op == 'upsert'``, so a delete replays as an actual
+    delete, never as a doc rebuild.
+
+    ``chunk_size`` is accepted for :class:`OutboxWriterProtocol`
+    compatibility but unused — the storage plane already writes one row
+    per op, so there is no oversized-JSONB-blob concern to chunk against.
+    ``last_error`` has no dedicated column on ``tasks.storage``; it is
+    logged instead of persisted (the row itself is enough for the drain
+    to retry — operator triage reads the log line for the reason).
+    """
+
+    async def enqueue(
+        self,
+        *,
+        indexer_id: str,
+        ctx: IndexContext,
+        ops: Sequence[IndexOp],
+        last_error: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+    ) -> None:
+        if not ops:
+            return
+        if ctx.pg_conn is None:
+            # Without a caller TX we can't honour the atomicity guarantee —
+            # same degrade as TaskTableOutboxWriter.enqueue.
+            sample = ops[0]
+            logger.warning(
+                "StoragePlaneOutboxWriter: ctx.pg_conn is None — skipping "
+                "outbox enqueue for indexer '%s' on %s/%s/%s (+%d more). "
+                "Caller must pass an open PG connection on IndexContext "
+                "for the OUTBOX policy to be durable.",
+                indexer_id, sample.op_type, sample.entity_type,
+                sample.entity_id, max(len(ops) - 1, 0),
+            )
+            return
+
+        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.modules.storage.driver_instance_id import (
+            compute_driver_instance_id,
+        )
+        from dynastore.modules.storage.storage_emit import (
+            enqueue_storage_op_id_only,
+        )
+        from dynastore.tools.identifiers import generate_uuidv7
+
+        collection_id = ctx.collection or ""
+        records = [
+            OutboxRecord(
+                op_id=generate_uuidv7(),
+                driver_id=indexer_id,
+                driver_instance_id=compute_driver_instance_id(
+                    indexer_id, ctx.catalog, collection_id,
+                ),
+                collection_id=collection_id,
+                op=cast(Any, op.op_type),
+                item_id=op.entity_id,
+                payload={},
+                idempotency_key=op.entity_id,
+            )
+            for op in ops
+        ]
+        logger.info(
+            "index_chunk_emitted indexer=%s source=storage_plane_outbox "
+            "catalog=%s collection=%s chunk_size=%d",
+            indexer_id, ctx.catalog, ctx.collection, len(records),
+        )
+        if last_error:
+            logger.warning(
+                "StoragePlaneOutboxWriter: enqueueing %d op(s) for indexer "
+                "'%s' (catalog=%s collection=%s) after inline failure: %s",
+                len(records), indexer_id, ctx.catalog, ctx.collection,
+                last_error,
+            )
+        _log_dispatch_path(
+            mode="outbox_handoff",
+            indexer_id=indexer_id,
+            catalog=ctx.catalog,
+            collection=ctx.collection,
+            chunk_size=len(records),
+        )
+        await enqueue_storage_op_id_only(
+            ctx.pg_conn, catalog_id=ctx.catalog, rows=records,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Default factory — wires the dispatcher against the live routing config
 # and the protocol-discovery indexer registry
@@ -390,13 +511,97 @@ def _log_dispatch_path(
     # `index_dispatch_path_total{mode}` (counter on mode label) and
     # `index_chunk_size_bucket` (distribution on the chunk_size field).
     # `mode` is one of: post_commit_inline | outbox_handoff |
-    # partial_failure_drop (per-doc rejections from an otherwise-OK bulk; #2064).
+    # partial_failure_drop (per-doc rejections from an otherwise-OK bulk; #2064) |
+    # inline_in_task_run (ASYNC entry absorbed inline because the dispatch
+    # is already running inside a background task/job execution).
     logger.info(
         "index_dispatch_path mode=%s indexer=%s catalog=%s collection=%s "
         "chunk_size=%d",
         mode, indexer_id, catalog, collection, chunk_size,
     )
 
+
+
+async def _storage_plane_routing_enabled() -> bool:
+    """Read ``TasksPluginConfig.items_secondary_via_storage_plane``, hot-reloaded.
+
+    Mirrors the resolution pattern in
+    ``dynastore.modules.tasks.async_writer_backlog._resolve_threshold``:
+    fails open to the field default (``False``) when the platform configs
+    protocol is unavailable (early startup, tests) so an unreadable flag
+    degrades to the pre-#2494 dispatch path rather than raising.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is None:
+            return bool(
+                TasksPluginConfig.model_fields["items_secondary_via_storage_plane"].default
+            )
+        cfg = await config_mgr.get_config(TasksPluginConfig)
+        if isinstance(cfg, TasksPluginConfig):
+            return cfg.items_secondary_via_storage_plane
+    except Exception:  # noqa: BLE001 — config read is best-effort
+        logger.debug(
+            "IndexDispatcher: items_secondary_via_storage_plane flag "
+            "unavailable — defaulting to the legacy dispatch path.",
+            exc_info=True,
+        )
+    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+    return bool(TasksPluginConfig.model_fields["items_secondary_via_storage_plane"].default)
+
+
+async def _resolve_in_task_run_chunk_size() -> int:
+    """Read ``TasksPluginConfig.in_task_run_inline_chunk_size``, hot-reloaded.
+
+    Bounds the per-chunk size of the in-run absorption path (#2716) — a job
+    container's memory budget was sized for ITS OWN write path, not for
+    ``INLINE_DISPATCH_CHUNK_SIZE`` (500) full envelopes on top of it.
+    Mirrors the fail-open resolution pattern of
+    ``_storage_plane_routing_enabled``: falls back to the field default when
+    the platform configs protocol is unavailable (early startup, tests).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is None:
+            return int(
+                TasksPluginConfig.model_fields["in_task_run_inline_chunk_size"].default
+            )
+        cfg = await config_mgr.get_config(TasksPluginConfig)
+        if isinstance(cfg, TasksPluginConfig):
+            return cfg.in_task_run_inline_chunk_size
+    except Exception:  # noqa: BLE001 — config read is best-effort
+        logger.debug(
+            "IndexDispatcher: in_task_run_inline_chunk_size unavailable — "
+            "falling back to the field default.",
+            exc_info=True,
+        )
+    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+    return int(TasksPluginConfig.model_fields["in_task_run_inline_chunk_size"].default)
+
+
+def _task_run_absorption_allowed(catalog: str) -> bool:
+    """True when the currently running task run may absorb an ASYNC write
+    for *catalog* inline instead of enqueuing it to the durable outbox.
+
+    A task run that declared no catalog (``current_task_catalog() is
+    None`` — a cross-tenant/global task, or a call site that predates
+    catalog-scoped ``task_run_scope``, e.g. the Cloud Run Job entrypoint)
+    is treated as unrestricted, preserving the original #2621 behaviour.
+    A task run that DID declare a catalog may only absorb writes for that
+    SAME catalog — a write for any other catalog is foreign backlog that
+    belongs to the async-writer job, not to this job's memory budget
+    (#2716).
+    """
+    scoped = current_task_catalog()
+    return scoped is None or scoped == catalog
 
 
 def _make_default_routing_resolver():
@@ -520,7 +725,7 @@ def _make_default_indexer_registry():
 
 def get_index_dispatcher() -> IndexDispatcher:
     """Process-wide singleton dispatcher — reuses live resolvers +
-    :class:`TaskTableOutboxWriter` for the ``OUTBOX`` failure path +
+    :class:`StoragePlaneOutboxWriter` for the ``OUTBOX`` failure path +
     a per-indexer :class:`CircuitBreaker`.
     """
     global _DEFAULT_DISPATCHER
@@ -530,7 +735,7 @@ def get_index_dispatcher() -> IndexDispatcher:
         _DEFAULT_DISPATCHER = IndexDispatcher(
             routing_resolver=_make_default_routing_resolver(),
             indexer_registry=_make_default_indexer_registry(),
-            outbox=TaskTableOutboxWriter(),
+            outbox=StoragePlaneOutboxWriter(),
             breaker=CircuitBreaker(),
         )
     return _DEFAULT_DISPATCHER
@@ -611,7 +816,11 @@ class IndexDispatcher:
     # ------------------------------------------------------------------
 
     async def fan_out_bulk(
-        self, ctx: IndexContext, ops: Sequence[DispatchableOp],
+        self,
+        ctx: IndexContext,
+        ops: Sequence[DispatchableOp],
+        *,
+        tx_factory: Optional[Callable[[], Any]] = None,
     ) -> Dict[str, BulkResult]:
         """Dispatch a bulk of index ops across every configured indexer.
 
@@ -619,9 +828,31 @@ class IndexDispatcher:
         failures (a 207-style report).  Per-op failures inside an indexer
         are absorbed into ``BulkResult.failures``; an indexer raising
         applies ``FailurePolicy`` to the whole batch.
+
+        ``tx_factory`` (in-task-run inline path only): a zero-arg callable
+        returning an ``async with``-able transaction. When supplied, the
+        inline chunked dispatch opens a fresh short transaction per chunk
+        (bound to that chunk's ``pg_conn``) instead of running the whole
+        fan-out under one long-lived ``ctx.pg_conn`` — so a busy job never
+        parks a pooled connection with an open transaction across the full
+        sequential ES dispatch.
         """
         results: Dict[str, BulkResult] = {}
         entries = await self._index_entries(ctx)
+        if ops:
+            # #2657 instrumentation — one resolved-entry count per dispatch
+            # call so a routing-config regression that fans one batch out
+            # across an unexpectedly large entry set is visible in logs
+            # (the ×N amplification that drove the ES secondary-write
+            # runaway). DEBUG (review finding): this fires on EVERY
+            # dispatch call regardless of the #2494 storage-plane flag, so
+            # INFO would add unconditional log volume to every deployment.
+            logger.debug(
+                "index_dispatch_entries catalog=%s collection=%s "
+                "entity_type=%s op_count=%d entry_count=%d",
+                ctx.catalog, ctx.collection,
+                getattr(ctx, "entity_type", None), len(ops), len(entries),
+            )
         if ops and not entries:
             # #914 — dispatch-level silent no-op: ops were submitted but no
             # routing entry exists for this (catalog, collection,
@@ -654,52 +885,123 @@ class IndexDispatcher:
                     failures=rejected,
                 )
                 continue
-            result = await self._dispatch_bulk(entry, indexer, ctx, entry_ops)
-            # #914 — silent no-op trap: an indexer that returns
-            # ``BulkResult(total=N, succeeded=0, failed=0)`` (e.g. ES bulk
-            # response shape the driver doesn't parse) was previously
-            # indistinguishable from a real success in logs, leaving the
-            # target index empty with no warning.  Pure upsert no-ops are
-            # converted to retryable failures so the batch routes through the
-            # durable outbox path (``_enqueue_or_warn``) and
-            # ``IndexPropagationTask`` replays it post-commit.  Delete ops are
-            # unaffected — they have their own pass-through.
-            if result.total > 0 and result.succeeded == 0 and result.failed == 0:
-                logger.warning(
-                    "IndexDispatcher: indexer '%s' returned a silent no-op "
-                    "(total=%d, succeeded=0, failed=0) for catalog=%s "
-                    "collection=%s — index will be empty despite a "
-                    "'successful' dispatch. Check the driver's bulk-response "
-                    "parser. Routing upsert ops to outbox for durable retry.",
-                    entry.driver_ref, result.total,
-                    ctx.catalog, ctx.collection,
+            # Honor write_mode=ASYNC: enqueue to the outbox and skip the
+            # inline indexer call entirely.  The outbox worker drains the
+            # row in the background; the write path is not blocked on ES.
+            # BulkResult is built from the ACTUAL count returned by
+            # _enqueue_or_warn — if any of the three drop paths fires (no
+            # outbox, no pg_conn, transient PG error) the returned 0 flows
+            # through as succeeded=0/failed=N so _check_index_health
+            # escalates to FAILED instead of silently claiming success.
+            # #2494 P1: when the storage-plane flag is on and this is an
+            # item-tier ASYNC entry, ALWAYS route to id-only ``tasks.storage``
+            # obligations — regardless of ``in_task_run()``. The drain
+            # re-reads canonical PG state at replay time, so there is no
+            # snapshot to go stale and no reason to ever absorb the write
+            # inline (the in-task-run inline path is exactly the mechanism
+            # #2657 traced the ES secondary-write runaway to). Because this
+            # branch never falls through to ``_dispatch_bulk_chunked``, the
+            # noop-reenqueue (:1044) and partial-failure-resurface (:1054)
+            # amplifiers inside ``_dispatch_bulk`` cannot fire for these ops.
+            #
+            # Access-aware drivers are EXCLUDED (review finding, HIGH):
+            # ``read_canonical_index_inputs`` hardcodes ``access=None`` (it
+            # only reads the raw PG row), so a drain-time re-read can never
+            # recover ``_visibility``/``_owner``/``_attrs`` — those are
+            # write-time-only values that live in ``processing_context``
+            # (item_service.py's ``_resolve_access_envelope``) and are never
+            # persisted to a PG column. Routing an access-aware entry through
+            # this branch would silently drop row-level ABAC from the
+            # indexed document. Mirrors the ES-envelope detection branch of
+            # ``_collection_uses_access_aware_driver`` (item_service.py).
+            # Recovering the envelope at drain time is tracked as a
+            # follow-up; until then these entries take the legacy path
+            # below unchanged — but #2716 still keeps them off the in-run
+            # absorption path (see ``storage_plane_active`` below: the flag
+            # applies to every item-tier ASYNC entry, access-aware or not).
+            storage_plane_active = (
+                ctx.entity_type == "item"
+                and await _storage_plane_routing_enabled()
+            )
+            if (
+                entry.write_mode == WriteMode.ASYNC
+                and storage_plane_active
+                and not getattr(type(indexer), "applies_access_filter", False)
+            ):
+                actually_enqueued = await self._enqueue_storage_plane_ids(
+                    entry, ctx, entry_ops, tx_factory=tx_factory,
                 )
-                noop_upserts: List[DispatchableOp] = [
-                    o for o in entry_ops
-                    if (
-                        o.op == "upsert"
-                        if isinstance(o, IndexableOp)
-                        else o.op_type == "upsert"
-                    )
-                ]
-                if noop_upserts:
-                    await self._enqueue_or_warn(entry, ctx, noop_upserts)
-                    result = BulkResult(
-                        total=result.total,
-                        succeeded=result.succeeded,
-                        failed=result.failed + len(noop_upserts),
-                        failures=[
-                            *result.failures,
-                            *[
-                                {
-                                    "reason": "silent_noop",
-                                    "indexer": entry.driver_ref,
-                                    "entity_id": _op_entity_id(o),
-                                }
-                                for o in noop_upserts
-                            ],
-                        ],
-                    )
+                enqueue_ok = actually_enqueued == len(entry_ops)
+                _log_dispatch_path(
+                    mode="storage_plane_id_only_enqueued" if enqueue_ok
+                    else "storage_plane_enqueue_failed",
+                    indexer_id=entry.driver_ref,
+                    catalog=ctx.catalog,
+                    collection=ctx.collection,
+                    chunk_size=len(entry_ops),
+                )
+                storage_plane_failures: List[Dict[str, Any]] = (
+                    [{"reason": "storage_plane_enqueue_failed", "indexer": entry.driver_ref}]
+                    if not enqueue_ok else []
+                )
+                results[entry.driver_ref] = BulkResult(
+                    total=len(entry_ops) + len(rejected),
+                    succeeded=actually_enqueued,
+                    failed=(len(entry_ops) - actually_enqueued) + len(rejected),
+                    failures=storage_plane_failures + (rejected if rejected else []),
+                )
+                continue
+            # Exception: when this dispatch is already running inside a
+            # background task/job execution (``in_task_run()``), spawning an
+            # outbox row per chunk would fan out onto the serving pods that
+            # drain it — the write is instead absorbed inline below, in the
+            # running job. #2716 narrows the exception two ways so a busy
+            # job's memory budget is never spent on work that isn't its own:
+            # (a) ``storage_plane_active`` — the flag owner (storage_drain)
+            # already claimed item-tier obligations above; an access-aware
+            # entry that fell through here still must not be absorbed once
+            # the operator has opted into the storage plane; (b)
+            # ``_task_run_absorption_allowed`` — a task run that declared
+            # its own catalog via ``task_run_scope(catalog=...)`` may only
+            # absorb writes for THAT catalog; a write for any other catalog
+            # is foreign backlog that belongs to the async-writer job, not
+            # to this job's container. A task run with no declared catalog
+            # (``current_task_catalog() is None`` — e.g. the Cloud Run Job
+            # entrypoint, which predates catalog-scoped ``task_run_scope``)
+            # stays unrestricted, matching the original #2621 behaviour.
+            if entry.write_mode == WriteMode.ASYNC and not (
+                in_task_run()
+                and not storage_plane_active
+                and _task_run_absorption_allowed(ctx.catalog)
+            ):
+                actually_enqueued = await self._enqueue_or_warn(entry, ctx, entry_ops)
+                enqueue_ok = actually_enqueued == len(entry_ops)
+                _log_dispatch_path(
+                    mode="async_outbox_enqueued" if enqueue_ok else "async_enqueue_failed",
+                    indexer_id=entry.driver_ref,
+                    catalog=ctx.catalog,
+                    collection=ctx.collection,
+                    chunk_size=len(entry_ops),
+                )
+                enqueue_failures: List[Dict[str, Any]] = (
+                    [{"reason": "async_enqueue_failed", "indexer": entry.driver_ref}]
+                    if not enqueue_ok else []
+                )
+                results[entry.driver_ref] = BulkResult(
+                    total=len(entry_ops) + len(rejected),
+                    succeeded=actually_enqueued,
+                    failed=(len(entry_ops) - actually_enqueued) + len(rejected),
+                    failures=enqueue_failures + (rejected if rejected else []),
+                )
+                continue
+            # SYNC entries, and ASYNC entries absorbed inline because the
+            # dispatch is already running inside a task run, both land here:
+            # the write is chunked and dispatched inline through the same
+            # driver-agnostic path (silent no-op conversion lives inside
+            # ``_dispatch_bulk``, applied per chunk).
+            result = await self._dispatch_bulk_chunked(
+                entry, indexer, ctx, entry_ops, tx_factory=tx_factory,
+            )
             # Only log clean success when the batch genuinely has no failures
             # (placed after no-op conversion so a converted no-op — now
             # failed > 0 — does not appear in the success log).
@@ -851,10 +1153,11 @@ class IndexDispatcher:
 
         WARN dedupes per ``(driver_id, catalog, collection)`` so a
         deliberately-omitted driver doesn't flood the log on every op.
-        OUTBOX path requires the new :class:`IndexableOp` shape; legacy
-        :class:`IndexOp` callers fall back to the existing
-        :meth:`_enqueue_or_warn` path so the singular-``enqueue`` outbox
-        writer still receives them.
+        OUTBOX path degrades through :meth:`_enqueue_or_warn` for both
+        :class:`IndexableOp` and legacy :class:`IndexOp` shapes — the
+        singular-``enqueue`` outbox writer only accepts ``IndexOp``, so an
+        all-``IndexableOp`` batch is filtered out and dropped with a
+        warning there.
         """
         policy = entry.on_failure
         if policy == FailurePolicy.FATAL:
@@ -866,13 +1169,7 @@ class IndexDispatcher:
                 ),
             )
         if policy == FailurePolicy.OUTBOX:
-            if isinstance(op, IndexableOp):
-                await self._enqueue_outbox_record(entry, ctx, op)
-            else:
-                # Legacy IndexOp path — degrade through the existing
-                # enqueue-or-warn helper so behaviour is unchanged for
-                # callers still on the older value type.
-                await self._enqueue_or_warn(entry, ctx, [op])
+            await self._enqueue_or_warn(entry, ctx, [op])
             return
         if policy == FailurePolicy.WARN:
             key = (entry.driver_ref, ctx.catalog, ctx.collection)
@@ -886,63 +1183,6 @@ class IndexDispatcher:
                 )
             return
         # IGNORE — silent.
-
-    async def _enqueue_outbox_record(
-        self,
-        entry: OperationDriverEntry,
-        ctx: IndexContext,
-        op: IndexableOp,
-    ) -> None:
-        """Translate an :class:`IndexableOp` into an :class:`OutboxRecord`
-        and enqueue via the bulk :class:`OutboxStore` interface.
-
-        Used by :meth:`_handle_missing` when a driver is absent and the
-        routing entry says ``OUTBOX``.  When no outbox is wired, degrade
-        to a one-time WARN keyed identically to the missing-warning
-        dedupe so operators see exactly one signal per
-        ``(driver_id, catalog, collection)``.
-        """
-        if self._outbox is None:
-            key = ("__no_outbox__", entry.driver_ref, ctx.catalog, ctx.collection)
-            if key not in self._missing_warning_emitted:
-                self._missing_warning_emitted.add(key)
-                logger.warning(
-                    "IndexDispatcher: indexer '%s' missing AND no outbox "
-                    "wired (catalog=%s, collection=%s); op dropped per "
-                    "fallback.",
-                    entry.driver_ref, ctx.catalog, ctx.collection,
-                )
-            return
-        from dynastore.models.protocols.indexing import OutboxRecord
-        record = OutboxRecord(
-            op_id=op.op_id,
-            driver_id=entry.driver_ref,
-            driver_instance_id=op.driver_instance_id,
-            collection_id=op.collection_id,
-            op=op.op,
-            item_id=op.item_id,
-            payload=op.payload,
-            idempotency_key=op.idempotency_key,
-        )
-        # Outbox may implement the bulk OutboxStore Protocol
-        # (``enqueue_bulk``) or only the legacy singular
-        # ``OutboxWriterProtocol.enqueue`` — pick whichever the wired
-        # instance offers so the dispatcher stays compatible with both
-        # during the migration window.  ``OutboxStore`` is
-        # ``@runtime_checkable`` so we narrow via ``isinstance`` rather
-        # than ``getattr`` probing (project rule: Protocols over hasattr).
-        if isinstance(self._outbox, OutboxStore):
-            await self._outbox.enqueue_bulk(
-                None,
-                catalog_id=op.catalog_id,
-                rows=[record],
-            )
-            return
-        # Fall through to the legacy singular-enqueue path, which uses
-        # the IndexOp shape internally.  This shouldn't fire in practice
-        # for IndexableOp callers (they wire OutboxStore), but keeps the
-        # dispatcher resilient mid-migration.
-        await self._enqueue_or_warn(entry, ctx, [op])
 
     async def _ensure_or_handle(
         self,
@@ -1004,6 +1244,23 @@ class IndexDispatcher:
                 {"reason": "ensure_indexer_failed", "indexer": entry.driver_ref},
             ])
         try:
+            # #2494 instrumentation — reason bucket + op count + monotonic
+            # sequence for every inline ``index_bulk`` call. ``_dispatch_bulk``
+            # has one call site reached from ``_dispatch_bulk_chunked``
+            # (chunked SYNC dispatch, or an ASYNC entry absorbed inline
+            # during a task run pre-#2494-flag); "primary" covers it today.
+            # The remaining bucket names are reserved for future call sites
+            # that resurface a batch through this same path (ensure_retry /
+            # noop_reenqueue / partial_failure_resurface / transient_retry) —
+            # not yet exercised, so only "primary" is emitted. DEBUG (review
+            # finding): fires on every SYNC/inline dispatch regardless of
+            # the #2494 flag, so INFO would add unconditional volume.
+            logger.debug(
+                "index_bulk_call reason=primary indexer=%s catalog=%s "
+                "collection=%s op_count=%d seq=%d",
+                entry.driver_ref, ctx.catalog, ctx.collection, len(ops),
+                next(_INDEX_BULK_SEQUENCE),
+            )
             # ``Indexer.index_bulk`` is still typed against the legacy
             # ``IndexOp``; concrete implementations duck-type the op
             # fields they need.  The dispatcher's Union accepts both
@@ -1024,6 +1281,51 @@ class IndexDispatcher:
             # ``_handle_failure_bulk`` has already applied the on_failure
             # policy, so emitting for those too would double-signal.
             await self._surface_partial_failures(entry, ctx, result)
+            # #914 — silent no-op trap: an indexer that returns
+            # ``BulkResult(total=N, succeeded=0, failed=0)`` (e.g. ES bulk
+            # response shape the driver doesn't parse) was previously
+            # indistinguishable from a real success in logs, leaving the
+            # target index empty with no warning.  Pure upsert no-ops are
+            # converted to retryable failures so the batch routes through the
+            # durable outbox path (``_enqueue_or_warn``) and
+            # ``IndexPropagationTask`` replays it post-commit.  Delete ops are
+            # unaffected — they have their own pass-through.
+            if result.total > 0 and result.succeeded == 0 and result.failed == 0:
+                logger.warning(
+                    "IndexDispatcher: indexer '%s' returned a silent no-op "
+                    "(total=%d, succeeded=0, failed=0) for catalog=%s "
+                    "collection=%s — index will be empty despite a "
+                    "'successful' dispatch. Check the driver's bulk-response "
+                    "parser. Routing upsert ops to outbox for durable retry.",
+                    entry.driver_ref, result.total,
+                    ctx.catalog, ctx.collection,
+                )
+                noop_upserts: List[DispatchableOp] = [
+                    o for o in ops
+                    if (
+                        o.op == "upsert"
+                        if isinstance(o, IndexableOp)
+                        else o.op_type == "upsert"
+                    )
+                ]
+                if noop_upserts:
+                    await self._enqueue_or_warn(entry, ctx, noop_upserts)
+                    result = BulkResult(
+                        total=result.total,
+                        succeeded=result.succeeded,
+                        failed=result.failed + len(noop_upserts),
+                        failures=[
+                            *result.failures,
+                            *[
+                                {
+                                    "reason": "silent_noop",
+                                    "indexer": entry.driver_ref,
+                                    "entity_id": _op_entity_id(o),
+                                }
+                                for o in noop_upserts
+                            ],
+                        ],
+                    )
             return result
         except Exception as exc:
             if self._breaker is not None:
@@ -1035,6 +1337,74 @@ class IndexDispatcher:
                 failed=len(ops),
                 failures=[{"reason": str(exc), "indexer": entry.driver_ref}],
             )
+
+    async def _dispatch_bulk_chunked(
+        self,
+        entry: OperationDriverEntry,
+        indexer: Indexer,
+        ctx: IndexContext,
+        ops: Sequence[DispatchableOp],
+        *,
+        tx_factory: Optional[Callable[[], Any]] = None,
+    ) -> BulkResult:
+        """Split ``ops`` into ``INLINE_DISPATCH_CHUNK_SIZE``-sized chunks and
+        dispatch each one SEQUENTIALLY through :meth:`_dispatch_bulk`,
+        aggregating the per-chunk results into one.
+
+        Sequential on purpose — a bounded footprint per chunk is the whole
+        point of the inline-dispatch path (both the ordinary SYNC entry and
+        an ASYNC entry absorbed inline during a task run land here), so
+        chunks are never fanned out concurrently.
+
+        When ``tx_factory`` is supplied (the in-task-run inline path), each
+        chunk is dispatched under a FRESH short transaction whose connection
+        is stamped onto a per-chunk :class:`IndexContext` copy — the pooled
+        connection is held only across that one chunk's dispatch (kept open
+        so an on-failure outbox enqueue is still atomic) and released before
+        the next chunk. Without it, dispatch runs under the ambient
+        ``ctx.pg_conn`` (the serving SYNC path, unchanged).
+        """
+        if not ops:
+            return BulkResult()
+        # Distinguish the two callers that land here: an ASYNC entry absorbed
+        # inline during a task/job run vs. an ordinary SYNC entry chunked on the
+        # post-commit tail. Same code path, different provenance in the logs.
+        running_in_task = in_task_run()
+        chunk_mode = "inline_in_task_run" if running_in_task else "sync_chunked"
+        # #2716: a job container's memory budget is sized for its own write
+        # path, not for INLINE_DISPATCH_CHUNK_SIZE (500) full envelopes on
+        # top of it. Inside a task run, chunk at the smaller, hot-reloadable
+        # ``TasksPluginConfig.in_task_run_inline_chunk_size`` instead — the
+        # serving-path SYNC chunk size (this same code path outside a task
+        # run) is unaffected.
+        chunk_size = (
+            await _resolve_in_task_run_chunk_size()
+            if running_in_task
+            else INLINE_DISPATCH_CHUNK_SIZE
+        )
+        aggregated = BulkResult()
+        for start in range(0, len(ops), chunk_size):
+            chunk = ops[start:start + chunk_size]
+            if tx_factory is not None:
+                async with tx_factory() as chunk_conn:
+                    chunk_ctx = ctx.model_copy(update={"pg_conn": chunk_conn})
+                    chunk_result = await self._dispatch_bulk(
+                        entry, indexer, chunk_ctx, chunk,
+                    )
+            else:
+                chunk_result = await self._dispatch_bulk(entry, indexer, ctx, chunk)
+            _log_dispatch_path(
+                mode=chunk_mode,
+                indexer_id=entry.driver_ref,
+                catalog=ctx.catalog,
+                collection=ctx.collection,
+                chunk_size=len(chunk),
+            )
+            # Bounded merge (#2657) — an unbounded concat here was one of
+            # three uncapped accumulation sites driving peak RSS to
+            # O(dataset) instead of O(chunk) on a degraded secondary index.
+            aggregated = merge_bulk_results(aggregated, chunk_result)
+        return aggregated
 
     async def _handle_failure(
         self,
@@ -1197,15 +1567,41 @@ class IndexDispatcher:
         ops: Sequence[DispatchableOp],
         *,
         original: Optional[BaseException] = None,
-    ) -> None:
+    ) -> int:
         """Enqueue a batch of ops as chunked outbox rows when configured;
         otherwise degrade to WARN.
+
+        Returns the count of ops actually handed to the outbox writer (0 on any
+        drop path).  Callers on the primary ASYNC path (``write_mode=ASYNC``)
+        must use this count to build ``BulkResult`` so that health-check logic
+        can distinguish "all accepted" from "silently dropped" — the three drop
+        paths below all return 0, which the ASYNC branch propagates as
+        ``failed=N`` rather than the false-success ``succeeded=N``.
+
+        Callers on the SYNC on_failure=OUTBOX path ignore the return value;
+        their best-effort behaviour is unchanged.
 
         Accepts a list so a 500-item bulk failure becomes one chunked
         ``enqueue`` call rather than 500 per-row writes (see #500).
         """
         if not ops:
-            return
+            return 0
+        if in_task_run():
+            # #2494 instrumentation: with the storage-plane flag ON, item-tier
+            # ASYNC entries never reach this method (they route through
+            # ``_enqueue_storage_plane_ids`` instead) — this call firing while
+            # a task/job run is in progress should read ~0 once the flag is
+            # on. Non-item entries and SYNC on_failure=OUTBOX failures still
+            # legitimately land here regardless of the flag, so with the
+            # flag OFF this fires on every in-task-run ASYNC entry — DEBUG
+            # (review finding) so the default (flag-off) code path doesn't
+            # gain unconditional INFO volume.
+            logger.debug(
+                "index_dispatch_enqueue_or_warn_in_task_run indexer=%s "
+                "catalog=%s collection=%s op_count=%d",
+                entry.driver_ref, ctx.catalog, ctx.collection, len(ops),
+            )
+        # Drop path (a): no outbox writer wired.
         if self._outbox is None:
             if entry.driver_ref not in self._outbox_warning_emitted:
                 self._outbox_warning_emitted.add(entry.driver_ref)
@@ -1221,7 +1617,7 @@ class IndexDispatcher:
                     "(policy=outbox, degraded): %s",
                     entry.driver_ref, len(ops), original,
                 )
-            return
+            return 0
 
         # The legacy ``enqueue`` writer expects IndexOp shape; an
         # IndexableOp-only batch is skipped with a single warning rather
@@ -1234,7 +1630,7 @@ class IndexDispatcher:
                 "``enqueue`` method; cannot enqueue %d ops.",
                 entry.driver_ref, len(ops),
             )
-            return
+            return 0
         index_ops: List[IndexOp] = [
             cast(IndexOp, o) for o in ops if not isinstance(o, IndexableOp)
         ]
@@ -1245,7 +1641,19 @@ class IndexDispatcher:
                 "OutboxStore for the bulk path.",
                 len(ops), entry.driver_ref,
             )
-            return
+            return 0
+        # Drop path (b): caller has no open PG connection.
+        # ``TaskTableOutboxWriter.enqueue`` checks this too but returns silently
+        # without raising — catch it here so the ASYNC caller receives the real
+        # failed count rather than a false success.
+        if ctx.pg_conn is None:
+            logger.warning(
+                "IndexDispatcher: cannot enqueue %d op(s) for indexer '%s' — "
+                "ctx.pg_conn is None (no open TX); ops dropped. "
+                "Caller must supply an open PG connection for durable enqueue.",
+                len(index_ops), entry.driver_ref,
+            )
+            return 0
         try:
             await enqueue(
                 indexer_id=entry.driver_ref,
@@ -1253,16 +1661,109 @@ class IndexDispatcher:
                 ops=index_ops,
                 last_error=str(original) if original else None,
             )
+            return len(index_ops)
         except Exception as enqueue_exc:
-            # Outbox itself failed — last-resort WARN.  We do NOT escalate
-            # to FATAL here because the upstream caller has already chosen
-            # OUTBOX as a tolerant policy; surfacing this as fatal would
-            # surprise them.
+            # Drop path (c): transient PG error during enqueue.
+            # We do NOT escalate to FATAL here because the upstream caller has
+            # already chosen OUTBOX as a tolerant policy; surfacing this as
+            # fatal would surprise them.  The ASYNC caller converts 0 to
+            # failed=N so health-check can escalate via its own policy.
             logger.error(
                 "IndexDispatcher: outbox enqueue failed for indexer '%s' "
                 "on %d ops — original error: %s, enqueue error: %s",
                 entry.driver_ref, len(ops), original, enqueue_exc,
             )
+            return 0
+
+    async def _enqueue_storage_plane_ids(
+        self,
+        entry: OperationDriverEntry,
+        ctx: IndexContext,
+        ops: Sequence[DispatchableOp],
+        *,
+        tx_factory: Optional[Callable[[], Any]] = None,
+    ) -> int:
+        """Enqueue id-only ``tasks.storage`` obligations (#2494 P1).
+
+        Used for item-tier ASYNC secondary-index entries when
+        ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled.
+        Prefers ``ctx.pg_conn`` when the caller already has an open
+        transaction (the serving-path wrapping TX
+        ``ItemService._dispatch_index_upsert`` opens around the fan-out
+        call) so the enqueue is co-transactional with that TX; falls back to
+        opening a short transaction via ``tx_factory`` for the in-task-run
+        inline path. Returns the count of ops actually enqueued (0 on any
+        drop path), mirroring :meth:`_enqueue_or_warn`'s health-check
+        contract so ``BulkResult.succeeded`` reflects reality.
+        """
+        if not ops:
+            return 0
+        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.modules.storage.driver_instance_id import (
+            compute_driver_instance_id,
+        )
+        from dynastore.modules.storage.storage_emit import (
+            enqueue_storage_op_id_only,
+        )
+        from dynastore.tools.identifiers import generate_uuidv7
+
+        collection_id = ctx.collection or ""
+        records = [
+            OutboxRecord(
+                op_id=generate_uuidv7(),
+                driver_id=entry.driver_ref,
+                driver_instance_id=compute_driver_instance_id(
+                    entry.driver_ref, ctx.catalog, collection_id,
+                ),
+                collection_id=collection_id,
+                op=cast(Any, _op_kind(op)),
+                item_id=_op_entity_id(op),
+                # Ignored downstream: enqueue_storage_op_id_only always
+                # forces the explicit id-only sentinel onto op_payload
+                # (storage_emit.py) regardless of what's set here.
+                payload={},
+                idempotency_key=_op_entity_id(op),
+            )
+            for op in ops
+        ]
+
+        if ctx.pg_conn is not None:
+            try:
+                await enqueue_storage_op_id_only(
+                    ctx.pg_conn, catalog_id=ctx.catalog, rows=records,
+                )
+                return len(records)
+            except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
+                logger.error(
+                    "IndexDispatcher: storage-plane id-only enqueue failed "
+                    "for indexer '%s' (catalog=%s collection=%s): %s",
+                    entry.driver_ref, ctx.catalog, ctx.collection, exc,
+                )
+                return 0
+
+        if tx_factory is not None:
+            try:
+                async with tx_factory() as conn:
+                    await enqueue_storage_op_id_only(
+                        conn, catalog_id=ctx.catalog, rows=records,
+                    )
+                return len(records)
+            except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
+                logger.error(
+                    "IndexDispatcher: storage-plane id-only enqueue (short "
+                    "TX) failed for indexer '%s' (catalog=%s collection=%s): "
+                    "%s",
+                    entry.driver_ref, ctx.catalog, ctx.collection, exc,
+                )
+                return 0
+
+        logger.warning(
+            "IndexDispatcher: cannot enqueue %d storage-plane id-only op(s) "
+            "for indexer '%s' — no open PG connection and no tx_factory "
+            "supplied. Caller must supply one for durable enqueue.",
+            len(records), entry.driver_ref,
+        )
+        return 0
 
 
 def _op_payload(op: "DispatchableOp") -> Any:
@@ -1280,6 +1781,13 @@ def _op_entity_kind(op: "DispatchableOp") -> Any:
         # IndexableOp models the bulk-reindex path which is item-centric.
         return "item"
     return op.entity_type
+
+
+def _op_kind(op: "DispatchableOp") -> str:
+    """``"upsert"`` or ``"delete"``, regardless of which op shape is used."""
+    if isinstance(op, IndexableOp):
+        return op.op
+    return op.op_type
 
 
 def _with_payload(op: "DispatchableOp", payload: Any) -> "DispatchableOp":

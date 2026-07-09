@@ -53,12 +53,19 @@ from dynastore.models.tasks import (
     TaskUpdate,
     TaskStatusEnum,
     TaskExecutionMode,
+    TaskExecutionOverrides,
     Task,
 )
 from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.models.auth_models import SYSTEM_USER_ID
 
 logger = logging.getLogger(__name__)
+
+# Reserved key under which ``execution_overrides`` (TaskExecutionOverrides) are
+# serialised inside the task's ``inputs`` JSONB column so they survive the
+# PENDING→dispatch round-trip.  Popped in dispatch() before the inputs dict
+# is handed to the runner, so runners never see this internal key.
+_EXECUTION_OVERRIDES_KEY = "__execution_overrides__"
 
 # Terminal statuses — dismiss and update operations check against these
 _TERMINAL_STATUSES = frozenset({
@@ -170,18 +177,63 @@ async def select_runner_for(task_key: str):
 # transient empty Cloud Run job map), the existing candidates are left intact
 # rather than failing the request — so the guard never introduces a new
 # failure mode, it only removes the in-process option when offload is real.
+#
+# A second, structural trigger (#2732): any task in the async-write workclass
+# (``dynastore.tasks.workclass_drain.AsyncWriteDrainTaskProtocol`` — the
+# generic secondary-write drainers) always wants to offload, independent of
+# routing hints. See ``_is_async_write_workclass`` below.
 # ----------------------------------------------------------------------
 
 _OFFLOAD_RUNNER_TYPES = frozenset({"gcp_cloud_run", "worker_queue"})
 
 
-async def offload_required(task_key: str) -> bool:
-    """True when routing tags ``task_key`` OFFLOAD/HEAVY (must not run in-process).
+def _is_async_write_workclass(task_key: str) -> bool:
+    """True when ``task_key`` is registered to a task in the async-write
+    workclass (``dynastore.tasks.workclass_drain.AsyncWriteDrainTaskProtocol``,
+    #2732) — the generic secondary-write drainers (``storage_drain``,
+    ``event_drain``, and any future outbox drainer).
 
-    Fail-open: any resolver error or absent routing opinion (empty targets)
-    returns ``False`` so in-process execution remains available where it is the
-    intent — the ``onprem`` profile (every process routed to ``background``),
-    system tasks, and test fixtures with no live routing config.
+    Resolved directly off the task registry rather than through routing
+    config: a task opts in by subclassing the workclass base, not by
+    editing this module or a routing preset, so a NEW drainer inherits the
+    placement rule with zero edits here. Fail-open (``False``) when the
+    task is unregistered or the registry lookup errors.
+    """
+    try:
+        from dynastore.tasks import get_task_config
+
+        cfg = get_task_config(task_key)
+        if cfg is None:
+            return False
+        return bool(getattr(cfg.cls, "is_async_write_workclass", False))
+    except Exception:  # noqa: BLE001 — registry lookup is best-effort
+        return False
+
+
+async def offload_required(task_key: str) -> bool:
+    """True when ``task_key`` must not run in-process on this pod.
+
+    Two independent signals, either of which is sufficient:
+
+    1. Routing tags ``task_key`` OFFLOAD/HEAVY (static, config-driven) — the
+       existing contract for heavy processes like ``ingestion``.
+    2. ``task_key`` belongs to the async-write workclass (#2732) — the
+       generic secondary-write drainers. Placement is unconditional for this
+       workclass: the row-count outbox backlog says nothing about hydration
+       bytes (#2723), so a "small backlog" is not a safe signal that
+       in-process drain is cheap. See :func:`_is_async_write_workclass`.
+
+    Neither signal checks whether an offload-capable runner is actually
+    registered here — that is :func:`_restrict_to_offload_runners`'s job,
+    and it is where the real fail-open lives: compose / onprem / tests with
+    no ``gcp_cloud_run`` / ``worker_queue`` runner advertising the task type
+    keep the in-process candidates untouched.
+
+    Fail-open: any resolver/registry error or absent opinion returns
+    ``False`` so in-process execution remains available where it is the
+    intent — the ``onprem`` profile (every process routed to
+    ``background``), unregistered task keys, and test fixtures with no live
+    routing config.
     """
     from dynastore.modules.tasks.routing import resolver as routing_resolver
     from dynastore.modules.tasks.routing.exec_hints import ExecHint
@@ -189,9 +241,12 @@ async def offload_required(task_key: str) -> bool:
     try:
         targets = await routing_resolver.resolved_targets(task_key)
     except Exception:  # noqa: BLE001 — resolver is best-effort
-        return False
+        targets = []
     heavy = {ExecHint.OFFLOAD, ExecHint.HEAVY}
-    return any(heavy & set(t.hints) for t in targets)
+    if any(heavy & set(t.hints) for t in targets):
+        return True
+
+    return _is_async_write_workclass(task_key)
 
 
 def _restrict_to_offload_runners(runners: list) -> list:
@@ -364,7 +419,9 @@ async def _read_task_status(engine: DbResource, task_id: Any) -> Optional[str]:
 
 # Task types that carry a ``catalog_id`` in their inputs and require the
 # provisioning checklist to be drained on terminal exit.
-_PROVISIONING_TASK_TYPES: frozenset = frozenset({"gcp_provision_catalog"})
+_PROVISIONING_TASK_TYPES: frozenset = frozenset(
+    {"gcp_provision_catalog", "catalog_provision"}
+)
 
 
 async def _drain_provisioning_checklist(
@@ -425,8 +482,16 @@ async def _drain_provisioning_checklist(
                 task_id, task_type, outcome,
             )
             return
+        # Atomic provisioning contract: a task that reached a terminal FAILED
+        # state (DEAD_LETTER / FAILED) must not leave the catalog 'ready'.
+        # Drain its still-pending steps to 'failed' so the catalog becomes
+        # 'failed' — never silently 'ready' on a provisioning that did not
+        # complete. On a 'success' outcome the task already marked its own
+        # steps; the drain is only a no-op backstop, so a leftover pending step
+        # there resolves to 'degraded' (ready) as before.
+        drain_status = "failed" if outcome in ("failure", "timeout") else "degraded"
         updated = await catalogs.drain_pending_checklist_steps(
-            catalog_id, terminal_status="degraded",
+            catalog_id, terminal_status=drain_status,
         )
         if updated:
             logger.warning(
@@ -649,6 +714,7 @@ class ExecutionEngine:
         collection_id: Optional[str] = None,
         background_tasks: Any = None,
         dedup_key: Optional[str] = None,
+        execution_overrides: Optional[TaskExecutionOverrides] = None,
         **extras: Any,
     ) -> Any:
         """
@@ -704,10 +770,9 @@ class ExecutionEngine:
         # in-process.  Gated on async mode: SYNCHRONOUS execution is the
         # designated maps-tier path (already filtered by _resolve_execution_mode
         # via block_sync), and dropping in-process runners there would be wrong.
-        if mode == TaskExecutionMode.ASYNCHRONOUS and await offload_required(
-            task_type
-        ):
-            runners = _restrict_to_offload_runners(runners)
+        if mode == TaskExecutionMode.ASYNCHRONOUS:
+            if await offload_required(task_type):
+                runners = _restrict_to_offload_runners(runners)
 
         context = RunnerContext(
             engine=engine,
@@ -717,6 +782,7 @@ class ExecutionEngine:
             db_schema=db_schema,
             collection_id=collection_id,
             dedup_key=dedup_key,
+            execution_overrides=execution_overrides,
             extra_context={
                 "background_tasks": background_tasks,
                 **({"runner_options": runner_options} if runner_options else {}),
@@ -1108,6 +1174,17 @@ class ExecutionEngine:
         cid = task_inputs.pop(_INTERNAL_KEY, None)
         token = set_correlation_id(cid) if cid else None
 
+        # Extract per-execution overrides persisted under the reserved key by the
+        # spawn handlers.  Pop so they do not appear in the task's live inputs.
+        _overrides_raw = task_inputs.pop(_EXECUTION_OVERRIDES_KEY, None)
+        _dispatch_exec_overrides: Optional[TaskExecutionOverrides] = None
+        if _overrides_raw and isinstance(_overrides_raw, dict):
+            try:
+                _dispatch_exec_overrides = TaskExecutionOverrides.model_validate(_overrides_raw)
+            except Exception as exc:  # noqa: BLE001 — malformed overrides must not break dispatch
+                logger.warning("invalid __execution_overrides__ payload, ignoring: %s", exc)
+                pass
+
         # Dispatcher-path handoff: the row is already ACTIVE with the
         # dispatcher's heartbeat extending ``locked_until``.  Runners that
         # schedule async work (``BackgroundRunner``) pick up both the
@@ -1152,8 +1229,9 @@ class ExecutionEngine:
             task_type=task_type,
             caller_id=raw_payload["caller_id"],
             inputs=task_inputs,
-            db_schema=task_row.get("schema_name", "tasks"),
+            db_schema=task_row.get("catalog_id", "tasks"),
             extra_context=_extra_context,
+            execution_overrides=_dispatch_exec_overrides,
         )
 
         try:
@@ -1167,19 +1245,19 @@ class ExecutionEngine:
             if preferred is not None and any(preferred is r for r in runners):
                 runners = [preferred] + [r for r in runners if r is not preferred]
             _offload_enforced = False
-            if runner_mode == TaskExecutionMode.ASYNCHRONOUS and await offload_required(
-                task_type
-            ):
-                restricted = _restrict_to_offload_runners(runners)
-                # Enforcement happened only if in-process runners were actually
-                # dropped (an offload runner was present). When no offload
-                # runner exists here, runners is unchanged and the in-process
-                # path remains the legitimate option (e.g. maps running gdal).
-                _offload_enforced = restricted is not runners and any(
-                    getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
-                    for r in restricted
-                )
-                runners = restricted
+            if runner_mode == TaskExecutionMode.ASYNCHRONOUS:
+                if await offload_required(task_type):
+                    restricted = _restrict_to_offload_runners(runners)
+                    # Enforcement happened only if in-process runners were
+                    # actually dropped (an offload runner was present). When no
+                    # offload runner exists here, runners is unchanged and the
+                    # in-process path remains the legitimate option (e.g. maps
+                    # running gdal).
+                    _offload_enforced = restricted is not runners and any(
+                        getattr(r, "runner_type", None) in _OFFLOAD_RUNNER_TYPES
+                        for r in restricted
+                    )
+                    runners = restricted
 
             result = None
             for runner in runners:

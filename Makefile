@@ -1,10 +1,11 @@
 COMPOSE := docker compose -f packages/core/src/dynastore/docker/docker-compose.yml -f packages/core/src/dynastore/docker/docker-compose.dev.yml
 PYTEST  := .venv/bin/pytest
 
-.PHONY: help db-up db-down db-wait test test-unit test-integration test-coverage clean
+.PHONY: help db-up db-down db-wait test test-unit test-integration test-coverage clean dev-sync
 
 help:
 	@echo "DynaStore developer targets:"
+	@echo "  make dev-sync          Install all extensions for local dev/testing"
 	@echo "  make db-up             Start the test database (host-bound 127.0.0.1:54320)"
 	@echo "  make db-down           Stop and remove the test database (drops volumes)"
 	@echo "  make test              Run unit + integration tests (requires db-up)"
@@ -12,6 +13,13 @@ help:
 	@echo "  make test-integration  Run integration tests only (requires db-up)"
 	@echo "  make test-coverage     Run full suite with coverage report"
 	@echo "  make clean             Remove pytest cache and coverage artefacts"
+
+# Derive the install set from the filesystem so added/retired extensions
+# never drift out of sync with this list.
+EXTENSION_DIRS := $(dir $(wildcard packages/extensions/*/pyproject.toml))
+
+dev-sync:
+	uv pip install -e packages/core/ $(addprefix -e ,$(EXTENSION_DIRS))
 
 db-up:
 	$(COMPOSE) up -d db

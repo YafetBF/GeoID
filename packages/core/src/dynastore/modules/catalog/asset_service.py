@@ -146,7 +146,7 @@ Hard-deletion of an ``owned_by`` asset with blocking references raises
 import json
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Literal, Optional, Dict, Any, Union, Callable, Annotated
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Dict, Any, Union, Callable, Annotated
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.router import ResolvedDriver
@@ -162,12 +162,14 @@ from dynastore.modules.db_config.query_executor import (
     DbConnection,
 )
 from dynastore.modules.catalog.models import AssetReferenceType, EventType
+from dynastore.modules.catalog.log_manager import log_info
 from dynastore.models.shared_models import Link
 from dynastore.models.protocols.assets import AssetsProtocol
+from dynastore.models.protocols.catalogs import CatalogsProtocol
 from dynastore.models.driver_context import DriverContext
+from dynastore.tools.discovery import get_protocol
 from dynastore.models.query_builder import AssetFilter
 from enum import Enum
-from dynastore.models.driver_context import DriverContext
 
 logger = logging.getLogger(__name__)
 
@@ -609,18 +611,59 @@ class AssetService(AssetsProtocol):
         """Returns True if the manager is initialized and ready."""
         return self.engine is not None
 
+    async def _emit_durable(
+        self,
+        event_type: "AssetEventType",
+        doc: Any,
+        db_resource: Optional[DbResource],
+    ) -> None:
+        """Emit an asset domain event, guaranteeing the outbox write.
+
+        When the caller supplies a transaction (bulk/ingest paths) we ride it.
+        On the REST single-asset path db_resource is None and the emitter's
+        ``if db_resource:`` guard would otherwise skip the durable outbox write,
+        so we open a dedicated short transaction (#2256). The asset row is
+        already committed at this point, so a separate transaction is safe.
+        """
+        if not self._event_emitter:
+            return
+        if db_resource is not None:
+            await self._event_emitter(event_type, doc, db_resource=db_resource)
+        elif self.engine is not None:
+            async with managed_transaction(self.engine) as ev_conn:
+                await self._event_emitter(event_type, doc, db_resource=ev_conn)
+        else:
+            await self._event_emitter(event_type, doc, db_resource=None)
+
     async def _resolve_schema(
         self, catalog_id: str, db_resource: DbResource
     ) -> Optional[str]:
-        from dynastore.tools.discovery import get_protocol
-        from dynastore.models.protocols.catalogs import CatalogsProtocol
-
         catalogs = get_protocol(CatalogsProtocol)
         if catalogs is None:
             return None
         return await catalogs.resolve_physical_schema(
             catalog_id, ctx=DriverContext(db_resource=db_resource)
         )
+
+    async def _resolve_external_ids(
+        self, catalog_id: str, collection_id: Optional[str] = None
+    ) -> Tuple[str, Optional[str]]:
+        """Resolve public external catalog/collection ids to immutable internal
+        ids at the asset boundary, so asset rows key on rename-stable ids.
+        Idempotent: an already-internal id is returned unchanged."""
+        catalogs_svc = get_protocol(CatalogsProtocol)
+        if catalogs_svc is None:
+            return catalog_id, collection_id
+        internal_cat = await catalogs_svc.resolve_catalog_id(catalog_id, allow_missing=True)
+        if internal_cat is not None:
+            catalog_id = internal_cat
+        if collection_id is not None:
+            internal_col = await catalogs_svc.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if internal_col is not None:
+                collection_id = internal_col
+        return catalog_id, collection_id
 
     def _get_partition_name(self, catalog_id: str, collection_id: str) -> str:
         """Generates the partition name for a given catalog and collection."""
@@ -756,8 +799,18 @@ class AssetService(AssetsProtocol):
         asset_id: str,
         collection_id: Optional[str] = None,
         db_resource: Optional[DbResource] = None,
+        ctx: Optional[DriverContext] = None,
     ) -> Optional[Asset]:
-        """Get asset by ID, routing through the configured read driver."""
+        """Get asset by ID, routing through the configured read driver.
+
+        ``ctx`` is the ``AssetsProtocol``-sanctioned way for a caller outside
+        this module to pass a transactional resource (mirrors
+        ``create_asset``'s ``ctx`` parameter) — it takes precedence over the
+        intra-module-only ``db_resource`` kwarg when both are given.
+        """
+        if ctx is not None and ctx.db_resource is not None:
+            db_resource = ctx.db_resource
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
 
         if db_resource:
@@ -796,6 +849,7 @@ class AssetService(AssetsProtocol):
         offset: int = 0,
         db_resource: Optional[DbResource] = None,
     ) -> List[Asset]:
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         driver = await get_asset_driver("READ", catalog_id, collection_id)
         docs = await driver.search_assets(
@@ -830,6 +884,7 @@ class AssetService(AssetsProtocol):
         vocabulary shared by the PG and ES backends). Unsupported operators
         raise ``ValueError`` from that layer (mapped to HTTP 400).
         """
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_search_driver
 
         driver = await get_asset_search_driver(catalog_id, collection_id)
@@ -853,6 +908,7 @@ class AssetService(AssetsProtocol):
         collection_id: Optional[str] = None,
         ctx: Optional[DriverContext] = None,
     ) -> Asset:
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         db_resource = ctx.db_resource if ctx else None
         now = datetime.now(timezone.utc)
@@ -906,11 +962,14 @@ class AssetService(AssetsProtocol):
 
         self._invalidate_cache(created.asset_id, catalog_id, collection_id)
 
-        if self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_CREATED, created.model_dump(),
-                db_resource=db_resource,
-            )
+        await self._emit_durable(
+            AssetEventType.ASSET_CREATED, created.model_dump(), db_resource
+        )
+        await log_info(
+            catalog_id, "asset_created",
+            f"Asset '{created.asset_id}' created",
+            collection_id=collection_id,
+        )
         return created
 
     async def update_asset(
@@ -922,6 +981,7 @@ class AssetService(AssetsProtocol):
         db_resource: Optional[DbResource] = None,
     ) -> Asset:
         """Updates an existing asset's metadata via the configured write driver."""
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
 
         # Fetch current asset
@@ -960,11 +1020,14 @@ class AssetService(AssetsProtocol):
 
         self._invalidate_cache(updated.asset_id, catalog_id, collection_id)
 
-        if self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_UPDATED, updated.model_dump(),
-                db_resource=db_resource,
-            )
+        await self._emit_durable(
+            AssetEventType.ASSET_UPDATED, updated.model_dump(), db_resource
+        )
+        await log_info(
+            catalog_id, "asset_updated",
+            f"Asset '{updated.asset_id}' updated",
+            collection_id=collection_id,
+        )
         return updated
 
     async def patch_asset(
@@ -984,6 +1047,7 @@ class AssetService(AssetsProtocol):
         writer (e.g. gdalinfo) and an end-user editing ``metadata.title``
         no longer clobber each other.
         """
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         from dynastore.modules.catalog._merge_patch import merge_patch
 
@@ -1026,11 +1090,14 @@ class AssetService(AssetsProtocol):
 
         self._invalidate_cache(updated.asset_id, catalog_id, collection_id)
 
-        if self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_UPDATED, updated.model_dump(),
-                db_resource=db_resource,
-            )
+        await self._emit_durable(
+            AssetEventType.ASSET_UPDATED, updated.model_dump(), db_resource
+        )
+        await log_info(
+            catalog_id, "asset_updated",
+            f"Asset '{updated.asset_id}' updated",
+            collection_id=collection_id,
+        )
         return updated
 
     async def finalize_pending_upload(
@@ -1141,10 +1208,14 @@ class AssetService(AssetsProtocol):
             db_resource=engine,
         )
 
-        if activated is not None and self._event_emitter:
-            await self._event_emitter(
-                AssetEventType.ASSET_UPDATED, activated.model_dump(),
-                db_resource=engine,
+        if activated is not None:
+            await self._emit_durable(
+                AssetEventType.ASSET_UPDATED, activated.model_dump(), engine
+            )
+            await log_info(
+                catalog_id, "asset_updated",
+                f"Asset '{activated.asset_id}' activated",
+                collection_id=collection_id,
             )
         return activated
 
@@ -1205,6 +1276,7 @@ class AssetService(AssetsProtocol):
         I/O here would hold the transaction's connection idle in-transaction and
         the commit would fail (idle_in_transaction_session_timeout).
         """
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
         from dynastore.modules.catalog.drivers.pg_asset_driver import AssetPostgresqlDriver
 
@@ -1273,17 +1345,20 @@ class AssetService(AssetsProtocol):
         # Emit events. ``propagate`` is stamped on each payload so the
         # ``ItemReverseCascadeSubscriber`` can opt into the cascade only
         # when the caller asked for it.
-        if self._event_emitter:
-            event_type = (
-                AssetEventType.ASSET_HARD_DELETED if hard
-                else AssetEventType.ASSET_DELETED
+        event_type = (
+            AssetEventType.ASSET_HARD_DELETED if hard
+            else AssetEventType.ASSET_DELETED
+        )
+        log_event_type = "asset_deleted"
+        for a in asset_rows:
+            doc = dict(a)
+            doc["propagate"] = bool(propagate)
+            await self._emit_durable(event_type, doc, db_resource)
+            await log_info(
+                catalog_id, log_event_type,
+                f"Asset '{a.get('asset_id')}' deleted (hard={hard})",
+                collection_id=a.get("collection_id"),
             )
-            for a in asset_rows:
-                doc = dict(a)
-                doc["propagate"] = bool(propagate)
-                await self._event_emitter(
-                    event_type, doc, db_resource=db_resource,
-                )
 
         return rowcount
 
@@ -1294,6 +1369,7 @@ class AssetService(AssetsProtocol):
         collection_id: Optional[str] = None,
         db_resource: Optional[DbResource] = None,
     ) -> int:
+        catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         return await self.delete_assets(
             catalog_id,
             asset_id=asset_id,
@@ -1308,6 +1384,7 @@ class AssetService(AssetsProtocol):
         propagate: bool = False,
         db_resource: Optional[DbResource] = None,
     ) -> int:
+        catalog_id, _ = await self._resolve_external_ids(catalog_id)
         return await self.delete_assets(
             catalog_id,
             asset_id=asset_id,
@@ -1393,37 +1470,6 @@ class AssetService(AssetsProtocol):
             await DDLQuery(trigger_ddl).execute(conn)
 
     # -------------------------------------------------------------------------
-    # Asset reference table bootstrap
-    # -------------------------------------------------------------------------
-
-    async def ensure_asset_references_table(
-        self,
-        schema: str,
-        db_resource: Optional[DbResource] = None,
-    ) -> None:
-        """
-        Idempotently creates the ``asset_references`` table in *schema* if it
-        does not yet exist.  Called during tenant schema initialisation alongside
-        the ``assets`` table creation.
-        """
-        ddl = f"""
-        CREATE TABLE IF NOT EXISTS "{schema}".asset_references (
-            asset_id       VARCHAR     NOT NULL,
-            catalog_id     VARCHAR     NOT NULL,
-            ref_type       VARCHAR     NOT NULL,
-            ref_id         VARCHAR     NOT NULL,
-            cascade_delete BOOLEAN     NOT NULL DEFAULT TRUE,
-            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (catalog_id, asset_id, ref_type, ref_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_asset_refs_blocking_{schema}
-            ON "{schema}".asset_references (catalog_id, asset_id)
-            WHERE cascade_delete = FALSE;
-        """.strip()
-        async with managed_transaction(db_resource or self.engine) as conn:
-            await DDLQuery(ddl).execute(conn, schema=schema)
-
-    # -------------------------------------------------------------------------
     # Asset reference CRUD
     # -------------------------------------------------------------------------
 
@@ -1493,6 +1539,7 @@ class AssetService(AssetsProtocol):
         db_resource: Optional[DbResource] = None,
     ) -> List[str]:
         """Returns asset IDs that carry a given reference (inverse lookup)."""
+        catalog_id, _ = await self._resolve_external_ids(catalog_id)
         from dynastore.modules.catalog.drivers.pg_asset_driver import AssetPostgresqlDriver
         pg = AssetPostgresqlDriver(engine=db_resource or self.engine)
         return await pg.list_assets_for_reference(

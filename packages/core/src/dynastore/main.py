@@ -19,7 +19,7 @@
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional, Union
 import asyncio
 import json
 import uuid
@@ -39,7 +39,25 @@ from dynastore._version import VERSION, get_build_info
 from dynastore.extensions.tools.fast_api import ORJSONResponse
 from dynastore.extensions.bootstrap import bootstrap_app
 from dynastore.modules.concurrency import set_concurrency_backend
+from dynastore.tools.background_service import (
+    BackgroundSupervisor,
+    Leadership,
+    LeaseRenewalMode,
+    PodPolicy,
+    ServiceContext,
+)
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
+from dynastore.tools.memory_watchdog import build_memory_watchdog_service
+from dynastore.tools.serving_state import is_draining
+
+# Register the scaling PluginConfig at the composition root so its class_key is
+# known to the config seeder. The seeder runs inside the TasksModule lifespan
+# and resolves only already-imported PluginConfig subclasses; scaling is
+# otherwise first imported when CatalogModule's lifespan starts its signal
+# publisher — one step too late, so a scaling-policy seed is silently skipped
+# as "unknown class_key". Importing here (main is imported before any lifespan)
+# guarantees registration in time — same pattern as the memory watchdog above.
+from dynastore.modules.scaling import config as _scaling_config  # noqa: F401
 from fastapi.concurrency import run_in_threadpool
 
 # --- Initialize Concurrency Backend ---
@@ -118,6 +136,53 @@ for _lib in ("opensearch", "elasticsearch", "elastic_transport"):
 
 logger = logging.getLogger(__name__)
 
+
+class _ColdBootReconciliationService:
+    """Runs the cold-boot contributor pipeline off the startup-probe path (#3002).
+
+    ``run_cold_boot`` iterates every registered ``ColdBootContributor`` —
+    force=True IAM/preset self-heal, the file-backed preset seeder (which can
+    provision demo catalogs/collections), and similar idempotent reconciliation
+    work. None of it gates ``/health`` or ``/ready`` (neither route checks IAM
+    or preset state), so running it synchronously before ``yield`` only made
+    boot time scale with catalog count for no correctness benefit — a
+    full-fleet deploy against a DB with many catalogs could grind past the
+    Cloud Run startup-probe window entirely.
+
+    Submitted as a RUN_EVERYWHERE background task instead: every pod attempts
+    it independently, and single-flight safety comes from the advisory lock
+    each contributor already takes via ``acquire_startup_lock`` in
+    ``bootstrap_preset_if_absent`` — a pod that loses a given lock skips that
+    contributor, exactly as it did when this ran inline.
+    """
+
+    name = "cold_boot_reconciliation"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.ALL
+    lock_key: Optional[Union[int, str]] = None
+    lease_renewal_mode = LeaseRenewalMode.PER_TICK  # unused under RUN_EVERYWHERE
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    async def run(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.presets.cold_boot import run_cold_boot
+        try:
+            await run_cold_boot(self._engine)
+        except Exception:
+            # run_cold_boot is documented to never raise; this is a last-resort
+            # guard so a future contributor's bug can't kill the task silently.
+            logger.error(
+                "Cold-boot reconciliation raised an unexpected error; some "
+                "presets or IdP config may not be seeded.",
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "--- [main.py] Cold-boot reconciliation complete (background). ---"
+            )
+
+
 # --- Combined Application Lifecycle ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -137,56 +202,99 @@ async def lifespan(app: FastAPI):
     # /local-upload, /local-download endpoints) can reach it without
     # being promoted to extensions.
     app.state.app = app
-    async with modules_lifespan(app.state):
-        logger.info("--- [main.py] Modules are active. ---")
-        # Extensions can now reliably access services from modules and task instances.
-        async with extensions_lifespan(app):
-            # Flush any pending policy/role registrations from extensions
-            from dynastore.models.protocols.policies import PermissionProtocol
-            pm = get_protocol(PermissionProtocol)
-            # Announce the authorization posture exactly once at startup. The
-            # IAM extension is always_on whenever its wheel is installed, so a
-            # service meant to be open (e.g. a SCOPE that excludes the iam
-            # extension) can silently flip to deny-by-default if it runs a
-            # stale or wrong-SCOPE image that still carries the wheel. Surfacing
-            # the posture here turns that into an obvious log line instead of
-            # mysterious "Deny by Default" 403s on every non-public route.
-            _scope = os.environ.get("SCOPE", "<unset>")
-            if pm is None:
-                logger.warning(
-                    "Authorization DISABLED - no PermissionProtocol registered; "
-                    "all requests run unauthenticated (open access) [SCOPE=%s]. "
-                    "Expected for open scopes built without the iam extension.",
-                    _scope,
-                )
-            else:
-                logger.warning(
-                    "Authorization ENFORCED (deny-by-default) via %s "
-                    "[SCOPE=%s, IdP=%s]. For an open/no-auth deployment, build "
-                    "WITHOUT the iam extension (e.g. a catalog-only scope).",
-                    type(pm).__name__,
-                    _scope,
-                    os.environ.get("IDP_ISSUER_URL") or "<none>",
-                )
-            # Run all registered cold-boot contributors in descending priority
-            # order. Each contributor is fail-soft — a failure does not abort
-            # startup. Fully agnostic: no module-specific (iam/web/auth) names here.
-            try:
-                from dynastore.modules.presets.cold_boot import run_cold_boot
+
+    # Memory watchdog (#2946): an OOM kill sends SIGKILL straight to the
+    # process, so nothing here can catch or drain it. This proactive
+    # RSS poll is the only way to turn the climb leading up to a kill into
+    # a monitored log-based error before it happens. Enabled by default via
+    # MemoryWatchdogConfig; started outside (and independent of) module/
+    # extension lifespans so it observes memory pressure from the very
+    # start of the process, not just once modules finish booting (the
+    # platform config store is not yet reachable at this point either way,
+    # so this always resolves the config's defaults). The effective memory
+    # budget (explicit limit_mb, else cgroup auto-detection, else inert) is
+    # resolved lazily on the service's own first tick, once the config store
+    # is reachable — see tools/memory_watchdog.py.
+    _mem_watchdog_service = await build_memory_watchdog_service()
+    _mem_watchdog_shutdown = asyncio.Event()
+    _mem_watchdog_supervisor = BackgroundSupervisor()
+    if _mem_watchdog_service is not None:
+        _mem_watchdog_supervisor.register(_mem_watchdog_service)
+        _mem_watchdog_supervisor.start(
+            ServiceContext(
+                engine=None,
+                shutdown=_mem_watchdog_shutdown,
+                is_ephemeral=False,
+                name=os.environ.get("SERVICE_NAME", "dynastore"),
+            )
+        )
+
+    # Cold-boot reconciliation supervisor (#3002): started once the DB engine
+    # is available below, stopped alongside the memory watchdog in `finally`.
+    _cold_boot_shutdown = asyncio.Event()
+    _cold_boot_supervisor = BackgroundSupervisor()
+
+    try:
+        async with modules_lifespan(app.state):
+            logger.info("--- [main.py] Modules are active. ---")
+            # Extensions can now reliably access services from modules and task instances.
+            async with extensions_lifespan(app):
+                # Flush any pending policy/role registrations from extensions
+                from dynastore.models.protocols.policies import PermissionProtocol
+                pm = get_protocol(PermissionProtocol)
+                # Announce the authorization posture exactly once at startup. The
+                # IAM extension is always_on whenever its wheel is installed, so a
+                # service meant to be open (e.g. a SCOPE that excludes the iam
+                # extension) can silently flip to deny-by-default if it runs a
+                # stale or wrong-SCOPE image that still carries the wheel. Surfacing
+                # the posture here turns that into an obvious log line instead of
+                # mysterious "Deny by Default" 403s on every non-public route.
+                _scope = os.environ.get("SCOPE", "<unset>")
+                if pm is None:
+                    logger.warning(
+                        "Authorization DISABLED - no PermissionProtocol registered; "
+                        "all requests run unauthenticated (open access) [SCOPE=%s]. "
+                        "Expected for open scopes built without the iam extension.",
+                        _scope,
+                    )
+                else:
+                    logger.warning(
+                        "Authorization ENFORCED (deny-by-default) via %s "
+                        "[SCOPE=%s, IdP=%s]. For an open/no-auth deployment, build "
+                        "WITHOUT the iam extension (e.g. a catalog-only scope).",
+                        type(pm).__name__,
+                        _scope,
+                        os.environ.get("IDP_ISSUER_URL") or "<none>",
+                    )
+                # Run all registered cold-boot contributors in descending priority
+                # order, off the critical path (#3002). This work is idempotent
+                # self-heal/reconciliation — it does not gate /health or /ready —
+                # so it is submitted as a background task rather than awaited
+                # here. Each contributor is fail-soft — a failure does not abort
+                # the pipeline. Fully agnostic: no module-specific (iam/web/auth)
+                # names here.
                 from dynastore.models.protocols import DatabaseProtocol
                 _db = get_protocol(DatabaseProtocol)
                 _engine = _db.engine if _db else None
-                await run_cold_boot(_engine)
-            except Exception:
-                logger.error(
-                    "Cold-boot orchestrator raised an unexpected error; "
-                    "some presets or IdP config may not be seeded.",
-                    exc_info=True,
+                _cold_boot_supervisor.register(_ColdBootReconciliationService(_engine))
+                _cold_boot_supervisor.start(
+                    ServiceContext(
+                        engine=_engine,
+                        shutdown=_cold_boot_shutdown,
+                        is_ephemeral=False,
+                        name=os.environ.get("SERVICE_NAME", "dynastore"),
+                    )
                 )
-            logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
-            yield
+                logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
+                yield
 
-    logger.info("--- [main.py] Application shutdown complete. ---")
+        logger.info("--- [main.py] Application shutdown complete. ---")
+    finally:
+        _cold_boot_shutdown.set()
+        await _cold_boot_supervisor.stop()
+        if _mem_watchdog_service is not None:
+            _mem_watchdog_shutdown.set()
+            await _mem_watchdog_supervisor.stop()
 
 # --- Main Application Creation ---
 
@@ -204,9 +312,6 @@ app = FastAPI(
     redoc_url=None, # We will serve custom redoc
     swagger_ui_parameters={"defaultModelsExpandDepth": -1} # Optional: hide models by default
 )
-
-# Add correlation ID middleware
-app.add_middleware(CorrelationIdMiddleware)
 
 @app.get("/api", include_in_schema=False)
 async def get_api_document(f: Optional[str] = None, request: Request = None):  # type: ignore[assignment]
@@ -345,6 +450,16 @@ async def readiness_check():
         deps["valkey"] = {"status": "failed", "detail": str(exc)}
         logger.warning("readiness: valkey error: %s", exc)
 
+    # --- Self-recycle draining flag (geoid#2946 / #2924) ---
+    # Set by the memory watchdog's self-recycle lever when this worker has
+    # decided to gracefully SIGTERM itself ahead of an OOM kill. Always
+    # folded into the real readiness signal (not gated by any config flag —
+    # unlike the readiness-shed middleware, which IS opt-in) since this is
+    # the platform's own probe and must reflect true state.
+    if is_draining():
+        all_ok = False
+        deps["draining"] = {"status": "failed", "detail": "worker is draining for self-recycle"}
+
     payload = {"status": "ready" if all_ok else "not_ready", "dependencies": deps}
     from fastapi.responses import JSONResponse
     return JSONResponse(
@@ -358,26 +473,57 @@ async def readiness_check():
 # /redoc is currently not exposed; if reintroduced it should also live in the
 # documentation extension so all docs-rendering routes share one owner.
 
+# Extensions register their own middleware (IamMiddleware, TenantScopeMiddleware,
+# SessionMiddleware, CORS, GZip, proxy-headers, slash-redirect, ...) inside
+# bootstrap_app. Starlette makes the *last*-added middleware the *outermost*
+# one, so bootstrap_app must run before we add the correlation-id and global
+# exception-handling middleware below — otherwise an exception raised inside
+# one of those extension middlewares would bypass both and hit Starlette's
+# bare ServerErrorMiddleware instead of the platform JSON error shape.
+bootstrap_app(app)
+
 from dynastore.extensions.tools.exception_handlers import setup_exception_handlers
 setup_exception_handlers(app)
-bootstrap_app(app)
+
+# Bounds the inbound body of the synchronous bulk item-POST before it is
+# parsed (#2657). Must sit inside (added before) CorrelationIdMiddleware so
+# a rejected request still gets stamped with X-Request-ID, and outside the
+# routing layer so it can reject a request before the route ever reads its
+# body.
+from dynastore.extensions.tools.body_size_limit import SyncIngestBodyLimitMiddleware
+app.add_middleware(SyncIngestBodyLimitMiddleware)
+
+# Sheds new requests with 503 while this worker is draining for a memory-
+# watchdog self-recycle (Lever B, geoid#2946 / #2924). Added AFTER (so it
+# sits OUTSIDE) SyncIngestBodyLimitMiddleware — under Starlette's insert-at-
+# front semantics the last-added middleware runs first — so a draining worker
+# sheds with a cheap 503 before SyncIngestBodyLimitMiddleware eagerly buffers
+# a (chunked) body it will refuse anyway, which would only pile memory onto a
+# worker recycling precisely because of memory pressure. Still added before
+# CorrelationIdMiddleware, so it stays inside it and shed 503s keep X-Request-ID.
+from dynastore.extensions.tools.readiness_shed_middleware import ReadinessShedMiddleware
+app.add_middleware(ReadinessShedMiddleware)
+
+# Correlation ID middleware must be the outermost middleware so it stamps
+# X-Request-ID on every response — including error responses produced by
+# GlobalExceptionHandlingMiddleware for exceptions raised inside any
+# extension-registered middleware.
+app.add_middleware(CorrelationIdMiddleware)
 
 logger.info("--- [main.py] FastAPI application instance created. ---")
 
 
-async def run_worker(concurrency: int = 1):
+async def run_worker():
     """
     Initializes the application's modules via their lifespans and runs as a
     long-lived worker process.
 
     The TasksModule lifespan is responsible for starting the dispatcher and
     queue listener internally — no schema or dispatcher knowledge is needed here.
-
-    Args:
-        concurrency: Reserved for future use. The dispatcher concurrency is
-                     configured via the TasksModule.
+    Dispatcher concurrency is configured by the TasksModule (dispatcher batch
+    size); the worker itself is a single process running one event loop.
     """
-    logger.info("--- [main.py] Initializing worker context (concurrency=%d)... ---", concurrency)
+    logger.info("--- [main.py] Initializing worker context... ---")
 
     app_state = SimpleNamespace()
 
@@ -402,11 +548,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="DynaStore Application Entry Point")
     parser.add_argument("--worker", action="store_true", help="Run as a background worker instead of API server")
-    parser.add_argument("--concurrency", type=int, default=1,
-                        help="Number of concurrent worker processes (worker mode only, default: 1)")
     args = parser.parse_args()
 
     if args.worker:
-        asyncio.run(run_worker(concurrency=args.concurrency))
+        asyncio.run(run_worker())
     else:
         print("This script is intended to be imported by an ASGI server (for API) or run with --worker (for Worker).")
