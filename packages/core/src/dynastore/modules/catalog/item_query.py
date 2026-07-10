@@ -24,9 +24,12 @@ Extracted from item_service.py to reduce file size.  All methods access
 inherits from this mixin.
 """
 
+import json
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional, Any, Dict, Tuple, AsyncIterator, FrozenSet, TYPE_CHECKING
+from typing import (
+    List, Optional, Any, Dict, Tuple, AsyncIterator, Callable, FrozenSet, TYPE_CHECKING,
+)
 
 from sqlalchemy import literal_column, text
 
@@ -278,6 +281,96 @@ async def _apply_item_pipeline(
         if dropped:
             continue
         yield doc
+
+
+# ---------------------------------------------------------------------------
+# Bounded page buffer for feature_stream() (#3142)
+#
+# feature_stream() used to hold its pooled connection for the whole HTTP
+# response (managed_transaction opened once and kept alive across every
+# yield). A slow reader — or a client paginating a large collection — then
+# pins that pooled slot for the entire response, and a handful of them can
+# starve a small serving pool. Since /items pages are already
+# pagination-bounded (request.limit), the common case can eagerly drain the
+# whole page into memory INSIDE the transaction and release the connection
+# before yielding anything; only a page that overruns the buffer needs to
+# keep streaming from an open transaction, exactly like before.
+# ---------------------------------------------------------------------------
+
+# Row-count ceiling for the bounded page buffer (#3142). Mirrors the
+# ``max_limit`` clamp shared by every OGC listing endpoint that calls into
+# ``stream_items()`` (``FeaturesPluginConfig.max_limit``,
+# ``RecordsPluginConfig.max_limit``, the STAC search ``max_limit`` default —
+# all 1000): a page at or under that size is the common case this buffer
+# targets. ``item_query.py`` is protocol-agnostic (STAC/Features/Records/
+# exports all share it), so this stays a module constant instead of reading
+# any one extension's ``PluginConfig``.
+_STREAM_BUFFER_ROW_CAP: int = 1000
+
+# Approximate byte budget for the same buffer (#3142), sized like the
+# existing ``max_response_bytes`` byte budgets (``FeaturesPluginConfig``,
+# ``RecordsPluginConfig``, both default 10 MiB) that already bound
+# page-assembly memory downstream of this generator.
+_STREAM_BUFFER_BYTE_BUDGET: int = 10 * 1024 * 1024  # 10 MiB
+
+# Fallback byte cost for a feature whose size cannot be estimated (mirrors
+# ``_UNESTIMATED_DOC_BYTES`` in ``storage_drain_task.py``): large enough to
+# force a budget trip rather than accumulate an unmeasured object forever.
+_UNESTIMATED_FEATURE_BYTES: int = 8 * 1024 * 1024
+
+
+def _approx_feature_bytes(feature: Any) -> int:
+    """Approximate one mapped feature's in-memory footprint.
+
+    Used only to decide when :func:`_buffer_feature_page` has accumulated
+    enough to flush — NOT an exact prediction of the eventual HTTP response
+    size (the formatter's own ``max_response_bytes`` budget measures that
+    downstream, on the actual serialized bytes with a different encoder,
+    key order and whitespace). The budget this bounds is buffer memory, not
+    response size. A pydantic ``Feature``'s own JSON encoder is used when
+    available; anything else falls back to ``json.dumps(default=str)`` —
+    the same idiom as ``storage_drain_task._estimate_doc_bytes``.
+    """
+    dump = getattr(feature, "model_dump_json", None)
+    try:
+        if dump is not None:
+            return len(dump())
+        return len(json.dumps(feature, default=str))
+    except Exception:  # noqa: BLE001 — an unestimable feature still forces a flush
+        return _UNESTIMATED_FEATURE_BYTES
+
+
+async def _buffer_feature_page(
+    rows: AsyncIterator[Any],
+    map_row: Callable[[Any], Any],
+    *,
+    row_cap: int = _STREAM_BUFFER_ROW_CAP,
+    byte_budget: int = _STREAM_BUFFER_BYTE_BUDGET,
+) -> Tuple[List[Any], bool]:
+    """Eagerly drain ``rows`` into an in-memory buffer of mapped features.
+
+    Stops at whichever bound trips first: ``row_cap`` rows or
+    ``byte_budget`` approximate bytes (:func:`_approx_feature_bytes`).
+
+    Returns ``(buffered, budget_tripped)``:
+
+    - ``budget_tripped=False``: ``rows`` was exhausted within budget — the
+      common /items page case (#3142). The caller can release its DB
+      connection/transaction before yielding ``buffered``.
+    - ``budget_tripped=True``: a bound tripped with rows still pending in
+      ``rows``. The caller must keep consuming ``rows`` (inside the
+      still-open transaction) for the remainder — identical to the
+      pre-#3142 behaviour, no regression for pathological pages.
+    """
+    buffered: List[Any] = []
+    buffered_bytes = 0
+    async for row in rows:
+        feature = map_row(row)
+        buffered.append(feature)
+        buffered_bytes += _approx_feature_bytes(feature)
+        if len(buffered) >= row_cap or buffered_bytes >= byte_budget:
+            return buffered, True
+    return buffered, False
 
 
 class ItemQueryMixin:
@@ -1339,6 +1432,15 @@ class ItemQueryMixin:
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+        write_id = None
+        if ctx is not None and isinstance(getattr(ctx, "extensions", None), dict):
+            candidate = ctx.extensions.get("write_id")
+            if isinstance(candidate, str) and candidate:
+                write_id = candidate
+        if write_id is None:
+            from dynastore.tools.identifiers import generate_uuidv7
+
+            write_id = str(generate_uuidv7())
 
         # Phase 2 tile-cache (#1297): capture the item's current extent BEFORE
         # the soft-delete so the invalidate task can drop the tiles it used to
@@ -1393,14 +1495,14 @@ class ItemQueryMixin:
                         deleted_geoids = [
                             str(g) for g in await DQLQuery(
                                 f'UPDATE {qualify_table(phys_schema, phys_table)} h '
-                                f"SET deleted_at = NOW() "
+                                f"SET deleted_at = NOW(), write_id = :write_id "
                                 f'FROM {qualify_table(phys_schema, sc_table)} s '
                                 f"WHERE s.{fid_col} = :ext_id "
                                 f"AND h.deleted_at IS NULL "
                                 f"AND h.geoid = s.geoid "
                                 f"RETURNING h.geoid",
                                 result_handler=ResultHandler.ALL_SCALARS,
-                            ).execute(conn, ext_id=str(item_id))
+                            ).execute(conn, ext_id=str(item_id), write_id=write_id)
                         ]
                         rows = len(deleted_geoids)
                         break
@@ -1436,6 +1538,7 @@ class ItemQueryMixin:
                     catalog_id=phys_schema,
                     collection_id=phys_table,
                     geoid=item_id,
+                    write_id=write_id,
                 )
                 # Here ``item_id`` is itself the geoid (UUID-validated above),
                 # so a non-zero rowcount means that geoid was soft-deleted.
@@ -1445,14 +1548,13 @@ class ItemQueryMixin:
             if rows > 0:
                 await recalculate_and_update_extents(conn, catalog_id, collection_id)
 
-                # Propagate the delete to async-OUTBOX index drivers
-                # (e.g. public ES) symmetrically with ``upsert_bulk``: one
-                # delete row per soft-deleted geoid, enqueued on THIS TX
-                # conn and keyed by the geoid — the same ES ``_id`` the
-                # upsert path indexed under. A failed enqueue rolls back
-                # the soft-delete, so PG and the index can't drift apart.
+                # Propagate the delete to async WRITE drivers symmetrically
+                # with ``upsert_bulk``: one lightweight write-id ledger row
+                # per async target, enqueued on THIS TX conn. The drain reads
+                # tombstoned geoids for the write id from the primary PG hub.
                 await self._enqueue_index_deletes(
                     conn, catalog_id, collection_id, deleted_geoids,
+                    write_id=write_id,
                 )
 
                 # Emit event for non-indexer subscribers (audit, telemetry).
@@ -1503,27 +1605,28 @@ class ItemQueryMixin:
         catalog_id: str,
         collection_id: str,
         geoids: List[str],
+        *,
+        write_id: str,
     ) -> None:
-        """Enqueue one ES-delete OUTBOX row per soft-deleted geoid.
+        """Enqueue a lightweight write-id delete row per async index target.
 
         Symmetric counterpart to ``ItemService.upsert_bulk``'s async-OUTBOX
         enqueue: resolve the secondary-index ``WRITE`` entries
         (``secondary_index=True``) in ``ItemsRoutingConfig.operations[WRITE]``
         that are ``write_mode=ASYNC`` + ``on_failure=OUTBOX`` and write one
-        ``OutboxRecord(op="delete")`` per (entry, geoid) onto the caller's
-        transaction, keyed by the geoid. The drain's delete branch keys the
-        ES ``_id`` on ``idempotency_key`` (the geoid), the same value the
-        upsert path indexed under, so the document is actually purged.
+        ``WriteIdOutboxRecord(op="delete")`` per target onto the caller's
+        transaction. The drain reads tombstoned hub ids by ``write_id``.
 
-        Honours the ``_test_routing_resolver`` seam (as ``upsert_bulk`` does)
-        so this can be unit-tested without a live ConfigsProtocol; the enqueue
-        itself goes through the module-level ``enqueue_storage_op`` (#1807 P4),
-        which tests patch directly.
+        Honours the ``_test_routing_resolver`` / ``_test_driver_registry``
+        seams (as ``upsert_bulk`` does) so this can be unit-tested without a
+        live ConfigsProtocol; the enqueue itself goes through the
+        module-level ``enqueue_storage_op_write_id`` (#1807 P4), which tests
+        patch directly.
         """
         if not geoids:
             return
 
-        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.models.protocols.indexing import WriteIdOutboxRecord
         from dynastore.modules.storage.driver_instance_id import (
             compute_driver_instance_id,
         )
@@ -1547,6 +1650,7 @@ class ItemQueryMixin:
 
         ops_map = getattr(routing, "operations", {}) or {}
         from dynastore.modules.storage.routing_config import (
+            Operation,
             secondary_index_entries,
         )
         async_outbox_entries = secondary_index_entries(
@@ -1555,33 +1659,89 @@ class ItemQueryMixin:
         if not async_outbox_entries:
             return
 
-        records: List[OutboxRecord] = []
+        # Write-id rows are only hydratable when the primary WRITE driver
+        # exposes the write-id chunk-read capability (#3116) — the drain
+        # hydrates tombstoned ids from the first resolved WRITE driver, so
+        # enqueueing a row it cannot serve would retry forever.
+        from dynastore.modules.storage.storage_emit import (
+            driver_supports_write_id_reads,
+        )
+
+        write_entries = list(ops_map.get(Operation.WRITE, []))
+        registry = getattr(self, "_test_driver_registry", None)
+        primary_driver = None
+        if write_entries:
+            if registry is not None:
+                primary_driver = await registry(write_entries[0].driver_ref)
+            else:
+                from dynastore.modules.storage.driver_registry import (
+                    DriverRegistry,
+                )
+                primary_driver = DriverRegistry.get_collection(
+                    write_entries[0].driver_ref,
+                )
+        if not driver_supports_write_id_reads(primary_driver):
+            # Primary lacks write-id chunk reads: fall back to per-entity
+            # id-only delete rows (one per geoid per secondary target) —
+            # the drain direct-appends these tombstones without rereading
+            # canonical state, so no capability is required to hydrate them.
+            logger.warning(
+                "_enqueue_index_deletes: primary WRITE driver %r for %s/%s "
+                "does not support write-id chunk reads — falling back to "
+                "per-entity id-only outbox rows for %d target(s) "
+                "(see #3116).",
+                write_entries[0].driver_ref if write_entries else None,
+                catalog_id, collection_id, len(async_outbox_entries),
+            )
+            from dynastore.models.protocols.indexing import OutboxRecord
+            from dynastore.modules.storage.storage_emit import (
+                enqueue_storage_op_id_only,
+            )
+
+            id_only_records: List[OutboxRecord] = []
+            for entry in async_outbox_entries:
+                inst = compute_driver_instance_id(
+                    entry.driver_ref, catalog_id, collection_id,
+                )
+                for geoid in geoids:
+                    id_only_records.append(OutboxRecord(
+                        op_id=generate_uuidv7(),
+                        driver_id=entry.driver_ref,
+                        driver_instance_id=inst,
+                        collection_id=collection_id,
+                        op="delete",
+                        item_id=geoid,
+                        idempotency_key=geoid,
+                    ))
+            if id_only_records:
+                await enqueue_storage_op_id_only(
+                    conn,
+                    catalog_id=catalog_id,
+                    rows=id_only_records,
+                )
+            return
+
+        records: List[WriteIdOutboxRecord] = []
         for entry in async_outbox_entries:
             inst = compute_driver_instance_id(
                 entry.driver_ref, catalog_id, collection_id,
             )
-            for geoid in geoids:
-                gid = str(geoid)
-                records.append(OutboxRecord(
-                    op_id=generate_uuidv7(),
-                    driver_id=entry.driver_ref,
-                    driver_instance_id=inst,
-                    collection_id=collection_id,
-                    op="delete",
-                    item_id=gid,
-                    # Delete actions carry no source document; the drain's
-                    # delete branch ignores ``payload`` and keys ES on
-                    # ``idempotency_key``.
-                    payload={},
-                    idempotency_key=gid,
-                ))
+            records.append(WriteIdOutboxRecord(
+                op_id=generate_uuidv7(),
+                driver_id=entry.driver_ref,
+                driver_instance_id=inst,
+                collection_id=collection_id,
+                op="delete",
+                write_id=write_id,
+                idempotency_key=write_id,
+            ))
         if records:
             # Enqueue storage rows and drain trigger co-transactionally on the
             # caller's conn (delete twin of ItemService.upsert_bulk).
             from dynastore.modules.storage.storage_emit import (
-                enqueue_storage_op,
+                enqueue_storage_op_write_id,
             )
-            await enqueue_storage_op(
+            await enqueue_storage_op_write_id(
                 conn,
                 catalog_id=catalog_id,
                 rows=records,
@@ -1797,19 +1957,48 @@ class ItemQueryMixin:
                     "feature_stream requires async engine; configure `module_db` "
                     "in SCOPE — see #1420"
                 )
-            # Open a fresh connection/transaction for streaming to ensure isolation and avoid leaks
+
+            def _map_row(row: Any) -> Any:
+                feature_ctx = FeaturePipelineContext(
+                    lang=lang, consumer=consumer,
+                    requested_fields=_requested_fields,
+                )
+                return self.map_row_to_feature(
+                    dict(row._mapping), col_config, context=feature_ctx,
+                    read_policy=read_policy,
+                )
+
+            # Open a fresh connection/transaction for streaming to ensure
+            # isolation and avoid leaks. Bounded buffering (#3142): the
+            # connection is held only long enough to fill a page-sized
+            # buffer (row- and byte-bounded, _buffer_feature_page). A page
+            # that fits — the common case, since /items pages are already
+            # limit-bounded — is buffered fully and the connection is
+            # released BEFORE the first feature reaches the caller, so a
+            # slow HTTP reader no longer pins a pooled connection for the
+            # whole response. A page that overruns the buffer falls back to
+            # streaming the remainder inside the still-open transaction,
+            # unchanged from before #3142.
             async with managed_transaction(self.engine) as stream_conn:
                 # AsyncConnection.stream() yields rows server-side without buffering
                 stream = await stream_conn.stream(text(sql), params)  # type: ignore[union-attr]
-                async for row in stream:
-                    feature_ctx = FeaturePipelineContext(
-                        lang=lang, consumer=consumer,
-                        requested_fields=_requested_fields,
-                    )
-                    yield self.map_row_to_feature(
-                        dict(row._mapping), col_config, context=feature_ctx,
-                        read_policy=read_policy,
-                    )
+                buffered, budget_tripped = await _buffer_feature_page(
+                    stream,
+                    _map_row,
+                    row_cap=_STREAM_BUFFER_ROW_CAP,
+                    byte_budget=_STREAM_BUFFER_BYTE_BUDGET,
+                )
+                if budget_tripped:
+                    for feature in buffered:
+                        yield feature
+                    async for row in stream:
+                        yield _map_row(row)
+            if not budget_tripped:
+                # Stream exhausted within budget: managed_transaction above
+                # has already exited (connection returned to the pool)
+                # before any feature is yielded here.
+                for feature in buffered:
+                    yield feature
 
         return QueryResponse(
             items=_apply_item_pipeline(feature_stream(), catalog_id, collection_id),

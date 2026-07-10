@@ -18,6 +18,7 @@
 
 import logging
 import json
+from collections import OrderedDict
 from typing import Optional, Dict, Any, List, Tuple, Type, Union
 from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 from dynastore.modules.storage.router import invalidate_router_cache
@@ -269,6 +270,13 @@ def invalidate_catalog_config_caches(internal_catalog_id: str) -> None:
 # ==============================================================================
 
 
+# Hot-working-set bound for ``_validated_config_cache`` — matches the row
+# caches' maxsize (1024). Entries beyond the bound are the least recently
+# resolved (class, catalog, collection) triples and simply re-validate on
+# next use.
+_VALIDATED_CONFIG_CACHE_MAXSIZE = 1024
+
+
 class ConfigService(ConfigsProtocol):
     """Hierarchical Configuration Manager with framework-level immutability enforcement."""
 
@@ -284,6 +292,17 @@ class ConfigService(ConfigsProtocol):
         self._catalog_manager = catalog_manager
         self._catalogs_service = catalog_manager
         self._platform_config_service = platform_config_manager
+        # Per-process memo of fully-validated waterfall results, keyed by
+        # (class_key, catalog_id, collection_id) and identity-guarded against
+        # the exact base/delta objects it was computed from — correctness
+        # never depends on an entry surviving, so LRU eviction is safe. The
+        # bound exists because an unbounded dict grows with every
+        # catalog x collection ever resolved in the process (#3160: the
+        # cold-boot deny-policy scan pushed workers into OOM through it).
+        self._validated_config_cache: OrderedDict[
+            Tuple[str, Optional[str], Optional[str]],
+            Tuple[PluginConfig, Optional[dict], Optional[dict], PluginConfig],
+        ] = OrderedDict()
 
     @property
     def catalog_manager(self) -> CatalogsProtocol:
@@ -303,6 +322,9 @@ class ConfigService(ConfigsProtocol):
 
     def is_available(self) -> bool:
         return self.engine is not None
+
+    def _clear_validated_config_cache(self) -> None:
+        self._validated_config_cache.clear()
 
     def _get_catalog_manager(self) -> CatalogsProtocol:
         if self._catalogs_service is None:
@@ -341,6 +363,7 @@ class ConfigService(ConfigsProtocol):
         """
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
+        use_validated_cache = db_resource is None and config_snapshot is None
 
         # Tier 0: Snapshot (authoritative override)
         if config_snapshot is not None:
@@ -385,6 +408,8 @@ class ConfigService(ConfigsProtocol):
 
         # Collect per-tier deltas top-down.
         deltas: list[dict] = []
+        catalog_delta: Optional[dict] = None
+        collection_delta: Optional[dict] = None
 
         # Tier 2: Catalog delta
         if not db_resource:
@@ -440,6 +465,19 @@ class ConfigService(ConfigsProtocol):
         if not deltas:
             return base
 
+        cache_key: Optional[Tuple[str, Optional[str], Optional[str]]] = None
+        if use_validated_cache:
+            cache_key = (class_key, catalog_id, collection_id)
+            cached = self._validated_config_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached[0] is base
+                and cached[1] is catalog_delta
+                and cached[2] is collection_delta
+            ):
+                self._validated_config_cache.move_to_end(cache_key)
+                return cached[3]
+
         # Merge base.model_dump() with deltas in order (catalog → collection).
         # mode="python" preserves native types for round-trip re-validation.
         # ``_validate_stored_config`` strips keys the live class schema no
@@ -450,7 +488,18 @@ class ConfigService(ConfigsProtocol):
         merged: Dict[str, Any] = base.model_dump(mode="python")
         for delta in deltas:
             merged.update(delta)
-        return _validate_stored_config(cls, merged)
+        resolved = _validate_stored_config(cls, merged)
+        if cache_key is not None:
+            self._validated_config_cache[cache_key] = (
+                base,
+                catalog_delta,
+                collection_delta,
+                resolved,
+            )
+            self._validated_config_cache.move_to_end(cache_key)
+            while len(self._validated_config_cache) > _VALIDATED_CONFIG_CACHE_MAXSIZE:
+                self._validated_config_cache.popitem(last=False)
+        return resolved
 
     async def get_configs_batch(
         self,
@@ -624,6 +673,35 @@ class ConfigService(ConfigsProtocol):
             return None
         return await getter(class_key)
 
+    async def list_collection_config_deltas(
+        self,
+        config_cls: "Union[str, Type[PluginConfig]]",
+        catalog_id: str,
+        ctx: Optional[DriverContext] = None,
+    ) -> List[Dict[str, Any]]:
+        """Every collection-level delta row stored for ``config_cls`` in
+        ``catalog_id``, in one query — see ConfigsProtocol (#3160).
+
+        Tier-local: raw partial dicts exactly as persisted, no waterfall,
+        no class-default filling. Collections without a stored row inherit
+        the catalog-scope resolution and do not appear here.
+        """
+        _, class_key = _resolve(config_cls)
+        validate_sql_identifier(catalog_id)
+        db_resource = ctx.db_resource if ctx else None
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+            )
+            if not phys_schema:
+                return []
+            if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
+                return []
+            rows = await _cq.select_collection_configs_for_ref(phys_schema).execute(
+                conn, ref_key=class_key
+            )
+        return [row for row in rows if row]
+
     async def get_config_versioned(
         self,
         config_cls: "Union[str, Type[PluginConfig]]",
@@ -748,6 +826,7 @@ class ConfigService(ConfigsProtocol):
         """
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
+        self._clear_validated_config_cache()
         if collection_id is not None:
             if catalog_id is None:
                 raise ValueError("catalog_id is required when collection_id is provided")
@@ -832,6 +911,7 @@ class ConfigService(ConfigsProtocol):
             await self._internal_catalog_id(catalog_id),
             SNAPSHOT_REF_KEY,
         )
+        self._clear_validated_config_cache()
 
     async def _enforce_first_write_against_inherited(
         self,
@@ -1396,6 +1476,7 @@ class ConfigService(ConfigsProtocol):
 
         db_resource = ctx.db_resource if ctx else None
         cls = type(config)
+        self._clear_validated_config_cache()
 
         if collection_id is not None:
             if catalog_id is None:
@@ -1589,6 +1670,7 @@ class ConfigService(ConfigsProtocol):
     ) -> bool:
         """Tier-local delete at ``(ref_key, scope)`` — see ConfigsProtocol."""
         db_resource = ctx.db_resource if ctx else None
+        self._clear_validated_config_cache()
 
         if collection_id is not None:
             if catalog_id is None:
@@ -1789,6 +1871,7 @@ class ConfigService(ConfigsProtocol):
     ) -> None:
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
+        self._clear_validated_config_cache()
         if collection_id is not None:
             if catalog_id is None:
                 raise ValueError("catalog_id is required when collection_id is provided")

@@ -171,7 +171,7 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
-    # Zoom-aware per-tile FEATURE CAP (opt-in, default disabled).
+    # Zoom-aware per-tile FEATURE CAP (bounded by default, opt-out).
     #
     # The density filters above run AFTER ST_AsMVTGeom transforms every feature
     # intersecting the tile bbox, so at low zoom the transform cost is
@@ -185,19 +185,53 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
     #
     #   - Each key is the minimum zoom for the bracket (highest key ≤ current
     #     zoom wins), mirroring the simplification/density resolution.
-    #   - Value is the maximum number of features aggregated into one tile.
-    #   - Default None = uncapped (existing behavior, safe for all collections).
-    #   - Example: {0: 20000, 4: 50000, 8: 200000} — tight at world scale,
-    #     looser as each tile covers less ground.
+    #   - Value is the maximum number of features aggregated into one tile;
+    #     0 in a bracket = uncapped for that zoom and above (the opt-out).
+    #   - Default {0: 20000, 4: 50000, 8: 200000} — tight at world scale,
+    #     looser as each tile covers less ground. Ordinary collections stay
+    #     far below these per-tile counts; only pathological low-zoom tiles
+    #     of very large collections are clipped. Disable with {0: 0}.
     #   - Without ``feature_rank_column`` the N kept are storage-order
     #     (arbitrary); set it to keep the most important features instead.
     max_features_per_tile_by_zoom: Mutable[Optional[Dict[int, int]]] = Field(
-        default=None,
+        default_factory=lambda: {0: 20000, 4: 50000, 8: 200000},
         description=(
-            "Opt-in zoom-aware per-tile feature cap. Each key is the minimum zoom "
+            "Zoom-aware per-tile feature cap. Each key is the minimum zoom "
             "for the bracket; value is the maximum number of features aggregated "
             "into a tile (a LIMIT applied before ST_AsMVTGeom, bounding render "
-            "cost and tile size regardless of dataset size). Default None = uncapped."
+            "cost and tile size regardless of dataset size). 0 in a bracket = "
+            "uncapped for that zoom and above; set {0: 0} to disable. "
+            "Default {0: 20000, 4: 50000, 8: 200000}."
+        ),
+    )
+
+    # Self-tuning per-tile BYTE budget (#3155).
+    #
+    # The feature cap above bounds render cost, but bytes-per-feature varies
+    # by orders of magnitude across layers (a 2-vertex segment vs a dense
+    # MultiLineString), so no single count holds tile *bytes* to a target.
+    # The budget adapts the effective per-tile LIMIT from the measured
+    # bytes-per-feature of previous successful renders of the same collection
+    # at the same zoom:
+    #
+    #   effective LIMIT = min(bracket cap, byte_budget // measured bytes/feature)
+    #
+    # The first render of a (collection, zoom) pair has no measurement yet and
+    # uses the feature-cap ladder alone; every successful render refines the
+    # estimate, so oversized tiles decay toward the budget on re-render instead
+    # of being re-served at full weight forever. It is a target, not a hard
+    # cap — a rendered tile is never discarded for exceeding it, and the
+    # estimator is per-process (each worker converges after one render).
+    tile_byte_budget: Mutable[int] = Field(
+        default=1_048_576,
+        ge=0,
+        description=(
+            "Target upper bound in bytes for a rendered MVT tile. The effective "
+            "per-tile feature LIMIT adapts toward it using the measured "
+            "bytes-per-feature of previous renders of the same collection and "
+            "zoom (never above the max_features_per_tile_by_zoom bracket). "
+            "A target, not a hard cap: an already-rendered tile is served "
+            "whole. 0 disables the byte budget. Default 1 MiB."
         ),
     )
 
@@ -233,6 +267,49 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    # Optional stored column used as a per-feature DENSITY CEILING — the
+    # inverse of feature_rank_column above. feature_rank_column/
+    # min_feature_rank_by_zoom keep features with rank >= floor ("higher is
+    # better"), which cannot express "drop overly dense/heavy geometry":
+    # e.g. the computed vertex_count geometry stat is an inverse signal,
+    # where MORE vertices means WORSE low-zoom render cost, not better. This
+    # column feeds max_feature_density_by_zoom instead, an upper bound rather
+    # than a lower one. Default None = no density ceiling.
+    feature_density_column: Mutable[Optional[str]] = Field(
+        default=None,
+        description=(
+            "Name of a stored (ideally indexed) numeric column measuring "
+            "per-feature geometry density/heaviness — the computed "
+            "vertex_count geometry stat is the intended use (the "
+            "geometry_density compute preset materialises it as an indexed "
+            "column). Used by max_feature_density_by_zoom as a pre-transform "
+            "ceiling. Default None = no density ceiling."
+        ),
+    )
+
+    # Zoom-aware maximum value of ``feature_density_column`` a feature may
+    # have to be included, evaluated BEFORE ST_AsMVTGeom. The symmetric
+    # counterpart of min_feature_rank_by_zoom: excludes features ABOVE the
+    # ceiling instead of keeping features above a floor. Requires
+    # ``feature_density_column``.
+    #   - Highest key ≤ current zoom wins (bracket resolution).
+    #   - Value is the inclusive ceiling: features with a density column
+    #     value strictly above it are excluded at that zoom.
+    #   - 0 in a bracket = no ceiling for that zoom and above, mirroring
+    #     max_features_per_tile_by_zoom's opt-out.
+    #   - Default None = disabled.
+    max_feature_density_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(
+        default=None,
+        description=(
+            "Opt-in zoom-aware ceiling for feature_density_column (highest "
+            "key ≤ current zoom wins). Features whose value exceeds the "
+            "bracket's ceiling are excluded via a pre-transform WHERE, "
+            "index-assisted when the column is indexed. 0 in a bracket = no "
+            "ceiling for that zoom and above. Requires feature_density_column. "
+            "Default None = disabled."
+        ),
+    )
+
     # Caching
     cache_on_demand: Mutable[bool] = Field(
         default=True,
@@ -241,14 +318,20 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
 
     # --- Live-render hardening (#2813) ---
     live_tile_timeout_seconds: Mutable[int] = Field(
-        default=30,
+        default=60,
         ge=1,
         description=(
             "Per-request PostgreSQL statement timeout (``SET LOCAL "
             "statement_timeout``) applied while rendering an on-demand MVT "
-            "tile. A query that exceeds this is canceled server-side; "
-            "``get_vector_tile`` treats the cancellation as an empty tile "
-            "(204) instead of surfacing a 500. Mirrors "
+            "tile, aligned with the 60s load-balancer ceiling. On the live "
+            "path ``render_budget_seconds`` (55s) is the graceful wall-clock "
+            "cutoff and normally fires first (503 with ``Retry-After``); "
+            "this statement timeout is the server-side reclaim backstop "
+            "that frees the DB worker if a statement outlives that cutoff. "
+            "A query that exceeds this is canceled server-side (pgcode "
+            "57014); ``get_vector_tile`` then serves a stale cached tile "
+            "when one exists, or fails fast with 503 + ``Retry-After``. "
+            "Mirrors "
             "``TilesPreseedConfig.preseed_tile_timeout_seconds``."
         ),
     )
@@ -599,13 +682,16 @@ class TilesPreseedConfig(PluginConfig):
     )
 
     preseed_tile_timeout_seconds: Mutable[int] = Field(
-        default=30,
+        default=60,
         ge=1,
         description=(
             "Per-tile PostgreSQL statement timeout (``SET LOCAL "
             "statement_timeout``) applied for the duration of each per-zoom "
             "preseed transaction. A tile that exceeds this is counted in "
             "``results['skipped']`` and the run continues, instead of one "
-            "pathological tile stalling the whole job."
+            "pathological tile stalling the whole job. Preseed runs offline "
+            "with no load-balancer deadline, but renders the same heavy "
+            "statements as the live path, so it defaults to the same "
+            "ceiling as ``TilesConfig.live_tile_timeout_seconds``."
         ),
     )

@@ -44,6 +44,19 @@ from uuid import uuid4
 POOLING_MODE_DIRECT = "direct"
 POOLING_MODE_TRANSACTION_POOLER = "transaction_pooler"
 
+# Bounded pool sizing for create_task_engine() (#3145). One drain_once()
+# batch opens managed_transaction blocks at several separate points, and each
+# used to pay a fresh connect/disconnect through the transaction pooler under
+# NullPool. A warm base of one connection plus one overflow slot pays that
+# connect cost once per run instead of once per transaction block, while
+# staying small enough it never competes with the shared serving pool for
+# capacity. Safe because every create_task_engine() call site builds and
+# disposes its engine within the single coroutine (and therefore single event
+# loop) of one task run -- see the ``finally: await engine.dispose()`` at each
+# call site -- so these pooled asyncpg connections never cross a loop boundary.
+TASK_ENGINE_POOL_SIZE = 1
+TASK_ENGINE_POOL_MAX_OVERFLOW = 1
+
 
 def _parse_pg_interval_seconds(value: str) -> Optional[int]:
     """Parse a small subset of PostgreSQL interval syntax into seconds.
@@ -265,6 +278,7 @@ def pooler_timeout_set_local_sql(
     lock_timeout: str,
     idle_in_transaction_session_timeout: str,
     statement_timeout: Optional[str] = None,
+    force: bool = False,
 ) -> Optional[str]:
     """A single SQL statement that re-applies the lock-safety timeouts inside a
     transaction, or ``None`` in direct mode (#3081).
@@ -277,8 +291,15 @@ def pooler_timeout_set_local_sql(
     LOCAL`` statements) so it is a single round-trip that also survives asyncpg's
     extended-query protocol, which rejects multi-statement strings.
     ``statement_timeout`` is included only when enabled (a non-"0" value).
+
+    ``force=True`` skips the transaction-pooler check and always returns the
+    SQL. Needed by an engine whose ``connect_args`` never carry these GUCs as
+    startup ``server_settings`` in the first place (psycopg2's sync engine —
+    see ``datastore_service.py``): for that engine the SET LOCAL guard is the
+    *only* place the lock-safety net is applied, in both direct and pooler
+    mode, so it cannot be gated on ``db_pooling_mode``.
     """
-    if not is_transaction_pooler(db_config):
+    if not force and not is_transaction_pooler(db_config):
         return None
     calls = [
         f"set_config('lock_timeout', '{lock_timeout}', true)",
@@ -316,8 +337,8 @@ def register_pooler_timeout_guard(engine: Any, set_local_sql: Optional[str]) -> 
 
 
 def create_task_engine(db_config) -> Any:
-    """Build the short-lived, ``NullPool``-backed async engine that task/job
-    code uses for its own DB work — mode-aware (#3081) and armed with the same
+    """Build the short-lived, bounded-pool async engine that task/job code
+    uses for its own DB work — mode-aware (#3081) and armed with the same
     lock-safety net + TCP keepalives as the shared serving engine (#3057).
 
     Direct mode: the startup ``server_settings`` carry ``lock_timeout``, the
@@ -328,12 +349,22 @@ def create_task_engine(db_config) -> Any:
     asyncpg exposes no libpq client keepalive params (#710) and the option is
     harmless in front of a pooler.
 
+    Pool sizing (#3145): ``TASK_ENGINE_POOL_SIZE`` / ``TASK_ENGINE_POOL_MAX_OVERFLOW``
+    replace the previous ``NullPool`` — a run that opens several
+    ``managed_transaction`` blocks (e.g. one drain_once() batch) now pays the
+    connect cost through the pooler once per run instead of once per block.
+    ``pool_recycle`` reuses the same ``db_config.pool_recycle`` budget the
+    shared serving engine applies (behind a transaction pooler that engine
+    already combines ``pool_pre_ping``/``pool_recycle`` with pooler-mode
+    ``connect_args``, so the same pairing is known pooler-safe here). Safe only
+    because every call site creates and disposes this engine within one task
+    run's coroutine — see each call site's ``finally: await engine.dispose()``.
+
     Supersedes the inline ``create_async_engine(..., connect_args=
     task_engine_connect_args(...))`` the task entrypoints used to build by hand,
     so every task/job engine is constructed identically and stays pooler-safe.
     """
     from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
 
     from dynastore.modules.db_config.tools import normalize_db_url
 
@@ -341,7 +372,10 @@ def create_task_engine(db_config) -> Any:
     task_idle = db_config.task_idle_in_transaction_session_timeout
     engine = create_async_engine(
         normalize_db_url(db_config.database_url, is_async=True),
-        poolclass=NullPool,
+        pool_size=TASK_ENGINE_POOL_SIZE,
+        max_overflow=TASK_ENGINE_POOL_MAX_OVERFLOW,
+        pool_recycle=db_config.pool_recycle,
+        pool_pre_ping=True,
         connect_args=task_engine_connect_args(db_config),
     )
     register_pooler_timeout_guard(

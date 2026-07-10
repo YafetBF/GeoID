@@ -171,8 +171,11 @@ async def test_g4_fails_open_when_get_driver_config_raises(monkeypatch: Any) -> 
 async def test_g1_access_envelope_injected_into_item_context(
     monkeypatch: Any,
 ) -> None:
-    """G1: when _resolve_access_envelope returns an envelope, it is present in
-    every item_context passed to sidecar.prepare_upsert_payload."""
+    """G1: when _resolve_access_envelope_base returns a base envelope, it is
+    stamped into every item_context passed to sidecar.prepare_upsert_payload
+    (#3175: per item, from the base's ``visibility``/``owner`` — ``_attrs``
+    is derived separately per item from that item's own feature)."""
+    from dynastore.modules.catalog.item_service import _AccessEnvelopeBase
 
     _EXPECTED_ENVELOPE = {
         "_visibility": "private",
@@ -205,11 +208,12 @@ async def test_g1_access_envelope_injected_into_item_context(
 
     svc = ItemService()
 
-    # Patch _resolve_access_envelope to return the fixed envelope.
-    async def _fake_resolve(cat: str, col: str, pc: Any, feature: Any = None) -> Dict[str, Any]:
-        return _EXPECTED_ENVELOPE
+    # Patch _resolve_access_envelope_base to return the fixed base envelope
+    # (the batch-level resolution the per-item loop builds on).
+    async def _fake_resolve_base(cat: str, col: str, pc: Any) -> _AccessEnvelopeBase:
+        return _AccessEnvelopeBase(visibility="private", owner="alice", attrs_paths={})
 
-    monkeypatch.setattr(svc, "_resolve_access_envelope", _fake_resolve)
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _fake_resolve_base)
 
     # Wire all Branch B dependencies: managed_transaction, configs, sidecars,
     # insert_or_update_distributed, etc.  _patch_branch_b also sets
@@ -232,8 +236,8 @@ async def test_g1_access_envelope_injected_into_item_context(
 async def test_g1_no_envelope_when_collection_not_access_aware(
     monkeypatch: Any,
 ) -> None:
-    """G1: when _resolve_access_envelope returns None (not an access-aware
-    collection), _access_envelope is absent from item_context."""
+    """G1: when _resolve_access_envelope_base returns None (not an
+    access-aware collection), _access_envelope is absent from item_context."""
 
     captured_contexts: List[Dict[str, Any]] = []
 
@@ -261,10 +265,10 @@ async def test_g1_no_envelope_when_collection_not_access_aware(
 
     svc = ItemService()
 
-    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
         return None
 
-    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
     _patch_branch_b(monkeypatch, svc, [_CapturingSidecar()])
 
     items = [{"type": "Feature", "id": "item2", "geometry": None, "properties": {}}]
@@ -274,6 +278,139 @@ async def test_g1_no_envelope_when_collection_not_access_aware(
     assert "_access_envelope" not in captured_contexts[0], (
         "_access_envelope must NOT appear when collection is not access-aware"
     )
+
+
+async def test_pg_primary_upsert_persists_write_id_in_hub_payload(
+    monkeypatch: Any,
+) -> None:
+    """PG-primary item writes stamp the canonical batch write id on hub rows."""
+
+    svc = ItemService()
+
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
+        return None
+
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
+    _patch_branch_b(monkeypatch, svc, [])
+
+    captured_hub_payloads: List[Dict[str, Any]] = []
+
+    async def _capture_insert(
+        conn: Any,
+        cat: str,
+        col: str,
+        hub_payload: Dict[str, Any],
+        sidecar_payloads: Any,
+        **_kw: Any,
+    ) -> Dict[str, Any]:
+        captured_hub_payloads.append(dict(hub_payload))
+        return {"geoid": hub_payload["geoid"]}
+
+    async def _noop(*_a: Any, **_kw: Any) -> None:
+        pass
+
+    monkeypatch.setattr(svc, "insert_or_update_distributed", _capture_insert)
+    monkeypatch.setattr(svc, "_dispatch_index_upsert", _noop)
+
+    items = [{"type": "Feature", "id": "item3", "geometry": None, "properties": {}}]
+    await svc.upsert(
+        "cat1",
+        "col1",
+        items,
+        processing_context={"write_id": "w-upsert-1"},
+    )
+
+    assert captured_hub_payloads
+    assert {p.get("write_id") for p in captured_hub_payloads} == {"w-upsert-1"}
+
+
+async def test_pg_primary_upsert_persists_access_owner_when_principal_present(
+    monkeypatch: Any,
+) -> None:
+    """#2687: the write-time owner is stamped onto every hub row whenever a
+    principal is present in ``processing_context`` — UNGATED, regardless of
+    whether the collection routes to an access-aware driver (mirrors the
+    write_id rollout shape: a cheap nullable column, no access-aware gate)."""
+
+    svc = ItemService()
+
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
+        return None  # not an access-aware collection
+
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
+    _patch_branch_b(monkeypatch, svc, [])
+
+    captured_hub_payloads: List[Dict[str, Any]] = []
+
+    async def _capture_insert(
+        conn: Any,
+        cat: str,
+        col: str,
+        hub_payload: Dict[str, Any],
+        sidecar_payloads: Any,
+        **_kw: Any,
+    ) -> Dict[str, Any]:
+        captured_hub_payloads.append(dict(hub_payload))
+        return {"geoid": hub_payload["geoid"]}
+
+    async def _noop(*_a: Any, **_kw: Any) -> None:
+        pass
+
+    monkeypatch.setattr(svc, "insert_or_update_distributed", _capture_insert)
+    monkeypatch.setattr(svc, "_dispatch_index_upsert", _noop)
+
+    items = [{"type": "Feature", "id": "item4", "geometry": None, "properties": {}}]
+    await svc.upsert(
+        "cat1",
+        "col1",
+        items,
+        processing_context={"owner": "alice"},
+    )
+
+    assert captured_hub_payloads
+    assert {p.get("access_owner") for p in captured_hub_payloads} == {"alice"}
+
+
+async def test_pg_primary_upsert_omits_access_owner_without_principal(
+    monkeypatch: Any,
+) -> None:
+    """No principal in ``processing_context`` → ``access_owner`` key is
+    absent from the hub payload entirely (not stamped as ``None``), so the
+    dynamic batch-insert column union never gains the column for a batch
+    with no principal at all."""
+
+    svc = ItemService()
+
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
+        return None
+
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
+    _patch_branch_b(monkeypatch, svc, [])
+
+    captured_hub_payloads: List[Dict[str, Any]] = []
+
+    async def _capture_insert(
+        conn: Any,
+        cat: str,
+        col: str,
+        hub_payload: Dict[str, Any],
+        sidecar_payloads: Any,
+        **_kw: Any,
+    ) -> Dict[str, Any]:
+        captured_hub_payloads.append(dict(hub_payload))
+        return {"geoid": hub_payload["geoid"]}
+
+    async def _noop(*_a: Any, **_kw: Any) -> None:
+        pass
+
+    monkeypatch.setattr(svc, "insert_or_update_distributed", _capture_insert)
+    monkeypatch.setattr(svc, "_dispatch_index_upsert", _noop)
+
+    items = [{"type": "Feature", "id": "item5", "geometry": None, "properties": {}}]
+    await svc.upsert("cat1", "col1", items)
+
+    assert captured_hub_payloads
+    assert all("access_owner" not in p for p in captured_hub_payloads)
 
 
 # ---------------------------------------------------------------------------

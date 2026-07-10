@@ -19,7 +19,7 @@
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Optional, Union
+from typing import Any, Optional
 import asyncio
 import json
 import uuid
@@ -33,6 +33,7 @@ from dynastore.modules import (
     discover_modules,
     instantiate_modules,
     get_protocol,
+    get_protocols,
 )
 from dynastore.extensions.lifespan import lifespan as extensions_lifespan
 from dynastore._version import VERSION, get_build_info
@@ -42,12 +43,17 @@ from dynastore.modules.concurrency import set_concurrency_backend
 from dynastore.tools.background_service import (
     BackgroundSupervisor,
     Leadership,
-    LeaseRenewalMode,
     PodPolicy,
     ServiceContext,
 )
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
-from dynastore.tools.memory_watchdog import build_memory_watchdog_service
+from dynastore.tools.memory_watchdog import (
+    build_memory_watchdog_service,
+    load_memory_watchdog_config,
+    read_process_rss_bytes,
+    resolve_watchdog_budget_mb,
+)
+from dynastore.tools.redact import RedactingLogFilter, redact_for_log
 from dynastore.tools.serving_state import is_draining
 
 # Register the scaling PluginConfig at the composition root so its class_key is
@@ -93,7 +99,16 @@ class _JsonFormatter(logging.Formatter):
             "correlation_id": getattr(record, "correlation_id", None),
         }
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            # A raw traceback isn't reached by RedactingLogFilter (it only
+            # rewrites record.msg/args before formatting) and its final
+            # line renders the exception's own str() — the same text a
+            # `raise ... from e` connection error can carry a DSN in.
+            # Scrub it the same way (URI-userinfo only; no key context is
+            # available in free-form traceback text) before it leaves the
+            # process (geoid#3132).
+            payload["exception"] = redact_for_log(
+                self.formatException(record.exc_info)
+            )
         return json.dumps(payload)
 
 
@@ -118,6 +133,12 @@ log_level = getattr(logging, log_level_name, logging.INFO)
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(_JsonFormatter())
 _handler.addFilter(_CorrelationFilter())
+# Second-layer credential redaction (geoid#3132): scrubs any record that
+# reaches this handler still carrying a raw connection-URI-class secret,
+# even if the emitting call site forgot to redact it before logging. See
+# dynastore.tools.redact for the full recursive helper call sites should
+# use proactively.
+_handler.addFilter(RedactingLogFilter())
 logging.root.setLevel(log_level)
 logging.root.handlers = [_handler]
 
@@ -137,6 +158,17 @@ for _lib in ("opensearch", "elasticsearch", "elastic_transport"):
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.1f.", name, raw, default)
+        return default
+
+
 class _ColdBootReconciliationService:
     """Runs the cold-boot contributor pipeline off the startup-probe path (#3002).
 
@@ -149,38 +181,229 @@ class _ColdBootReconciliationService:
     full-fleet deploy against a DB with many catalogs could grind past the
     Cloud Run startup-probe window entirely.
 
-    Submitted as a RUN_EVERYWHERE background task instead: every pod attempts
-    it independently, and single-flight safety comes from the advisory lock
-    each contributor already takes via ``acquire_startup_lock`` in
-    ``bootstrap_preset_if_absent`` — a pod that loses a given lock skips that
-    contributor, exactly as it did when this ran inline.
+    Submitted as a delayed one-shot background task instead: each process
+    reaches readiness before this work starts, then checks a per-service /
+    per-revision shared-property marker and makes one fleet-level lease
+    attempt. Only the first winner for the current service revision runs the
+    pipeline; later workers see the marker and return. The contributor-local
+    advisory locks still provide per-contributor single-flight safety.
     """
 
     name = "cold_boot_reconciliation"
     leadership = Leadership.RUN_EVERYWHERE
     pod_policy = PodPolicy.ALL
-    lock_key: Optional[Union[int, str]] = None
-    lease_renewal_mode = LeaseRenewalMode.PER_TICK  # unused under RUN_EVERYWHERE
+    lock_key: Optional[str] = None
+    initial_delay_seconds = _env_float(
+        "DYNASTORE_COLD_BOOT_INITIAL_DELAY_SECONDS",
+        30.0,
+    )
 
     def __init__(self, engine: Any) -> None:
         self._engine = engine
 
     async def run(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.db_config.locking_tools import lease_leadership
         from dynastore.modules.presets.cold_boot import run_cold_boot
+
+        engine = self._engine if self._engine is not None else ctx.engine
+        if engine is None:
+            logger.info(
+                "Cold-boot reconciliation skipped; no database engine is available."
+            )
+            return
+
+        marker_key = _cold_boot_revision_marker_key()
+        if marker_key and await _cold_boot_revision_completed(engine, marker_key):
+            logger.info(
+                "Cold-boot reconciliation skipped; revision marker %r already set.",
+                marker_key,
+            )
+            return
+
         try:
-            await run_cold_boot(self._engine)
+            async with lease_leadership(
+                engine,
+                "dynastore.cold_boot_reconciliation",
+                name=self.name,
+            ) as (is_leader, _lock_conn):
+                if not is_leader:
+                    logger.info(
+                        "Cold-boot reconciliation skipped; another process "
+                        "holds the fleet lease."
+                    )
+                    return
+                if marker_key and await _cold_boot_revision_completed(
+                    engine,
+                    marker_key,
+                ):
+                    logger.info(
+                        "Cold-boot reconciliation skipped after lease; "
+                        "revision marker %r already set.",
+                        marker_key,
+                    )
+                    return
+                await run_cold_boot(engine, probe=_ColdBootMemoryProbe())
+                if marker_key:
+                    await _mark_cold_boot_revision_completed(engine, marker_key)
         except Exception:
-            # run_cold_boot is documented to never raise; this is a last-resort
-            # guard so a future contributor's bug can't kill the task silently.
             logger.error(
-                "Cold-boot reconciliation raised an unexpected error; some "
-                "presets or IdP config may not be seeded.",
+                "Cold-boot reconciliation failed; some presets or IdP config "
+                "may not be seeded.",
                 exc_info=True,
             )
         else:
             logger.info(
                 "--- [main.py] Cold-boot reconciliation complete (background). ---"
             )
+
+
+def _cold_boot_revision_marker_key() -> Optional[str]:
+    """Return the shared-property key that makes cold boot once-per-revision.
+
+    Cloud Run provides ``K_SERVICE`` and ``K_REVISION``. Outside Cloud Run we do
+    not set a durable marker: without a revision identity, a DB marker could
+    incorrectly suppress cold-boot self-heal across ordinary local/on-prem
+    restarts.
+    """
+    service = os.getenv("K_SERVICE")
+    revision = os.getenv("K_REVISION")
+    if not service or not revision:
+        return None
+    return f"platform.cold_boot_reconciliation.completed.{service}.{revision}"
+
+
+async def _cold_boot_revision_completed(engine: Any, marker_key: str) -> bool:
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery,
+        ResultHandler,
+        managed_transaction,
+    )
+
+    try:
+        async with managed_transaction(engine) as conn:
+            value = await DQLQuery(
+                "SELECT key_value FROM catalog.shared_properties "
+                "WHERE key_name = :key_name",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, key_name=marker_key)
+            return value == "true"
+    except Exception as exc:
+        logger.debug(
+            "Cold-boot revision marker read failed for %r (%s); proceeding.",
+            marker_key,
+            exc,
+        )
+        return False
+
+
+async def _mark_cold_boot_revision_completed(engine: Any, marker_key: str) -> None:
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery,
+        ResultHandler,
+        managed_transaction,
+    )
+
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(
+            """
+            INSERT INTO catalog.shared_properties (key_name, key_value, owner_code)
+            VALUES (:key_name, 'true', 'cold_boot_reconciliation')
+            ON CONFLICT (key_name) DO UPDATE SET
+                key_value = EXCLUDED.key_value,
+                owner_code = EXCLUDED.owner_code;
+            """,
+            result_handler=ResultHandler.ROWCOUNT,
+        ).execute(conn, key_name=marker_key)
+
+
+class _ColdBootMemoryProbe:
+    """Emit per-contributor RSS diagnostics when watchdog diagnostics are enabled."""
+
+    def __init__(self) -> None:
+        self._rss_before: dict[str, Optional[int]] = {}
+
+    async def __call__(
+        self,
+        event: str,
+        contributor: Any,
+        elapsed_seconds: Optional[float],
+        error: Optional[BaseException],
+    ) -> None:
+        name = getattr(contributor, "name", "<unknown>")
+        before = self._rss_before.pop(name, None) if event == "after" else None
+        try:
+            config = await load_memory_watchdog_config()
+        except Exception:
+            return
+        if not config.diagnostic_tracemalloc_enabled:
+            return
+
+        rss_bytes = read_process_rss_bytes()
+        if event == "before":
+            self._rss_before[name] = rss_bytes
+            logger.info(
+                "cold_boot[diagnostic]: contributor %r starting "
+                "(priority=%s, rss=%s)",
+                name,
+                getattr(contributor, "priority", "<unknown>"),
+                _format_mib(rss_bytes),
+            )
+            return
+
+        budget_bytes = _cold_boot_budget_bytes(config)
+        ratio = (rss_bytes / budget_bytes) if rss_bytes is not None and budget_bytes else None
+        delta = (
+            rss_bytes - before
+            if rss_bytes is not None and before is not None
+            else None
+        )
+        level = logging.WARNING
+        if error is not None or (
+            ratio is not None and ratio >= config.critical_ratio
+        ):
+            level = logging.ERROR
+
+        logger.log(
+            level,
+            "cold_boot[diagnostic]: contributor %r finished "
+            "elapsed=%.3fs rss_before=%s rss_after=%s delta=%s budget=%s "
+            "ratio=%s error=%s",
+            name,
+            elapsed_seconds if elapsed_seconds is not None else 0.0,
+            _format_mib(before),
+            _format_mib(rss_bytes),
+            _format_signed_mib(delta),
+            _format_mib(budget_bytes),
+            _format_ratio(ratio),
+            type(error).__name__ if error is not None else "none",
+        )
+
+
+def _cold_boot_budget_bytes(config: Any) -> Optional[int]:
+    if getattr(config, "limit_mb", None) is not None:
+        return int(config.limit_mb) * 1024 * 1024
+    budget_mb = resolve_watchdog_budget_mb()
+    if budget_mb is None:
+        return None
+    return budget_mb * 1024 * 1024
+
+
+def _format_mib(value: Optional[int]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 * 1024):.0f}MiB"
+
+
+def _format_signed_mib(value: Optional[int]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 * 1024):.0f}MiB"
+
+
+def _format_ratio(value: Optional[float]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value * 100:.0f}%"
 
 
 # --- Combined Application Lifecycle ---
@@ -371,13 +594,26 @@ async def readiness_check():
     # --- PostgreSQL ---
     try:
         from dynastore.models.protocols.database import DatabaseProtocol
-        db = get_protocol(DatabaseProtocol)
-        if db is None or db.async_engine is None:
+
+        # Providers are sorted ascending by `priority`, so the first one does
+        # not necessarily hold the async engine: on services that load the sync
+        # DatastoreModule (priority 7) it precedes DBService (priority 10) and
+        # always reports `async_engine` as None. Probing only that leader would
+        # report "disabled" — which leaves the status code at 200 — and a dead
+        # database would be announced as ready. Walk the providers for the async
+        # engine, as protocol_helpers.get_engine() does for the same reason.
+        async_engine = None
+        for provider in get_protocols(DatabaseProtocol):
+            async_engine = provider.async_engine
+            if async_engine is not None:
+                break
+
+        if async_engine is None:
             deps["postgres"] = {"status": "disabled"}
         else:
             from sqlalchemy import text as sa_text
             async with asyncio.timeout(2):
-                async with db.async_engine.connect() as conn:
+                async with async_engine.connect() as conn:
                     await conn.execute(sa_text("SELECT 1"))
             deps["postgres"] = {"status": "ok"}
     except TimeoutError as exc:

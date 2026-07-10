@@ -245,6 +245,57 @@ def is_lock_not_available_error(exc: Optional[BaseException]) -> bool:
     return _is_lock_not_available_error(exc)
 
 
+# --- Statement-timeout detection (pgcode 57014) ------------------------------
+# Sibling of the 55P03 lock-timeout detection above. A boot herd (several
+# pods re-running the same idempotent startup DDL after a shared-cause
+# restart, e.g. an OOM) can push a single statement past
+# ``_DDL_STATEMENT_TIMEOUT`` even once its advisory lock is held -- distinct
+# from losing the lock-acquire race. Used only by the startup-DDL tolerance
+# wrapper; regular DDL/query execution must still raise on this error.
+
+_STATEMENT_TIMEOUT_PGCODE = "57014"
+_STATEMENT_TIMEOUT_CLASS_NAMES = frozenset({"QueryCanceledError"})
+_STATEMENT_TIMEOUT_MESSAGE_FRAGMENTS = (
+    "canceling statement due to statement timeout",
+    "statement timeout",
+)
+
+
+def _is_statement_timeout_error(exc: Optional[BaseException]) -> bool:
+    """Return True if ``exc`` is a PG statement-timeout cancellation (57014).
+
+    Walks the ``.orig`` / ``__cause__`` chain so asyncpg errors wrapped inside
+    SQLAlchemy ``DBAPIError`` are still detected.
+    """
+    if exc is None:
+        return False
+    if type(exc).__name__ in _STATEMENT_TIMEOUT_CLASS_NAMES:
+        return True
+    seen: set[int] = set()
+    candidate: Optional[BaseException] = exc
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        if type(candidate).__name__ in _STATEMENT_TIMEOUT_CLASS_NAMES:
+            return True
+        pgcode = getattr(candidate, "pgcode", None) or getattr(candidate, "sqlstate", None)
+        if pgcode == _STATEMENT_TIMEOUT_PGCODE:
+            return True
+        candidate = getattr(candidate, "orig", None) or getattr(candidate, "__cause__", None)
+    msg = str(exc)
+    return any(fragment in msg for fragment in _STATEMENT_TIMEOUT_MESSAGE_FRAGMENTS)
+
+
+def is_statement_timeout_error(exc: Optional[BaseException]) -> bool:
+    """Public alias of :func:`_is_statement_timeout_error`.
+
+    Exposed for callers outside this module that need to special-case a PG
+    statement-timeout cancellation (57014) -- e.g. the startup-DDL tolerance
+    wrapper deciding whether a boot-herd cancellation is safe to retry
+    unlocked instead of aborting startup.
+    """
+    return _is_statement_timeout_error(exc)
+
+
 # --- Sync (psycopg2 / SQLAlchemy) closed-connection detection ----------------
 
 _SYNC_CLOSED_CONN_MESSAGE_FRAGMENTS = (
@@ -312,6 +363,10 @@ _DUPLICATE_OBJECT_PGCODES = frozenset({
     "42710",  # duplicate_object (general — types, functions, etc.)
     "23505",  # unique_violation (catches pg_namespace_nspname_index races)
 })
+_DDL_PEER_RACE_INTERNAL_PGCODE = "XX000"
+_DDL_PEER_RACE_MESSAGE_FRAGMENTS = frozenset({
+    "tuple concurrently updated",
+})
 
 
 def _is_duplicate_object_error(exc: Optional[BaseException]) -> bool:
@@ -328,6 +383,10 @@ def _is_duplicate_object_error(exc: Optional[BaseException]) -> bool:
         pgcode = getattr(candidate, "pgcode", None) or getattr(candidate, "sqlstate", None)
         if pgcode in _DUPLICATE_OBJECT_PGCODES:
             return True
+        if pgcode == _DDL_PEER_RACE_INTERNAL_PGCODE:
+            msg = str(candidate).lower()
+            if any(fragment in msg for fragment in _DDL_PEER_RACE_MESSAGE_FRAGMENTS):
+                return True
         candidate = getattr(candidate, "orig", None) or getattr(candidate, "__cause__", None)
     return False
 
@@ -353,6 +412,25 @@ R = TypeVar("R")
 P = ParamSpec("P")
 
 logger = logging.getLogger(__name__)
+
+_STARTUP_DDL_UNLOCKED_FALLBACK: contextvars.ContextVar[bool] = (
+    contextvars.ContextVar("startup_ddl_unlocked_fallback", default=False)
+)
+
+
+@contextmanager
+def startup_ddl_unlocked_fallback_scope() -> Iterator[None]:
+    """Mark the current call stack as the startup-DDL unlocked fallback path."""
+    token = _STARTUP_DDL_UNLOCKED_FALLBACK.set(True)
+    try:
+        yield
+    finally:
+        _STARTUP_DDL_UNLOCKED_FALLBACK.reset(token)
+
+
+def startup_ddl_fallback_active() -> bool:
+    """Return True while startup DDL is replaying after the outer lock timed out."""
+    return _STARTUP_DDL_UNLOCKED_FALLBACK.get()
 
 
 # DDL execution timeouts — short by default to surface deadlocks fast in
@@ -1353,18 +1431,24 @@ class DDLExecutor(BaseExecutor):
                 acquired = result.scalar()
 
                 if not acquired:
-                    # Another worker holds the lock. Wait for them to finish so that
-                    # their transaction is committed before we re-check existence.
-                    await tx_conn.execute(text(f"SET LOCAL lock_timeout = '{_DDL_LOCK_TIMEOUT}'"))
-                    await tx_conn.execute(
-                        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-                        {"lock_id": lock_id},
-                    )
-                    # Re-check: the other worker should have committed the object by now.
-                    if self.existence_check:
-                        res_post = await self._call_existence_check(tx_conn, params)
-                        if res_post:
-                            return True  # peer created it during our wait
+                    if startup_ddl_fallback_active():
+                        logger.warning(
+                            "DDL advisory lock busy during startup fallback; "
+                            "running idempotent DDL without the nested advisory wait."
+                        )
+                    else:
+                        # Another worker holds the lock. Wait for them to finish so that
+                        # their transaction is committed before we re-check existence.
+                        await tx_conn.execute(text(f"SET LOCAL lock_timeout = '{_DDL_LOCK_TIMEOUT}'"))
+                        await tx_conn.execute(
+                            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                            {"lock_id": lock_id},
+                        )
+                        # Re-check: the other worker should have committed the object by now.
+                        if self.existence_check:
+                            res_post = await self._call_existence_check(tx_conn, params)
+                            if res_post:
+                                return True  # peer created it during our wait
 
                 # Timeout guard to prevent DDL hangs
                 await tx_conn.execute(text(f"SET LOCAL statement_timeout = '{_DDL_STATEMENT_TIMEOUT}'"))

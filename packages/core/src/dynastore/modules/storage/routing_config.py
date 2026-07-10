@@ -267,7 +267,13 @@ class OperationDriverEntry(BaseModel):
             "Execution mode for WRITE operations.  "
             "'sync' = await result (parallel with other sync drivers, participates "
             "in coordinated rollback).  "
-            "'async' = fire-and-forget after sync phase succeeds."
+            "'async' = fire-and-forget after sync phase succeeds.  "
+            "Not consulted for catalog-/asset-tier secondary-index WRITE "
+            "entries: those propagate through the durable ``tasks.events`` "
+            "plane (``ReindexWorker`` off ``catalog_metadata_changed`` / "
+            "``AssetEntitySyncSubscriber`` off ``ASSET_*``) and are "
+            "effectively always ASYNC regardless of the configured value — "
+            "see :class:`CatalogRoutingConfig` and :class:`AssetRoutingConfig`."
         ),
     )
     sla: Optional[DriverSla] = Field(
@@ -976,6 +982,15 @@ class AssetRoutingConfig(_RoutingConfigBase):
     Same structure as :class:`ItemsRoutingConfig` but scoped to
     asset-domain drivers.
 
+    Secondary-index ``WRITE`` entries on this config (``secondary_index=True``,
+    e.g. ``AssetElasticsearchDriver``) are consumed by
+    ``dynastore.modules.catalog.asset_sync.AssetEntitySyncSubscriber`` off the
+    ``CatalogEventType.ASSET_*`` event stream — mirrors the catalog-tier
+    trigger documented on :class:`CatalogRoutingConfig` (durable
+    ``tasks.events`` plane, not a direct call from ``AssetService``). Dispatch
+    is durable and effectively always async regardless of the entry's
+    ``write_mode``, which is not consulted for these entries today.
+
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "assets", "routing")
@@ -1660,16 +1675,14 @@ async def _sync_deny_policy_for_catalog(
             await ItemsElasticsearchPrivateDriver._apply_deny_policy(catalog_id)
             return
 
-        from dynastore.models.protocols import CatalogsProtocol
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.tools.discovery import get_protocol
 
-        catalogs_proto = get_protocol(CatalogsProtocol)
         configs_proto = get_protocol(ConfigsProtocol)
-        if catalogs_proto is None or configs_proto is None:
+        if configs_proto is None:
             return
         if not await ItemsElasticsearchPrivateDriver._catalog_has_private_collection(
-            catalogs_proto, configs_proto, catalog_id,
+            configs_proto, catalog_id,
         ):
             await ItemsElasticsearchPrivateDriver._revoke_deny_policy(catalog_id)
     except Exception as exc:

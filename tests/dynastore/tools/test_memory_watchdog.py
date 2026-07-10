@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 
 import pytest
@@ -30,9 +31,11 @@ from dynastore.tools.background_service import BackgroundSupervisor, ServiceCont
 from dynastore.tools.memory_watchdog import (
     MemoryWatchdogConfig,
     MemoryWatchdogService,
+    _rss_breakdown_suffix,
     build_memory_watchdog_service,
     detect_cgroup_memory_limit_mb,
     parse_memory_to_mb,
+    read_process_rss_breakdown_bytes,
     read_process_rss_bytes,
     resolve_watchdog_budget_mb,
 )
@@ -97,6 +100,59 @@ def test_read_process_rss_bytes_returns_none_when_line_missing(tmp_path, monkeyp
         "dynastore.tools.memory_watchdog._PROC_STATUS_PATH", str(status_file)
     )
     assert read_process_rss_bytes() is None
+
+
+# ---------------------------------------------------------------------------
+# read_process_rss_breakdown_bytes
+# ---------------------------------------------------------------------------
+
+
+def _write_status(tmp_path, monkeypatch, text: str) -> None:
+    status_file = tmp_path / "status"
+    status_file.write_text(text)
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._PROC_STATUS_PATH", str(status_file)
+    )
+
+
+def test_read_process_rss_breakdown_parses_anon_and_file(tmp_path, monkeypatch) -> None:
+    _write_status(
+        tmp_path,
+        monkeypatch,
+        "VmRSS:\t 2000 kB\nRssAnon:\t  500 kB\nRssFile:\t 1500 kB\nThreads:\t2\n",
+    )
+    assert read_process_rss_breakdown_bytes() == (500 * 1024, 1500 * 1024)
+
+
+def test_read_process_rss_breakdown_is_none_when_fields_absent(tmp_path, monkeypatch) -> None:
+    # Linux < 4.5 exposes VmRSS but neither RssAnon nor RssFile.
+    _write_status(tmp_path, monkeypatch, "VmRSS:\t 2000 kB\nThreads:\t2\n")
+    assert read_process_rss_breakdown_bytes() is None
+
+
+def test_read_process_rss_breakdown_is_none_when_file_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._PROC_STATUS_PATH",
+        str(tmp_path / "does-not-exist"),
+    )
+    assert read_process_rss_breakdown_bytes() is None
+
+
+def test_rss_breakdown_suffix_renders_both_components(tmp_path, monkeypatch) -> None:
+    _write_status(
+        tmp_path,
+        monkeypatch,
+        "RssAnon:\t 1048576 kB\nRssFile:\t 2097152 kB\n",
+    )
+    assert _rss_breakdown_suffix() == " [anon 1024MiB, file 2048MiB]"
+
+
+def test_rss_breakdown_suffix_is_empty_when_unavailable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._PROC_STATUS_PATH",
+        str(tmp_path / "does-not-exist"),
+    )
+    assert _rss_breakdown_suffix() == ""
 
 
 def test_read_process_rss_bytes_returns_none_on_malformed_line(tmp_path, monkeypatch) -> None:
@@ -256,20 +312,20 @@ def test_detect_cgroup_v2_limit(tmp_path, monkeypatch) -> None:
     v2_file = tmp_path / "memory.max"
     v2_file.write_text("536870912\n")  # 512 MiB
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
     )
     assert detect_cgroup_memory_limit_mb() == 512
 
 
 def test_detect_cgroup_v1_fallback_when_v2_absent(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist"),
     )
     v1_file = tmp_path / "memory.limit_in_bytes"
     v1_file.write_text("268435456\n")  # 256 MiB
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
     )
     assert detect_cgroup_memory_limit_mb() == 256
 
@@ -278,10 +334,10 @@ def test_detect_cgroup_v2_max_sentinel_is_unlimited(tmp_path, monkeypatch) -> No
     v2_file = tmp_path / "memory.max"
     v2_file.write_text("max\n")
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist"),
     )
     assert detect_cgroup_memory_limit_mb() is None
@@ -289,24 +345,24 @@ def test_detect_cgroup_v2_max_sentinel_is_unlimited(tmp_path, monkeypatch) -> No
 
 def test_detect_cgroup_v1_huge_sentinel_is_unlimited(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist"),
     )
     v1_file = tmp_path / "memory.limit_in_bytes"
     v1_file.write_text("9223372036854771712\n")
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
     )
     assert detect_cgroup_memory_limit_mb() is None
 
 
 def test_detect_cgroup_none_when_neither_file_present(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist-v1"),
     )
     assert detect_cgroup_memory_limit_mb() is None
@@ -329,11 +385,11 @@ async def test_build_service_never_none_merely_for_unresolved_limit(monkeypatch,
     resolved yet (no RAM env, no cgroup) — it stays inert until a budget
     appears (an operator limit_mb, read live) rather than refusing to start."""
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist-v1"),
     )
     svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
@@ -359,7 +415,7 @@ async def test_build_service_auto_detects_budget_from_cgroup_at_init(monkeypatch
     v2_file = tmp_path / "memory.max"
     v2_file.write_text("536870912\n")  # 512 MiB
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
     )
 
     svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
@@ -407,11 +463,11 @@ def test_resolve_budget_defaults_workers_to_one(monkeypatch) -> None:
 
 def test_resolve_budget_none_when_no_source(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "nope-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "nope-v1"),
     )
     assert resolve_watchdog_budget_mb() is None
@@ -465,11 +521,11 @@ async def test_tick_config_limit_picked_up_live_no_latch(monkeypatch, tmp_path) 
     loadable on a LATER tick — the old design latched 'inert' on the first
     tick and never recovered."""
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "nope-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "nope-v1"),
     )
     # First tick: config store 'unreachable' -> default config (no limit_mb).
@@ -490,13 +546,32 @@ async def test_tick_config_limit_picked_up_live_no_latch(monkeypatch, tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_tick_applies_config_cadence_live(monkeypatch) -> None:
+    """A cadence_seconds set through the config store takes effect on the next
+    tick. PeriodicService.run() reads self.cadence_seconds before every sleep,
+    but the service is always BUILT with the code default (the config store is
+    unreachable at lifespan start), so shortening the sampling window — e.g. to
+    catch an OOM spike that completes between two 15s ticks — must work
+    without a redeploy."""
+    monkeypatch.setenv("RAM", "1Gi")
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog.load_memory_watchdog_config",
+        _fake_config(MemoryWatchdogConfig(cadence_seconds=2.0)),
+    )
+    svc = MemoryWatchdogService(get_rss_bytes=lambda: 100)
+    assert svc.cadence_seconds == pytest.approx(15.0)
+    await svc.tick(_make_ctx())
+    assert svc.cadence_seconds == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
 async def test_tick_inert_and_warns_once_when_no_budget(monkeypatch, tmp_path, caplog) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist-v1"),
     )
     monkeypatch.setattr(
@@ -719,3 +794,384 @@ async def test_service_runs_under_real_supervisor_and_stops_cleanly(caplog) -> N
         await supervisor.stop(timeout=2.0)
 
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic tracemalloc snapshot (geoid#3121)
+# ---------------------------------------------------------------------------
+
+
+def _patch_config(monkeypatch, config: MemoryWatchdogConfig) -> None:
+    import dynastore.tools.memory_watchdog as mw
+
+    async def _fake_load() -> MemoryWatchdogConfig:
+        return config
+
+    monkeypatch.setattr(mw, "load_memory_watchdog_config", _fake_load)
+
+
+@pytest.fixture
+def _stop_tracemalloc():
+    """Leave tracemalloc off after any diagnostic test (it is process-global)."""
+    import tracemalloc
+
+    yield
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_off_by_default_takes_no_snapshot(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """With diagnostics disabled (the default), no snapshot log is emitted even
+    while RSS is high enough to have crossed diagnostic_ratio."""
+    import tracemalloc
+
+    tracemalloc.start(1)
+    _patch_config(monkeypatch, MemoryWatchdogConfig())  # diagnostic off by default
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,  # 70% — above default diagnostic_ratio 0.60
+    )
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+    assert not any("diagnostic" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_logs_top_allocations_above_ratio(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """Tracing already on but no arming-tick baseline (e.g. a PYTHONTRACEMALLOC
+    boot): the first qualifying tick logs the absolute top sites once, as the
+    baseline report; growth diffs follow from the next report."""
+    import tracemalloc
+
+    tracemalloc.start(1)  # pre-armed so this tick exercises the snapshot path
+    # Give the snapshot something concrete to rank at the top.
+    big = [bytearray(1024 * 512) for _ in range(8)]  # ~4MiB
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,  # 70% — above diagnostic_ratio
+    )
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+    diag = [r for r in caplog.records if "diagnostic" in r.getMessage()]
+    assert len(diag) == 1
+    assert "baseline report" in diag[0].getMessage()
+    assert "allocation sites" in diag[0].getMessage()
+    assert len(big) == 8  # keep the allocation alive until after the snapshot
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_throttles_repeated_snapshots(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """A sustained climb does not log a snapshot every tick — throttled by
+    diagnostic_min_interval_seconds."""
+    import tracemalloc
+
+    tracemalloc.start(1)
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=60.0,  # long enough to suppress tick 2/3
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)
+        await svc.tick(ctx)
+        await svc.tick(ctx)
+    diag = [r for r in caplog.records if "diagnostic" in r.getMessage()]
+    assert len(diag) == 1
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_lazy_starts_tracing_then_snapshots(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """Enabled while tracemalloc is off: the first qualifying tick lazily arms
+    tracing AND captures the baseline snapshot, and a later tick emits the
+    growth report diffed against it. The flag is read live, so the diagnostic
+    can be switched on through the config store with no restart."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)  # arms tracing + captures the baseline
+        assert tracemalloc.is_tracing()
+        assert svc._diag_baseline is not None
+        assert any("started tracemalloc" in r.getMessage() for r in caplog.records)
+        assert not any("[diagnostic]" in r.getMessage() for r in caplog.records)
+        await svc.tick(ctx)  # now reports growth against the baseline
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+    assert "previous snapshot" in diag[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_reports_growth_since_previous_snapshot(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """The report names sites that GREW between snapshots (compare_to against
+    the rolled-forward baseline), with an explicit +size diff — not the absolute
+    top-N, which steady-state allocations would dominate."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)  # arming tick: baseline only, no report
+        # Allocate AFTER the baseline so this site shows up as growth.
+        big = [bytearray(1024 * 512) for _ in range(8)]  # ~4MiB
+        await svc.tick(ctx)
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+    message = diag[0].getMessage()
+    assert "by growth since the previous snapshot" in message
+    assert "+" in message  # sites are reported as +N.NMiB deltas
+    assert "test_memory_watchdog" in message  # this file is the growing site
+    assert len(big) == 8  # keep the allocation alive until after the snapshot
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_no_python_growth_points_at_native_memory(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """When the diff comes back empty while RSS is high, the report says so
+    explicitly and points at native/C-extension memory — the decisive signal
+    that tracemalloc is the wrong tool and a native profiler is next."""
+    import dynastore.tools.memory_watchdog as mw
+
+    class _FakeSnapshot:
+        def compare_to(self, _baseline, _key):
+            return []
+
+        def statistics(self, _key):
+            return []
+
+    class _FakeTracemalloc:
+        @staticmethod
+        def is_tracing() -> bool:
+            return True
+
+        @staticmethod
+        def take_snapshot() -> "_FakeSnapshot":
+            return _FakeSnapshot()
+
+        @staticmethod
+        def get_traced_memory():
+            return (42 * 1024 * 1024, 64 * 1024 * 1024)
+
+    monkeypatch.setattr(mw, "tracemalloc", _FakeTracemalloc())
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    svc._diag_baseline = _FakeSnapshot()  # type: ignore[assignment]  # as if armed earlier
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+    message = diag[0].getMessage()
+    assert "NO Python-level allocation growth" in message
+    assert "native/C-extension" in message
+
+
+@pytest.mark.asyncio
+async def test_build_does_not_start_tracemalloc(
+    monkeypatch, _stop_tracemalloc
+) -> None:
+    """The diagnostic is armed lazily from the tick path, never at build time:
+    the platform config store is unreachable when the service is built, so a
+    build-time read of the flag always sees the default. build_memory_watchdog_service
+    therefore leaves tracing off and keeps the plain cadence even with the flag set."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            cadence_seconds=15.0,
+        ),
+    )
+    svc = await build_memory_watchdog_service()
+    assert svc is not None
+    assert not tracemalloc.is_tracing()
+    assert svc.cadence_seconds == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_disable_stops_tracing_it_started(
+    monkeypatch, _stop_tracemalloc
+) -> None:
+    """Flipping the flag back off releases tracemalloc if this service started
+    it — so an operator can turn the diagnostic off live and reclaim the
+    per-allocation overhead without recycling the process."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    await svc.tick(ctx)  # lazy-starts tracing
+    assert tracemalloc.is_tracing()
+    _patch_config(monkeypatch, MemoryWatchdogConfig())  # diagnostic now off
+    await svc.tick(ctx)
+    assert not tracemalloc.is_tracing()
+
+
+def _decode_json_payload(raw: str):
+    """Stand-in for the real callers of ``json.loads`` (cache decode, HTTP
+    bodies): the frame the diagnostic has to name."""
+    import json
+
+    return json.loads(raw)
+
+
+def test_tracemalloc_keeps_enough_frames_to_reach_the_caller() -> None:
+    """``raw_decode`` <- ``decode`` <- ``loads`` <- caller is four frames deep,
+    so anything below that can only ever name ``json/decoder.py``."""
+    from dynastore.tools.memory_watchdog import _TRACEMALLOC_FRAMES
+
+    assert _TRACEMALLOC_FRAMES >= 4
+
+
+@pytest.mark.asyncio
+async def test_growth_report_names_the_caller_not_just_the_leaf_frame(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """A spike inside ``json.loads`` must be attributed to the code that asked
+    for the decode. Retaining one frame reports ``json/decoder.py`` — true, and
+    useless for finding the culprit (geoid#3121)."""
+    import json
+    import tracemalloc
+
+    assert not tracemalloc.is_tracing()
+    raw = json.dumps([{"k": i, "v": "x" * 64} for i in range(20000)])
+
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+            readiness_shed_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,  # 70% — above diagnostic_ratio, below warn
+    )
+
+    await svc.tick(_make_ctx())  # arming tick: starts tracing, takes the baseline
+    decoded = _decode_json_payload(raw)  # the spike the next report must explain
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+
+    reports = [
+        r.getMessage()
+        for r in caplog.records
+        if "memory_watchdog[diagnostic]" in r.getMessage()
+    ]
+    assert len(reports) == 1
+
+    # Each ranked entry starts with "  N. +X.YMiB ...". Isolate the entry that
+    # the decode dominates; the caller must be inside *that* entry, not merely
+    # somewhere else in the report.
+    entries = re.split(r"\n\s+\d+\.\s", reports[0])
+    decode_entries = [e for e in entries if "decoder.py" in e]
+    assert decode_entries, "expected the json decode to dominate the growth"
+    assert "test_memory_watchdog.py" in decode_entries[0], (
+        "the decode entry must name the caller of json.loads, not only its leaf "
+        f"frame. Entry was:\n{decode_entries[0]}"
+    )
+    assert len(decoded) == 20000  # keep the allocation alive past the snapshot

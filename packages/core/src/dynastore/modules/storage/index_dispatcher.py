@@ -60,9 +60,7 @@ Phases
 
 from __future__ import annotations
 
-import hashlib
 import itertools
-import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
@@ -92,9 +90,8 @@ DispatchableOp = Union[IndexOp, IndexableOp]
 
 logger = logging.getLogger(__name__)
 
-# Mirrors TaskTableOutboxWriter.DEFAULT_CHUNK_SIZE; chunk the inline
-# in-task-run dispatch so a large batch never builds one oversized
-# driver call.
+# Chunk the inline in-task-run dispatch so a large batch never builds
+# one oversized driver call.
 INLINE_DISPATCH_CHUNK_SIZE = 500
 
 # Monotonic sequence stamped on every inline ``indexer.index_bulk`` call
@@ -146,8 +143,8 @@ class IndexerFatal(Exception):
 class OutboxWriterProtocol(Protocol):
     """Minimal surface the dispatcher needs from a durable retry queue.
 
-    The default implementation (:class:`TaskTableOutboxWriter`) reuses
-    the existing ``tasks.tasks`` table; callers wanting a different
+    The default implementation (:class:`StoragePlaneOutboxWriter`) writes
+    into the unified ``tasks.storage`` table; callers wanting a different
     persistence (Kafka, SQS, …) implement the same one-method interface.
     """
 
@@ -156,247 +153,19 @@ class OutboxWriterProtocol(Protocol):
         *,
         indexer_id: str,
         ctx: IndexContext,
-        ops: Sequence[IndexOp],
+        ops: Sequence[DispatchableOp],
         last_error: Optional[str] = None,
         chunk_size: Optional[int] = None,
     ) -> None:
         ...
 
 
-class TaskTableOutboxWriter:
-    """Outbox backed by the existing ``tasks.tasks`` table.
-
-    Writes a ``task_type='index_propagation'`` row on the caller's PG
-    connection so the row commits / rolls back atomically with the
-    upstream data write.  The regular tasks worker pool drains it via
-    the existing ``claim_batch`` / ``complete_task`` / ``fail_task``
-    pipeline — retry budget, DEAD_LETTER, dedup are all reused.
-
-    The dedup_key is a stable hash of
-    ``(indexer_id, entity_type, entity_id, op_type)`` so concurrent
-    failures on the same item don't fan-out into multiple retry rows.
-
-    Deprecated: ``get_index_dispatcher()`` no longer wires this writer as
-    the default ``OUTBOX`` handler — see :class:`StoragePlaneOutboxWriter`,
-    which enqueues into the unified ``tasks.storage`` outbox instead. This
-    class stays importable/testable for the migration window (already
-    running deployments may still hold a reference to it) but new code
-    should not construct it as the dispatcher's ``outbox``.
-    """
-
-    TASK_TYPE = "index_propagation"
-
-    def __init__(
-        self,
-        *,
-        schema_resolver=None,
-        task_schema_resolver=None,
-    ) -> None:
-        """
-        Parameters
-        ----------
-        schema_resolver
-            Optional callable ``(catalog: str) -> str`` mapping a catalog
-            id to the per-tenant ``schema_name`` recorded on the task
-            row.  Defaults to passing the catalog id through unchanged
-            (matches the convention used elsewhere — schema_name == catalog
-            schema name).
-        task_schema_resolver
-            Optional callable ``() -> str`` returning the SQL schema that
-            owns the ``tasks`` table.  Defaults to importing
-            :func:`dynastore.modules.tasks.tasks_module.get_task_schema`
-            at call time, so this module stays importable in test
-            contexts that don't pull the tasks runtime.
-        """
-        self._schema_resolver = schema_resolver or (lambda c: c)
-        self._task_schema_resolver = task_schema_resolver
-
-    DEFAULT_CHUNK_SIZE = 500
-
-    async def enqueue(
-        self,
-        *,
-        indexer_id: str,
-        ctx: IndexContext,
-        ops: Sequence[IndexOp],
-        last_error: Optional[str] = None,
-        chunk_size: Optional[int] = None,
-    ) -> None:
-        if not ops:
-            return
-        if ctx.pg_conn is None:
-            # Without a caller TX we can't honour the atomicity guarantee.
-            # Emit a single warning and bail; the dispatcher's degrade
-            # path already logged the original failure.
-            sample = ops[0]
-            logger.warning(
-                "TaskTableOutboxWriter: ctx.pg_conn is None — skipping "
-                "outbox enqueue for indexer '%s' on %s/%s/%s (+%d more). "
-                "Caller must pass an open PG connection on IndexContext "
-                "for the OUTBOX policy to be durable.",
-                indexer_id, sample.op_type, sample.entity_type,
-                sample.entity_id, max(len(ops) - 1, 0),
-            )
-            return
-
-        size = chunk_size if chunk_size and chunk_size > 0 else self.DEFAULT_CHUNK_SIZE
-        # Chunk per (op_type, entity_type) so dedup_key stays meaningful.
-        # Mixed op_types in one task row would either need a composite key
-        # (over-coalesces) or no key (loses dedup) — split is cleaner.
-        grouped: Dict[Tuple[str, str], List[IndexOp]] = {}
-        for op in ops:
-            grouped.setdefault((op.op_type, op.entity_type), []).append(op)
-
-        for (op_type, entity_type), bucket in grouped.items():
-            for start in range(0, len(bucket), size):
-                chunk = bucket[start:start + size]
-                await self._enqueue_chunk(
-                    indexer_id=indexer_id,
-                    ctx=ctx,
-                    op_type=op_type,
-                    entity_type=entity_type,
-                    chunk=chunk,
-                    last_error=last_error,
-                )
-
-    async def _enqueue_chunk(
-        self,
-        *,
-        indexer_id: str,
-        ctx: IndexContext,
-        op_type: str,
-        entity_type: str,
-        chunk: Sequence[IndexOp],
-        last_error: Optional[str],
-    ) -> None:
-        task_schema = self._resolve_task_schema()
-        schema_name = self._schema_resolver(ctx.catalog)
-
-        op_records = [
-            {
-                "entity_id": o.entity_id,
-                "op_type": o.op_type,
-                "payload": o.payload,
-            }
-            for o in chunk
-        ]
-        inputs = {
-            "indexer_id": indexer_id,
-            "op_type": op_type,
-            "entity_type": entity_type,
-            "catalog": ctx.catalog,
-            "collection": ctx.collection,
-            "ops": op_records,
-            "correlation_id": ctx.correlation_id,
-            "last_error": last_error,
-        }
-        dedup_key = self._dedup_key(
-            indexer_id, op_type, entity_type,
-            [o.entity_id for o in chunk],
-        )
-
-        from dynastore.tools.identifiers import generate_uuidv7
-        from dynastore.tools.json import CustomJSONEncoder
-
-        task_id = generate_uuidv7()
-        # Observability (#504): structured log line for GCP log-based metric
-        # `index_chunks_emitted_total{indexer,source,op_type}`. One row per
-        # task — chunk_size reflects how many ops the row coalesces.
-        logger.info(
-            "index_chunk_emitted indexer=%s source=legacy op_type=%s "
-            "catalog=%s collection=%s chunk_size=%d",
-            indexer_id, op_type, ctx.catalog, ctx.collection, len(chunk),
-        )
-        _log_dispatch_path(
-            mode="outbox_handoff",
-            indexer_id=indexer_id,
-            catalog=ctx.catalog,
-            collection=ctx.collection,
-            chunk_size=len(chunk),
-        )
-        await self._exec_insert(
-            ctx.pg_conn,
-            sql=f"""
-                INSERT INTO {task_schema}.tasks (
-                    task_id, catalog_id, scope, caller_id, task_type, type,
-                    execution_mode, inputs, collection_id, dedup_key, status
-                ) VALUES (
-                    :task_id, :catalog_id, 'CATALOG', :caller_id, :task_type,
-                    'task', 'ASYNCHRONOUS', CAST(:inputs AS jsonb),
-                    :collection_id, :dedup_key, 'PENDING'
-                )
-                ON CONFLICT DO NOTHING
-            """,
-            params=dict(
-                task_id=task_id,
-                catalog_id=schema_name,
-                caller_id=f"index_dispatcher:{indexer_id}",
-                task_type=self.TASK_TYPE,
-                inputs=json.dumps(inputs, cls=CustomJSONEncoder),
-                collection_id=ctx.collection,
-                dedup_key=dedup_key,
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    def _resolve_task_schema(self) -> str:
-        if self._task_schema_resolver is not None:
-            return self._task_schema_resolver()
-        from dynastore.modules.tasks.tasks_module import get_task_schema
-        return get_task_schema()
-
-    @staticmethod
-    def _dedup_key(
-        indexer_id: str, op_type: str, entity_type: str,
-        entity_ids: Sequence[str],
-    ) -> str:
-        """Stable hash over the sorted entity-id set of a chunk.
-
-        Same chunk retried → same key (so retries coalesce). Different
-        chunks of the same batch get distinct keys.
-        """
-        sorted_ids = sorted(entity_ids)
-        material = "|".join(
-            (indexer_id, op_type, entity_type, *sorted_ids),
-        ).encode("utf-8")
-        return hashlib.sha256(material).hexdigest()[:64]
-
-    async def _exec_insert(
-        self, conn: Any, sql: str, params: Dict[str, Any],
-    ) -> None:
-        """Execute the INSERT on the caller's connection.
-
-        Delegates to :class:`DQLQuery` so connection-flavour dispatch
-        (sync/async SA ``Connection``/``Session``) and named-bind
-        translation are handled in one place — same path every other
-        query in the codebase uses. This keeps the OUTBOX writer free
-        of bespoke isinstance ladders and inherits the typed exception
-        surface (``DatabaseConnectionError`` / ``QueryExecutionError``,
-        plus transient-asyncpg detection from #235/#239).
-
-        ``ctx.pg_conn`` always comes from ``managed_transaction(engine)``
-        which yields a SA resource; raw asyncpg connections are not
-        produced by that contract, so DQLQuery's SA-only dispatch is
-        sufficient.
-        """
-        from dynastore.modules.db_config.query_executor import (
-            DQLQuery, ResultHandler,
-        )
-        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-            conn, **params,
-        )
-
-
 class StoragePlaneOutboxWriter:
     """Outbox backed by the storage-plane ``tasks.storage`` table.
 
-    Replaces :class:`TaskTableOutboxWriter` as the ``OUTBOX`` failure-
-    policy handler (un-fao/GeoID#2732 step 1) — the same durable-retry
-    concept, on the plane ``storage_drain`` already drains, instead of a
-    second ``tasks.tasks`` outbox living behind ``index_propagation``.
+    The ``OUTBOX`` failure-policy handler (un-fao/GeoID#2732 step 1) —
+    durable retry via the plane ``storage_drain`` already drains, rather
+    than a dedicated ``tasks.tasks`` outbox.
 
     Writes id-only rows via :func:`~dynastore.modules.storage.storage_emit.enqueue_storage_op_id_only`
     on the caller's PG connection so the enqueue commits / rolls back
@@ -421,61 +190,45 @@ class StoragePlaneOutboxWriter:
         *,
         indexer_id: str,
         ctx: IndexContext,
-        ops: Sequence[IndexOp],
+        ops: Sequence[DispatchableOp],
         last_error: Optional[str] = None,
         chunk_size: Optional[int] = None,
     ) -> None:
         if not ops:
             return
         if ctx.pg_conn is None:
-            # Without a caller TX we can't honour the atomicity guarantee —
-            # same degrade as TaskTableOutboxWriter.enqueue.
-            sample = ops[0]
+            # Without a caller TX we can't honour the atomicity guarantee.
             logger.warning(
                 "StoragePlaneOutboxWriter: ctx.pg_conn is None — skipping "
-                "outbox enqueue for indexer '%s' on %s/%s/%s (+%d more). "
+                "outbox enqueue for indexer '%s' on %s (+%d more). "
                 "Caller must pass an open PG connection on IndexContext "
                 "for the OUTBOX policy to be durable.",
-                indexer_id, sample.op_type, sample.entity_type,
-                sample.entity_id, max(len(ops) - 1, 0),
+                indexer_id, _describe_op(ops[0]), max(len(ops) - 1, 0),
             )
             return
 
-        from dynastore.models.protocols.indexing import OutboxRecord
-        from dynastore.modules.storage.driver_instance_id import (
-            compute_driver_instance_id,
-        )
         from dynastore.modules.storage.storage_emit import (
             enqueue_storage_op_id_only,
+            enqueue_storage_op_write_id,
         )
-        from dynastore.tools.identifiers import generate_uuidv7
 
-        collection_id = ctx.collection or ""
-        records = [
-            OutboxRecord(
-                op_id=generate_uuidv7(),
-                driver_id=indexer_id,
-                driver_instance_id=compute_driver_instance_id(
-                    indexer_id, ctx.catalog, collection_id,
-                ),
-                collection_id=collection_id,
-                op=cast(Any, op.op_type),
-                item_id=op.entity_id,
-                payload={},
-                idempotency_key=op.entity_id,
-            )
-            for op in ops
-        ]
+        grouped_records, id_only_records = _build_storage_plane_records(
+            driver_id=indexer_id, ctx=ctx, ops=ops,
+            write_id_supported=await _primary_supports_write_id_reads(
+                ctx.catalog, ctx.collection,
+            ),
+        )
+        total_records = len(grouped_records) + len(id_only_records)
         logger.info(
             "index_chunk_emitted indexer=%s source=storage_plane_outbox "
             "catalog=%s collection=%s chunk_size=%d",
-            indexer_id, ctx.catalog, ctx.collection, len(records),
+            indexer_id, ctx.catalog, ctx.collection, total_records,
         )
         if last_error:
             logger.warning(
                 "StoragePlaneOutboxWriter: enqueueing %d op(s) for indexer "
                 "'%s' (catalog=%s collection=%s) after inline failure: %s",
-                len(records), indexer_id, ctx.catalog, ctx.collection,
+                total_records, indexer_id, ctx.catalog, ctx.collection,
                 last_error,
             )
         _log_dispatch_path(
@@ -483,11 +236,16 @@ class StoragePlaneOutboxWriter:
             indexer_id=indexer_id,
             catalog=ctx.catalog,
             collection=ctx.collection,
-            chunk_size=len(records),
+            chunk_size=total_records,
         )
-        await enqueue_storage_op_id_only(
-            ctx.pg_conn, catalog_id=ctx.catalog, rows=records,
-        )
+        if grouped_records:
+            await enqueue_storage_op_write_id(
+                ctx.pg_conn, catalog_id=ctx.catalog, rows=grouped_records,
+            )
+        if id_only_records:
+            await enqueue_storage_op_id_only(
+                ctx.pg_conn, catalog_id=ctx.catalog, rows=id_only_records,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -698,8 +456,8 @@ def _make_default_indexer_registry():
     """Build a registry that resolves an :class:`Indexer` by class identity.
 
     Identity is ``_to_snake(type(impl).__name__)`` — same convention as
-    ``_self_register_indexers_into`` (routing_config.py) and
-    ``index_propagation/task.py``. No separate ``indexer_id`` attribute.
+    ``_self_register_indexers_into`` (routing_config.py). No separate
+    ``indexer_id`` attribute.
 
     Cached after first build because the set of registered indexers is
     fixed once app startup completes.
@@ -904,30 +662,25 @@ class IndexDispatcher:
             # noop-reenqueue (:1044) and partial-failure-resurface (:1054)
             # amplifiers inside ``_dispatch_bulk`` cannot fire for these ops.
             #
-            # Access-aware drivers are EXCLUDED (review finding, HIGH):
-            # ``read_canonical_index_inputs`` hardcodes ``access=None`` (it
-            # only reads the raw PG row), so a drain-time re-read can never
-            # recover ``_visibility``/``_owner``/``_attrs`` — those are
-            # write-time-only values that live in ``processing_context``
-            # (item_service.py's ``_resolve_access_envelope``) and are never
-            # persisted to a PG column. Routing an access-aware entry through
-            # this branch would silently drop row-level ABAC from the
-            # indexed document. Mirrors the ES-envelope detection branch of
-            # ``_collection_uses_access_aware_driver`` (item_service.py).
-            # Recovering the envelope at drain time is tracked as a
-            # follow-up; until then these entries take the legacy path
-            # below unchanged — but #2716 still keeps them off the in-run
-            # absorption path (see ``storage_plane_active`` below: the flag
-            # applies to every item-tier ASYNC entry, access-aware or not).
+            # Access-aware drivers are INCLUDED (#2687): the hub row now
+            # persists the write-time owner (``access_owner`` column,
+            # ``ItemService._resolve_write_owner``), and
+            # ``read_canonical_index_inputs`` recomputes ``_visibility`` /
+            # ``_owner`` / ``_attrs`` from that column plus live config
+            # (``CatalogLookupAudience`` / ``AttributeStampingPolicy``) —
+            # see ``canonical_index_read._resolve_access_context``. The drain
+            # enforces the ABAC invariant fail-closed:
+            # ``StorageDrainTask._build_canonical_doc`` raises (→ retry,
+            # never index) rather than write an access-aware doc whose
+            # envelope recompute failed or came back empty. There is
+            # therefore no longer a payload requirement that would force an
+            # access-aware entry onto a different plane than any other
+            # item-tier ASYNC entry.
             storage_plane_active = (
                 ctx.entity_type == "item"
                 and await _storage_plane_routing_enabled()
             )
-            if (
-                entry.write_mode == WriteMode.ASYNC
-                and storage_plane_active
-                and not getattr(type(indexer), "applies_access_filter", False)
-            ):
+            if entry.write_mode == WriteMode.ASYNC and storage_plane_active:
                 actually_enqueued = await self._enqueue_storage_plane_ids(
                     entry, ctx, entry_ops, tx_factory=tx_factory,
                 )
@@ -1155,9 +908,9 @@ class IndexDispatcher:
         deliberately-omitted driver doesn't flood the log on every op.
         OUTBOX path degrades through :meth:`_enqueue_or_warn` for both
         :class:`IndexableOp` and legacy :class:`IndexOp` shapes — the
-        singular-``enqueue`` outbox writer only accepts ``IndexOp``, so an
-        all-``IndexableOp`` batch is filtered out and dropped with a
-        warning there.
+        wired :class:`StoragePlaneOutboxWriter` accepts either shape, so
+        the batch (mixed or all-``IndexableOp``) reaches the durable
+        outbox unchanged.
         """
         policy = entry.on_failure
         if policy == FailurePolicy.FATAL:
@@ -1287,8 +1040,8 @@ class IndexDispatcher:
             # indistinguishable from a real success in logs, leaving the
             # target index empty with no warning.  Pure upsert no-ops are
             # converted to retryable failures so the batch routes through the
-            # durable outbox path (``_enqueue_or_warn``) and
-            # ``IndexPropagationTask`` replays it post-commit.  Delete ops are
+            # durable outbox path (``_enqueue_or_warn``) and the
+            # storage-plane drain replays it post-commit.  Delete ops are
             # unaffected — they have their own pass-through.
             if result.total > 0 and result.succeeded == 0 and result.failed == 0:
                 logger.warning(
@@ -1619,10 +1372,10 @@ class IndexDispatcher:
                 )
             return 0
 
-        # The legacy ``enqueue`` writer expects IndexOp shape; an
-        # IndexableOp-only batch is skipped with a single warning rather
-        # than hard-failing — the caller's failure policy already chose
-        # tolerance.
+        # ``OutboxWriterProtocol.enqueue`` accepts the full ``DispatchableOp``
+        # union — the wired :class:`StoragePlaneOutboxWriter` builds records
+        # from either shape via ``_op_kind``/``_op_entity_id``/``_op_write_id``,
+        # the same helpers ``_enqueue_storage_plane_ids`` already relies on.
         enqueue = getattr(self._outbox, "enqueue", None)
         if enqueue is None:
             logger.warning(
@@ -1631,37 +1384,26 @@ class IndexDispatcher:
                 entry.driver_ref, len(ops),
             )
             return 0
-        index_ops: List[IndexOp] = [
-            cast(IndexOp, o) for o in ops if not isinstance(o, IndexableOp)
-        ]
-        if not index_ops:
-            logger.warning(
-                "IndexDispatcher: %d IndexableOp(s) routed to legacy "
-                "task-table outbox for indexer '%s' — dropping; wire an "
-                "OutboxStore for the bulk path.",
-                len(ops), entry.driver_ref,
-            )
-            return 0
         # Drop path (b): caller has no open PG connection.
-        # ``TaskTableOutboxWriter.enqueue`` checks this too but returns silently
-        # without raising — catch it here so the ASYNC caller receives the real
-        # failed count rather than a false success.
+        # ``StoragePlaneOutboxWriter.enqueue`` checks this too but returns
+        # silently without raising — catch it here so the ASYNC caller
+        # receives the real failed count rather than a false success.
         if ctx.pg_conn is None:
             logger.warning(
                 "IndexDispatcher: cannot enqueue %d op(s) for indexer '%s' — "
                 "ctx.pg_conn is None (no open TX); ops dropped. "
                 "Caller must supply an open PG connection for durable enqueue.",
-                len(index_ops), entry.driver_ref,
+                len(ops), entry.driver_ref,
             )
             return 0
         try:
             await enqueue(
                 indexer_id=entry.driver_ref,
                 ctx=ctx,
-                ops=index_ops,
+                ops=ops,
                 last_error=str(original) if original else None,
             )
-            return len(index_ops)
+            return len(ops)
         except Exception as enqueue_exc:
             # Drop path (c): transient PG error during enqueue.
             # We do NOT escalate to FATAL here because the upstream caller has
@@ -1683,7 +1425,7 @@ class IndexDispatcher:
         *,
         tx_factory: Optional[Callable[[], Any]] = None,
     ) -> int:
-        """Enqueue id-only ``tasks.storage`` obligations (#2494 P1).
+        """Enqueue ``tasks.storage`` obligations for the storage plane.
 
         Used for item-tier ASYNC secondary-index entries when
         ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled.
@@ -1698,44 +1440,32 @@ class IndexDispatcher:
         """
         if not ops:
             return 0
-        from dynastore.models.protocols.indexing import OutboxRecord
-        from dynastore.modules.storage.driver_instance_id import (
-            compute_driver_instance_id,
-        )
         from dynastore.modules.storage.storage_emit import (
             enqueue_storage_op_id_only,
+            enqueue_storage_op_write_id,
         )
-        from dynastore.tools.identifiers import generate_uuidv7
-
-        collection_id = ctx.collection or ""
-        records = [
-            OutboxRecord(
-                op_id=generate_uuidv7(),
-                driver_id=entry.driver_ref,
-                driver_instance_id=compute_driver_instance_id(
-                    entry.driver_ref, ctx.catalog, collection_id,
-                ),
-                collection_id=collection_id,
-                op=cast(Any, _op_kind(op)),
-                item_id=_op_entity_id(op),
-                # Ignored downstream: enqueue_storage_op_id_only always
-                # forces the explicit id-only sentinel onto op_payload
-                # (storage_emit.py) regardless of what's set here.
-                payload={},
-                idempotency_key=_op_entity_id(op),
-            )
-            for op in ops
-        ]
+        grouped_records, id_only_records = _build_storage_plane_records(
+            driver_id=entry.driver_ref, ctx=ctx, ops=ops,
+            write_id_supported=await _primary_supports_write_id_reads(
+                ctx.catalog, ctx.collection,
+            ),
+        )
+        total_records = len(grouped_records) + len(id_only_records)
 
         if ctx.pg_conn is not None:
             try:
-                await enqueue_storage_op_id_only(
-                    ctx.pg_conn, catalog_id=ctx.catalog, rows=records,
-                )
-                return len(records)
+                if grouped_records:
+                    await enqueue_storage_op_write_id(
+                        ctx.pg_conn, catalog_id=ctx.catalog, rows=grouped_records,
+                    )
+                if id_only_records:
+                    await enqueue_storage_op_id_only(
+                        ctx.pg_conn, catalog_id=ctx.catalog, rows=id_only_records,
+                    )
+                return total_records
             except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
                 logger.error(
-                    "IndexDispatcher: storage-plane id-only enqueue failed "
+                    "IndexDispatcher: storage-plane enqueue failed "
                     "for indexer '%s' (catalog=%s collection=%s): %s",
                     entry.driver_ref, ctx.catalog, ctx.collection, exc,
                 )
@@ -1744,13 +1474,18 @@ class IndexDispatcher:
         if tx_factory is not None:
             try:
                 async with tx_factory() as conn:
-                    await enqueue_storage_op_id_only(
-                        conn, catalog_id=ctx.catalog, rows=records,
-                    )
-                return len(records)
+                    if grouped_records:
+                        await enqueue_storage_op_write_id(
+                            conn, catalog_id=ctx.catalog, rows=grouped_records,
+                        )
+                    if id_only_records:
+                        await enqueue_storage_op_id_only(
+                            conn, catalog_id=ctx.catalog, rows=id_only_records,
+                        )
+                return total_records
             except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
                 logger.error(
-                    "IndexDispatcher: storage-plane id-only enqueue (short "
+                    "IndexDispatcher: storage-plane enqueue (short "
                     "TX) failed for indexer '%s' (catalog=%s collection=%s): "
                     "%s",
                     entry.driver_ref, ctx.catalog, ctx.collection, exc,
@@ -1758,16 +1493,98 @@ class IndexDispatcher:
                 return 0
 
         logger.warning(
-            "IndexDispatcher: cannot enqueue %d storage-plane id-only op(s) "
+            "IndexDispatcher: cannot enqueue %d storage-plane op(s) "
             "for indexer '%s' — no open PG connection and no tx_factory "
             "supplied. Caller must supply one for durable enqueue.",
-            len(records), entry.driver_ref,
+            total_records, entry.driver_ref,
         )
         return 0
 
 
 def _op_payload(op: "DispatchableOp") -> Any:
     return op.payload if hasattr(op, "payload") else None
+
+
+def _op_write_id(op: "DispatchableOp") -> Optional[str]:
+    write_id = getattr(op, "write_id", None)
+    return write_id if isinstance(write_id, str) and write_id else None
+
+
+async def _primary_supports_write_id_reads(
+    catalog_id: str,
+    collection_id: Optional[str],
+) -> bool:
+    """True when the collection's primary WRITE driver can hydrate
+    write-id ledger rows (#3116 routing guard).
+
+    Mirrors ``StorageDrainTask._resolve_primary_write_source`` — the drain
+    hydrates from the FIRST resolved WRITE driver, so write-id rows must
+    only be enqueued when that driver exposes the write-id chunk-read
+    capability. Any resolution failure counts as unsupported: the caller
+    falls back to id-only rows, which re-read canonical PG state and are
+    always hydratable.
+    """
+    from dynastore.modules.storage.router import get_write_drivers
+    from dynastore.modules.storage.storage_emit import (
+        driver_supports_write_id_reads,
+    )
+
+    try:
+        resolved = await get_write_drivers(catalog_id, collection_id)
+    except Exception:  # noqa: BLE001 — resolution failure = no capability
+        return False
+    if not resolved:
+        return False
+    return driver_supports_write_id_reads(getattr(resolved[0], "driver", None))
+
+
+def _build_storage_plane_records(
+    *,
+    driver_id: str,
+    ctx: IndexContext,
+    ops: Sequence[DispatchableOp],
+    write_id_supported: bool = True,
+) -> Tuple[List[Any], List[Any]]:
+    from dynastore.models.protocols.indexing import OutboxRecord, WriteIdOutboxRecord
+    from dynastore.modules.storage.driver_instance_id import (
+        compute_driver_instance_id,
+    )
+    from dynastore.tools.identifiers import generate_uuidv7
+
+    collection_id = ctx.collection or ""
+    driver_instance_id = compute_driver_instance_id(
+        driver_id, ctx.catalog, collection_id,
+    )
+    grouped_records: List[WriteIdOutboxRecord] = []
+    id_only_records: List[OutboxRecord] = []
+    for op in ops:
+        write_id = _op_write_id(op) if write_id_supported else None
+        if write_id is not None:
+            grouped_records.append(
+                WriteIdOutboxRecord(
+                    op_id=generate_uuidv7(),
+                    driver_id=driver_id,
+                    driver_instance_id=driver_instance_id,
+                    collection_id=collection_id,
+                    op=cast(Any, _op_kind(op)),
+                    write_id=write_id,
+                    idempotency_key=write_id,
+                ),
+            )
+            continue
+        entity_id = _op_entity_id(op)
+        id_only_records.append(
+            OutboxRecord(
+                op_id=generate_uuidv7(),
+                driver_id=driver_id,
+                driver_instance_id=driver_instance_id,
+                collection_id=collection_id,
+                op=cast(Any, _op_kind(op)),
+                item_id=entity_id,
+                idempotency_key=entity_id,
+            ),
+        )
+    return grouped_records, id_only_records
 
 
 def _op_entity_id(op: "DispatchableOp") -> str:

@@ -32,9 +32,10 @@ import pytest
 from dynastore.models.protocols.indexer import (
     BulkResult, IndexContext, IndexOp,
 )
+from dynastore.models.protocols.indexing import IndexableOp
 from dynastore.modules.storage.index_dispatcher import (
     INLINE_DISPATCH_CHUNK_SIZE, IndexDispatcher, IndexerFatal,
-    StoragePlaneOutboxWriter, TaskTableOutboxWriter, get_index_dispatcher,
+    StoragePlaneOutboxWriter, get_index_dispatcher,
     reset_index_dispatcher,
 )
 from dynastore.modules.storage.routing_config import (
@@ -127,6 +128,21 @@ def _op(op_type: str = "upsert", entity_id: str = "item-1") -> IndexOp:
         entity_type="item",
         entity_id=entity_id,
         payload={"foo": "bar"} if op_type == "upsert" else None,
+    )
+
+
+def _indexable_op(*, op: str = "upsert", entity_id: str = "item-1") -> IndexableOp:
+    from uuid import uuid4
+
+    return IndexableOp(
+        op_id=uuid4(),
+        op=op,
+        catalog_id="cat-x",
+        collection_id="col-y",
+        driver_instance_id="primary-di",
+        item_id=entity_id,
+        payload={"foo": "bar"} if op == "upsert" else {},
+        idempotency_key=f"idem-{entity_id}",
     )
 
 
@@ -494,170 +510,34 @@ class _FakePgConn:
         return None
 
 
-@pytest.mark.asyncio
-async def test_outbox_writer_skips_when_no_pg_conn(caplog):
-    """When IndexContext has no pg_conn, atomicity can't be guaranteed —
-    writer logs a warning and returns without raising.
+class _RecordingWriter:
+    """Generic ``OutboxWriterProtocol`` double — records each accepted op
+    without touching a database.  Used by tests that exercise the
+    dispatcher's OUTBOX routing decisions (which writer gets called, with
+    which ops), not the internals of any specific writer implementation.
     """
-    writer = TaskTableOutboxWriter(task_schema_resolver=lambda: "tasks")
-    import logging as _logging
-    with caplog.at_level(_logging.WARNING):
-        await writer.enqueue(
-            indexer_id="x", ctx=_ctx(), ops=[_op()], last_error="boom",
-        )
-    assert any("ctx.pg_conn is None" in r.getMessage() for r in caplog.records)
-
-
-class _RecordingWriter(TaskTableOutboxWriter):
-    """Bypass DQLQuery so chunk emission can be asserted in isolation
-    from the SA dialect resolution layer (which the legacy ``_FakePgConn``
-    fixture no longer satisfies)."""
 
     def __init__(self) -> None:
-        super().__init__(task_schema_resolver=lambda: "tasks")
         self.rows: list[dict] = []
 
-    async def _exec_insert(self, conn, sql, params):  # type: ignore[override]
-        self.rows.append({"sql": sql, "params": dict(params)})
-
-
-
-@pytest.mark.asyncio
-async def test_outbox_writer_inserts_task_row_on_caller_conn():
-    """Happy path: writer issues INSERT INTO {task_schema}.tasks on the
-    caller's connection.  The shape of the SQL + bind args is the load-
-    bearing assertion — this is the contract that gives the atomicity
-    guarantee.
-    """
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx,
-        ops=[_op()],
-        last_error="ES timeout",
-    )
-    assert len(writer.rows) == 1
-    sql = writer.rows[0]["sql"]
-    params = writer.rows[0]["params"]
-
-    # SQL must INSERT into the tasks table with task_type='index_propagation'.
-    assert "INSERT INTO tasks.tasks" in sql
-    # Named binds preserved (DQLQuery uses sqlalchemy text named binds).
-    assert ":task_id" in sql
-    # ``inputs`` is a JSON-serialized payload bound by name.
-    import json as _json
-    inputs = _json.loads(params["inputs"])
-    assert inputs["indexer_id"] == "items_elasticsearch_driver"
-    assert inputs["ops"][0]["entity_id"] == "item-1"
-    assert inputs["op_type"] == "upsert"
-    assert inputs["catalog"] == "cat-x"
-    assert inputs["last_error"] == "ES timeout"
-
-
-@pytest.mark.asyncio
-async def test_outbox_dedup_key_is_stable_across_calls():
-    """Same chunk identity → same dedup_key.  Different op_type → distinct
-    key.  Different chunk membership → distinct key.
-    """
-    k_a = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["abc"])
-    k_b = TaskTableOutboxWriter._dedup_key("ix", "delete", "item", ["abc"])
-    k_c = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["abc"])
-    k_d = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["abc", "def"])
-    # Same chunk content, different ordering → same key (sorted).
-    k_d2 = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["def", "abc"])
-    assert k_a == k_c, "same chunk identity must coalesce"
-    assert k_a != k_b, "upsert and delete must stay distinct"
-    assert k_a != k_d, "different chunk membership must produce distinct keys"
-    assert k_d == k_d2, "order-independent: sort entity_ids before hashing"
-
-
-@pytest.mark.asyncio
-async def test_outbox_chunks_large_batch_into_one_row_per_chunk():
-    """A 1500-op batch with chunk_size=500 → 3 task rows, each carrying
-    500 ops under inputs.ops.
-    """
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),  # truthy; bypassed by _RecordingWriter._exec_insert
-    )
-    writer = _RecordingWriter()
-    ops = [_op(entity_id=f"i{i}") for i in range(1500)]
-
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx, ops=ops, chunk_size=500,
-    )
-    assert len(writer.rows) == 3
-    import json as _json
-    sizes = [
-        len(_json.loads(r["params"]["inputs"])["ops"]) for r in writer.rows
-    ]
-    assert sizes == [500, 500, 500]
-    keys = {r["params"]["dedup_key"] for r in writer.rows}
-    assert len(keys) == 3, "distinct chunks must produce distinct dedup_keys"
-
-
-@pytest.mark.asyncio
-async def test_outbox_one_op_call_writes_single_row_of_one_op():
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx, ops=[_op()],
-    )
-    assert len(writer.rows) == 1
-    import json as _json
-    inputs = _json.loads(writer.rows[0]["params"]["inputs"])
-    assert len(inputs["ops"]) == 1
-    assert inputs["ops"][0]["entity_id"] == "item-1"
-
-
-@pytest.mark.asyncio
-async def test_outbox_mixed_op_types_chunk_separately():
-    """Mixing upsert + delete in one enqueue call splits per op_type so
-    each chunk's dedup_key stays meaningful (upsert/delete don't share
-    a coalescing identity).
-    """
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-    ops = [
-        _op("upsert", entity_id="a"),
-        _op("delete", entity_id="b"),
-        _op("upsert", entity_id="c"),
-    ]
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx, ops=ops,
-    )
-    assert len(writer.rows) == 2
-    import json as _json
-    op_types = sorted(
-        _json.loads(r["params"]["inputs"])["op_type"] for r in writer.rows
-    )
-    assert op_types == ["delete", "upsert"]
-
-
-@pytest.mark.asyncio
-async def test_outbox_empty_ops_is_noop():
-    ctx = IndexContext(
-        catalog="cat", collection="col", correlation_id="cid",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-    await writer.enqueue(indexer_id="x", ctx=ctx, ops=[])
-    assert writer.rows == []
+    async def enqueue(
+        self,
+        *,
+        indexer_id: str,
+        ctx: IndexContext,
+        ops: Sequence[IndexOp],
+        last_error: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+    ) -> None:
+        for op in ops:
+            self.rows.append({
+                "indexer_id": indexer_id,
+                "catalog": ctx.catalog,
+                "collection": ctx.collection,
+                "op_type": op.op_type,
+                "entity_id": op.entity_id,
+                "last_error": last_error,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -696,53 +576,16 @@ async def test_default_dispatcher_describe_with_no_routing_returns_empty_indexer
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_outbox_policy_with_writer_enqueues_on_failure():
-    """OUTBOX policy + a real OutboxWriter should write the task row when
-    the indexer call fails.  Validates the production durability path
-    end-to-end against the dispatcher.
-    """
-    a = _StubIndexer("a", raise_on="upsert")
-    ctx_with_conn = IndexContext(
-        catalog="cat-x", collection="col-y",
-        correlation_id="cid-1", pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-
-    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
-
-    async def routing_resolver(catalog, collection):
-        return routing
-
-    async def indexer_registry(indexer_id):
-        return {"a": a}.get(indexer_id)
-
-    dispatcher = IndexDispatcher(
-        routing_resolver=routing_resolver,
-        indexer_registry=indexer_registry,
-        outbox=writer,
-    )
-    await dispatcher.fan_out_bulk(ctx_with_conn, [_op()])
-
-    # Indexer was attempted once (and raised).
-    assert len(a.bulk_calls) == 1
-    # Outbox row was written on the caller's connection.
-    assert len(writer.rows) == 1
-    assert "INSERT INTO tasks.tasks" in writer.rows[0]["sql"]
-
-
 # ---------------------------------------------------------------------------
-# StoragePlaneOutboxWriter — replaces TaskTableOutboxWriter as the default
-# OUTBOX failure-policy handler (un-fao/GeoID#2732 step 1: index_propagation
-# consolidation).
+# StoragePlaneOutboxWriter — the default OUTBOX failure-policy handler
+# (un-fao/GeoID#2732 step 1).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_storage_plane_outbox_writer_skips_when_no_pg_conn(caplog):
-    """Same atomicity guard as TaskTableOutboxWriter: no open TX means the
-    enqueue can't be made durable, so it degrades to a warning instead of
-    silently writing a non-atomic row."""
+    """No open TX means the enqueue can't be made durable, so it degrades
+    to a warning instead of silently writing a non-atomic row."""
     import logging as _logging
 
     writer = StoragePlaneOutboxWriter()
@@ -808,6 +651,33 @@ async def test_storage_plane_outbox_writer_maps_delete_op_to_delete_row(
 
 
 @pytest.mark.asyncio
+async def test_storage_plane_outbox_writer_enqueues_grouped_write_id_rows(
+    monkeypatch,
+):
+    _patch_write_id_capable_primary(monkeypatch)
+    calls = _patch_storage_emit_recorders(monkeypatch)
+    writer = StoragePlaneOutboxWriter()
+    ctx = IndexContext(
+        catalog="cat-x", collection="col-y", correlation_id="cid-1",
+        pg_conn=object(),
+    )
+    await writer.enqueue(
+        indexer_id="items_elasticsearch_driver",
+        ctx=ctx,
+        ops=[
+            _write_id_op(write_id="w-123", entity_id="item-1"),
+            _write_id_op(write_id="w-123", entity_id="item-2"),
+        ],
+        last_error="ES timeout",
+    )
+    assert calls["id_only"] == []
+    assert len(calls["write_id"]) == 1
+    rows = calls["write_id"][0]["rows"]
+    assert len(rows) == 2
+    assert {r.write_id for r in rows} == {"w-123"}
+
+
+@pytest.mark.asyncio
 async def test_storage_plane_outbox_writer_empty_ops_is_noop(monkeypatch):
     calls = _patch_storage_emit_recorder(monkeypatch)
     writer = StoragePlaneOutboxWriter()
@@ -824,8 +694,8 @@ async def test_outbox_policy_with_storage_plane_writer_enqueues_on_failure(
     monkeypatch,
 ):
     """OUTBOX policy + the storage-plane writer wired as ``outbox`` writes a
-    tasks.storage row on inline failure and never produces an
-    index_propagation (tasks.tasks) row."""
+    tasks.storage row on inline failure and never produces a
+    payload-carrying tasks.tasks row."""
     calls = _patch_storage_emit_recorder(monkeypatch)
     a = _StubIndexer("a", raise_on="upsert")
     ctx_with_conn = IndexContext(
@@ -892,15 +762,90 @@ async def test_outbox_policy_delete_failure_enqueues_storage_plane_delete_row(
 
 
 @pytest.mark.asyncio
+async def test_outbox_policy_all_indexableop_batch_reaches_writer(monkeypatch):
+    """#3173 regression: an all-IndexableOp OUTBOX batch must reach the
+    storage-plane writer instead of being filtered to an empty IndexOp
+    subset and dropped — the IndexOp-only constraint belonged to the
+    retired TaskTableOutboxWriter, and StoragePlaneOutboxWriter already
+    builds records from either op shape.
+    """
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    a = _StubIndexer("a", raise_on="upsert")
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return {"a": a}.get(indexer_id)
+
+    dispatcher = IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=StoragePlaneOutboxWriter(),
+    )
+    ops = [
+        _indexable_op(op="upsert", entity_id="item-1"),
+        _indexable_op(op="delete", entity_id="item-2"),
+    ]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert len(a.bulk_calls) == 1
+    assert len(calls) == 1, "the batch must reach the storage-plane writer"
+    rows_by_id = {r.item_id: r.op for r in calls[0]["rows"]}
+    assert rows_by_id == {"item-1": "upsert", "item-2": "delete"}
+    # The failure policy still reports the whole batch as failed —
+    # accepted-count semantics for the ASYNC caller are unaffected.
+    assert results["a"].failed == 2
+
+
+@pytest.mark.asyncio
+async def test_outbox_policy_mixed_op_shapes_all_reach_writer(monkeypatch):
+    """A batch mixing legacy IndexOp and IndexableOp members must not have
+    the IndexableOp members silently dropped."""
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    a = _StubIndexer("a", raise_on="upsert")
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return {"a": a}.get(indexer_id)
+
+    dispatcher = IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=StoragePlaneOutboxWriter(),
+    )
+    ops = [
+        _op(op_type="upsert", entity_id="legacy-1"),
+        _indexable_op(op="delete", entity_id="new-1"),
+    ]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert len(calls) == 1
+    row_ids = {r.item_id for r in calls[0]["rows"]}
+    assert row_ids == {"legacy-1", "new-1"}
+    assert results["a"].failed == 2
+
+
+@pytest.mark.asyncio
 async def test_default_dispatcher_wires_storage_plane_outbox_writer():
     """un-fao/GeoID#2732 step 1: the process-wide default dispatcher's
-    OUTBOX handler is the storage-plane writer, not TaskTableOutboxWriter —
-    fresh writes must never produce index_propagation rows."""
+    OUTBOX handler is the storage-plane writer."""
     await reset_index_dispatcher()
     dispatcher = get_index_dispatcher()
     try:
         assert isinstance(dispatcher._outbox, StoragePlaneOutboxWriter)
-        assert not isinstance(dispatcher._outbox, TaskTableOutboxWriter)
     finally:
         await reset_index_dispatcher()
 
@@ -1085,12 +1030,7 @@ async def test_silent_noop_upsert_batch_enqueues_and_returns_failed():
 
     # (a) outbox must have been written
     assert len(writer.rows) >= 1, "outbox enqueue must be called for noop upserts"
-    import json as _json
-    enqueued_ids = {
-        item["entity_id"]
-        for row in writer.rows
-        for item in _json.loads(row["params"]["inputs"])["ops"]
-    }
+    enqueued_ids = {row["entity_id"] for row in writer.rows}
     assert "i1" in enqueued_ids
     assert "i2" in enqueued_ids
 
@@ -1215,12 +1155,7 @@ async def test_async_write_mode_skips_inline_index_and_enqueues():
     )
     # Outbox must have received the ops.
     assert len(writer.rows) >= 1, "ASYNC entry must enqueue ops to outbox"
-    import json as _json
-    enqueued_ids = {
-        item["entity_id"]
-        for row in writer.rows
-        for item in _json.loads(row["params"]["inputs"])["ops"]
-    }
+    enqueued_ids = {row["entity_id"] for row in writer.rows}
     assert "i1" in enqueued_ids
     assert "i2" in enqueued_ids
 
@@ -1556,13 +1491,10 @@ async def test_mixed_sync_and_async_entries_dispatch_correctly():
 # ---------------------------------------------------------------------------
 
 
-class _FailingWriter(TaskTableOutboxWriter):
-    """Simulates a transient PG error during task-row insertion (drop path c)."""
+class _FailingWriter:
+    """Simulates a transient PG error during outbox enqueue (drop path c)."""
 
-    def __init__(self) -> None:
-        super().__init__(task_schema_resolver=lambda: "tasks")
-
-    async def _exec_insert(self, conn, sql, params):  # type: ignore[override]
+    async def enqueue(self, **kwargs) -> None:
         raise RuntimeError("simulated transient PG error")
 
 
@@ -1590,9 +1522,9 @@ async def test_async_enqueue_drop_path_a_no_outbox_returns_failed():
 
 @pytest.mark.asyncio
 async def test_async_enqueue_drop_path_b_pg_conn_none_returns_failed():
-    """Drop path (b): ctx.pg_conn is None — TaskTableOutboxWriter.enqueue
-    returns silently without enqueuing anything.  The ASYNC branch pre-checks
-    and must return BulkResult(succeeded=0, failed=N).
+    """Drop path (b): ctx.pg_conn is None. The ASYNC branch pre-checks
+    before ever calling the outbox writer's enqueue and must return
+    BulkResult(succeeded=0, failed=N).
     """
     a = _StubIndexer("a")
     writer = _RecordingWriter()
@@ -1648,6 +1580,69 @@ def _patch_storage_emit_recorder(monkeypatch) -> List[dict]:
     return calls
 
 
+def _patch_storage_emit_recorders(monkeypatch) -> dict[str, List[dict]]:
+    import dynastore.modules.storage.storage_emit as storage_emit_mod
+
+    calls = {"id_only": [], "write_id": []}
+
+    async def _fake_id_only(conn, *, catalog_id, rows):
+        calls["id_only"].append(
+            {"conn": conn, "catalog_id": catalog_id, "rows": list(rows)},
+        )
+
+    async def _fake_write_id(conn, *, catalog_id, rows):
+        calls["write_id"].append(
+            {"conn": conn, "catalog_id": catalog_id, "rows": list(rows)},
+        )
+
+    monkeypatch.setattr(storage_emit_mod, "enqueue_storage_op_id_only", _fake_id_only)
+    monkeypatch.setattr(storage_emit_mod, "enqueue_storage_op_write_id", _fake_write_id)
+    return calls
+
+
+def _write_id_op(
+    *,
+    write_id: str,
+    op: str = "upsert",
+    entity_id: str = "item-1",
+) -> IndexableOp:
+    from uuid import uuid4
+
+    indexable = IndexableOp(
+        op_id=uuid4(),
+        op=op,
+        catalog_id="cat-x",
+        collection_id="col-y",
+        driver_instance_id="primary-di",
+        item_id=entity_id,
+        payload={"foo": "bar"} if op == "upsert" else {},
+        idempotency_key=f"{write_id}:{entity_id}",
+    )
+    object.__setattr__(indexable, "write_id", write_id)
+    return indexable
+
+
+def _patch_write_id_capable_primary(monkeypatch) -> None:
+    """Resolve the primary WRITE driver to a stub exposing
+    ``read_indexable_write_batch`` (#3116) — without this, grouped write-id
+    rows can never be produced: ``_primary_supports_write_id_reads`` fails
+    open to ``False`` when ``get_write_drivers`` isn't wired, forcing every
+    op down the id-only fallback path regardless of ``op.write_id``.
+    """
+    from types import SimpleNamespace
+
+    import dynastore.modules.storage.router as router_mod
+
+    class _CapablePrimary:
+        async def read_indexable_write_batch(self, **kwargs):
+            return []
+
+    async def _fake_get_write_drivers(catalog_id, collection_id):
+        return [SimpleNamespace(driver=_CapablePrimary())]
+
+    monkeypatch.setattr(router_mod, "get_write_drivers", _fake_get_write_drivers)
+
+
 @pytest.mark.asyncio
 async def test_storage_plane_flag_on_item_async_enqueues_id_only_not_in_task_run(monkeypatch):
     """Flag ON + item-tier ASYNC entry, outside a task run: id-only rows are
@@ -1669,7 +1664,7 @@ async def test_storage_plane_flag_on_item_async_enqueues_id_only_not_in_task_run
     assert calls[0]["catalog_id"] == "cat-x"
     row_ids = {r.item_id for r in calls[0]["rows"]}
     assert row_ids == {"i1", "i2"}
-    assert all(r.payload == {} for r in calls[0]["rows"]), "rows must be id-only"
+    assert all(r.op == "upsert" for r in calls[0]["rows"]), "rows must be id-only"
     assert results["a"].succeeded == 2
     assert results["a"].failed == 0
 
@@ -1696,6 +1691,32 @@ async def test_storage_plane_flag_on_item_async_enqueues_id_only_in_task_run(mon
     )
     assert len(calls) == 1
     assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_item_async_enqueues_grouped_write_id_row(monkeypatch):
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    _patch_write_id_capable_primary(monkeypatch)
+    calls = _patch_storage_emit_recorders(monkeypatch)
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(
+        entries=[_async_entry("a")], indexers={"a": a},
+    )
+    ops = [
+        _write_id_op(write_id="w-123", entity_id="i1"),
+        _write_id_op(write_id="w-123", entity_id="i2"),
+    ]
+    results = await dispatcher.fan_out_bulk(_item_ctx(), ops)
+
+    assert a.bulk_calls == []
+    assert calls["id_only"] == []
+    assert len(calls["write_id"]) == 1
+    rows = calls["write_id"][0]["rows"]
+    assert len(rows) == 2
+    assert {r.write_id for r in rows} == {"w-123"}
+    assert results["a"].succeeded == 2
+    assert results["a"].failed == 0
 
 
 @pytest.mark.asyncio
@@ -1752,7 +1773,7 @@ async def test_storage_plane_flag_on_no_conn_no_tx_factory_drops_and_fails(monke
 @pytest.mark.asyncio
 async def test_storage_plane_flag_off_preserves_legacy_async_outbox_path(monkeypatch):
     """Flag OFF: byte-identical to the pre-#2494 dispatch — ASYNC entries
-    still go through the payload-carrying TaskTableOutboxWriter."""
+    still go through the payload-carrying legacy outbox writer."""
     _patch_storage_plane_flag(monkeypatch, enabled=False)
     calls = _patch_storage_emit_recorder(monkeypatch)
 
@@ -1815,35 +1836,38 @@ async def test_storage_plane_flag_on_non_item_entity_type_unaffected(monkeypatch
 
 class _AccessAwareStubIndexer(_StubIndexer):
     """An ASYNC secondary indexer that carries the same
-    ``applies_access_filter = True`` class marker as the private ES
-    envelope driver — used to pin that the storage-plane gate excludes
-    access-aware entries (review finding: the drain's canonical re-read
-    cannot recover the write-time access envelope)."""
+    ``applies_access_filter = True`` class marker as the envelope ES
+    driver — used to pin that the storage-plane gate now INCLUDES
+    access-aware entries (#2687: the drain recomputes the ABAC envelope
+    from the hub row's persisted ``access_owner`` column plus live config,
+    fail-closed)."""
 
     applies_access_filter = True
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_access_aware_entry_excluded(monkeypatch):
-    """An access-aware ASYNC entry (applies_access_filter=True) must NEVER
-    take the id-only storage-plane branch, even with the flag on — the
-    drain cannot recover _visibility/_owner/_attrs from a bare PG re-read.
-    It falls back to the legacy payload-carrying outbox path unchanged.
+async def test_storage_plane_flag_on_access_aware_entry_included(monkeypatch):
+    """An access-aware ASYNC entry (applies_access_filter=True) now takes
+    the SAME id-only storage-plane branch as any other item-tier ASYNC
+    entry (#2687) — the drain recomputes the envelope from stored state, so
+    there is no longer a payload requirement forcing it onto a different
+    plane.
     """
     _patch_storage_plane_flag(monkeypatch, enabled=True)
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _AccessAwareStubIndexer("a")
-    writer = _RecordingWriter()
-    dispatcher = _make_dispatcher_with_outbox(
-        entries=[_async_entry("a")], indexers={"a": a}, outbox=writer,
+    dispatcher = _make_dispatcher(
+        entries=[_async_entry("a")], indexers={"a": a},
     )
     results = await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
 
-    assert calls == [], "an access-aware entry must never use the id-only storage plane"
-    assert a.bulk_calls == [], "ASYNC must still not be absorbed inline"
-    assert len(writer.rows) >= 1, "must fall back to the legacy payload-carrying outbox path"
+    assert a.bulk_calls == [], "storage-plane routing must never call the indexer inline"
+    assert len(calls) == 1, "an access-aware entry now uses the id-only storage plane too"
+    row_ids = {r.item_id for r in calls[0]["rows"]}
+    assert row_ids == {"i1"}
     assert results["a"].succeeded == 1
+    assert results["a"].failed == 0
 
 
 @pytest.mark.asyncio
@@ -2012,15 +2036,16 @@ async def test_in_task_run_foreign_catalog_logs_outbox_handoff_not_inline(caplog
 async def test_storage_plane_flag_on_access_aware_entry_not_absorbed_in_task_run(
     monkeypatch,
 ):
-    """#2716: when ``items_secondary_via_storage_plane`` is enabled, an
-    access-aware ASYNC entry (excluded from the id-only plane) must still
-    NOT be absorbed inline while inside a task run — the operator opted
-    into letting storage_drain own every item-tier ASYNC write, payload or
-    not, in-run or not. It falls back to the legacy payload-carrying
-    outbox instead.
+    """#2716 + #2687: when ``items_secondary_via_storage_plane`` is enabled,
+    an access-aware ASYNC entry is NEVER absorbed inline while inside a task
+    run — the operator opted into letting storage_drain own every item-tier
+    ASYNC write, access-aware or not, in-run or not. Since #2687 lifted the
+    access-aware exclusion, it now takes the SAME id-only storage-plane path
+    as any other entry (no longer a fallback to the legacy payload-carrying
+    outbox).
     """
     _patch_storage_plane_flag(monkeypatch, enabled=True)
-    _patch_storage_emit_recorder(monkeypatch)
+    calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _AccessAwareStubIndexer("a")
     writer = _RecordingWriter()
@@ -2032,9 +2057,10 @@ async def test_storage_plane_flag_on_access_aware_entry_not_absorbed_in_task_run
 
     assert a.bulk_calls == [], (
         "storage-plane flag on must prevent in-run absorption even for "
-        "entries excluded from the id-only plane"
+        "access-aware entries"
     )
-    assert len(writer.rows) >= 1, "must fall back to the legacy payload-carrying outbox"
+    assert len(calls) == 1, "access-aware entries now use the id-only storage plane"
+    assert writer.rows == [], "must never fall back to the legacy payload-carrying outbox"
     assert results["a"].succeeded == 1
 
 

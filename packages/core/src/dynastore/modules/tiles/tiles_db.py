@@ -19,6 +19,7 @@
 # dynastore/modules/tiles/tiles_db.py
 
 import logging
+from collections import OrderedDict
 from typing import Dict, Any, List, Mapping, Optional, Tuple, Union
 from sqlalchemy import text
 from shapely.geometry import box
@@ -35,6 +36,45 @@ from dynastore.tools.geospatial import SimplificationAlgorithm
 from .tiles_models import TileMatrixSet
 
 logger = logging.getLogger(__name__)
+
+# --- Self-tuning per-tile byte budget (#3155) --------------------------------
+#
+# Measured bytes-per-feature of successful MVT renders, keyed by
+# (catalog_id, collection_id, zoom). Sizing the next render's feature LIMIT
+# from the previous render's measured byte cost is the same adaptive-estimator
+# mechanism ``dynastore.tools.adaptive_chunk_sizing`` (#3163) applies to
+# ingest chunks; tiles keep their own map because the sample here is a
+# (bytes, feature_count) pair per rendered tile, not a chunk of documents.
+#
+# Deliberately per-process: one successful render per key is enough to size
+# the next one, the feature-cap ladder bounds the cold-start miss, and no
+# distributed state means no coherence traffic on the tile hot path. The EWMA
+# smooths within-zoom variance (a coastal tile vs an inland one).
+_BPF_ESTIMATES: "OrderedDict[Tuple[str, str, int], float]" = OrderedDict()
+_BPF_MAX_ENTRIES = 4096
+_BPF_EWMA_ALPHA = 0.5
+
+
+def _bpf_get(key: Tuple[str, str, int]) -> Optional[float]:
+    val = _BPF_ESTIMATES.get(key)
+    if val is not None:
+        _BPF_ESTIMATES.move_to_end(key)
+    return val
+
+
+def _bpf_update(key: Tuple[str, str, int], tile_bytes: int, features: int) -> None:
+    if tile_bytes <= 0 or features <= 0:
+        return
+    sample = tile_bytes / features
+    prev = _BPF_ESTIMATES.get(key)
+    _BPF_ESTIMATES[key] = (
+        sample if prev is None
+        else _BPF_EWMA_ALPHA * sample + (1.0 - _BPF_EWMA_ALPHA) * prev
+    )
+    _BPF_ESTIMATES.move_to_end(key)
+    while len(_BPF_ESTIMATES) > _BPF_MAX_ENTRIES:
+        _BPF_ESTIMATES.popitem(last=False)
+
 
 # Query to check if a specific SRID exists in PostGIS
 check_srid_query = text(
@@ -118,6 +158,8 @@ async def _build_collection_subquery(
     max_features: Optional[float] = None,
     rank_column: Optional[str] = None,
     min_rank: Optional[float] = None,
+    density_column: Optional[str] = None,
+    max_density: Optional[float] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Builds the subquery for a single collection using ItemService.
@@ -126,6 +168,9 @@ async def _build_collection_subquery(
     feature reduction for scalable low-zoom rendering. They are pushed into the
     shared query builder via its ``limit`` / ``where`` hooks so the reduction
     happens BEFORE ST_AsMVTGeom (bounding transform cost), not after.
+    ``density_column`` / ``max_density`` are the symmetric ceiling: they
+    exclude features ABOVE a threshold instead of keeping features above a
+    floor, and compose with the rank filter in the same ``where`` clause.
     """
     from dynastore.models.protocols import ConfigsProtocol, ItemsProtocol
     from dynastore.tools.discovery import get_protocol
@@ -217,6 +262,12 @@ async def _build_collection_subquery(
     # cost, which the post-transform density predicates cannot.
     if max_features and max_features > 0:
         params["limit"] = int(max_features)
+    # Both the rank floor and the density ceiling below are pre-transform
+    # predicates on the same subquery, so they are collected into one list
+    # and ANDed together into a single ``where`` clause instead of one
+    # clobbering the other when both are configured.
+    where_clauses: List[str] = []
+    raw_params: Dict[str, Any] = {}
     if rank_column and min_rank is not None:
         # Importance-preserving, index-assisted decimation: keep only features
         # whose stored rank column (e.g. length_m) meets the per-zoom minimum.
@@ -224,8 +275,22 @@ async def _build_collection_subquery(
         # never user input; quote it as an identifier. The threshold is a bind
         # param. The builder suffixes both the SQL and bind name per collection,
         # so ``:feat_rank_min`` never collides across a multi-collection tile.
-        params["where"] = f'"{rank_column}" >= :feat_rank_min'
-        params["raw_params"] = {"feat_rank_min": min_rank}
+        where_clauses.append(f'"{rank_column}" >= :feat_rank_min')
+        raw_params["feat_rank_min"] = min_rank
+    if density_column and max_density is not None and max_density > 0:
+        # Symmetric to the rank floor: excludes features whose stored density
+        # column (e.g. the computed vertex_count geometry stat) exceeds the
+        # per-zoom ceiling, dropping overly heavy geometry before the
+        # transform instead of keeping the most important features above a
+        # floor. ``density_column`` is operator-configured
+        # (TilesConfig.feature_density_column), never user input; quote it as
+        # an identifier. ``:feat_density_max`` is suffixed per collection by
+        # the builder like ``:feat_rank_min`` above.
+        where_clauses.append(f'"{density_column}" <= :feat_density_max')
+        raw_params["feat_density_max"] = max_density
+    if where_clauses:
+        params["where"] = " AND ".join(where_clauses)
+        params["raw_params"] = raw_params
 
     # 3. Get Query from ItemService
     # We pass tile_wkb via params so GeometrySidecar can use it as bind param
@@ -328,6 +393,39 @@ async def get_features_as_mvt_filtered(
         if resolved_collections else None
     )
     min_rank = _bracket("min_feature_rank_by_zoom")
+    density_column = (
+        resolved_collections[0].get("feature_density_column")
+        if resolved_collections else None
+    )
+    max_density = _bracket("max_feature_density_by_zoom")
+
+    # Self-tuning byte budget (#3155): shrink the bracket cap using the
+    # measured bytes-per-feature of previous renders of this collection at
+    # this zoom, so the effective LIMIT converges the tile toward the byte
+    # budget without per-collection tuning. Single-collection tiles only —
+    # a multi-collection tile cannot attribute its bytes to one estimator
+    # key. The first render of a key has no estimate and runs under the
+    # ladder cap alone; the measurement after execution below seeds it.
+    bpf_key: Optional[Tuple[str, str, int]] = None
+    if len(resolved_collections) == 1:
+        byte_budget = int(resolved_collections[0].get("tile_byte_budget") or 0)
+        if byte_budget > 0:
+            try:
+                bpf_key = (
+                    resolved_collections[0]["catalog_id"],
+                    resolved_collections[0]["collection_id"],
+                    int(z),
+                )
+            except (KeyError, ValueError):
+                bpf_key = None
+        if bpf_key is not None:
+            bytes_per_feature = _bpf_get(bpf_key)
+            if bytes_per_feature and bytes_per_feature > 0:
+                budget_rows = max(1, int(byte_budget / bytes_per_feature))
+                if max_features and max_features > 0:
+                    max_features = min(int(max_features), budget_rows)
+                else:
+                    max_features = budget_rows
 
     # 3. Build Subqueries for each collection
     for i, meta in enumerate(resolved_collections):
@@ -357,6 +455,8 @@ async def get_features_as_mvt_filtered(
             max_features=max_features,
             rank_column=rank_column,
             min_rank=min_rank,
+            density_column=density_column,
+            max_density=max_density,
         )
         if subq:
             union_queries.append(subq)
@@ -429,11 +529,15 @@ async def get_features_as_mvt_filtered(
             z, min_pixel_area, min_pixel_length,
         )
 
-    # 5. Final SQL Execution
+    # 5. Final SQL Execution. The COUNT(*) rides the same aggregate pass as
+    # ST_AsMVT (one row, no GROUP BY) and feeds the byte-budget estimator —
+    # bytes-per-feature needs the number of features actually aggregated,
+    # which the LIMIT-ed subqueries make different from the requested cap.
     full_query = f"""
         WITH
         mvtgeom AS ({" UNION ALL ".join(union_queries)})
-        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom')
+        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom') AS mvt,
+               COUNT(*) AS feature_count
         FROM mvtgeom{area_where};
     """
 
@@ -442,9 +546,14 @@ async def get_features_as_mvt_filtered(
     )
     logger.debug(f"target_srid value: {all_bind_params.get('target_srid')}")
 
-    mvt = await DQLQuery(
-        full_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
+    row = await DQLQuery(
+        full_query, result_handler=ResultHandler.ONE_OR_NONE
     ).execute(conn, **all_bind_params)
+    mvt = None
+    if row is not None:
+        mvt = row[0]
+        if bpf_key is not None and mvt:
+            _bpf_update(bpf_key, len(mvt), int(row[1] or 0))
     # ST_AsMVT is an aggregate over `mvtgeom`, which this query always
     # executes as a single row (no GROUP BY) — the only way this comes back
     # None is the aggregate itself being NULL, i.e. zero features matched.

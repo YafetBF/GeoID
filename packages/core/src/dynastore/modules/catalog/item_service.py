@@ -20,7 +20,7 @@ import asyncio
 import copy
 import logging
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, FrozenSet, List, Optional, Any, Dict, Union, Sequence, Tuple
 
@@ -43,10 +43,15 @@ from dynastore.modules.storage.driver_config import (
 from dynastore.models.ogc import Feature
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.protocols.items import ItemsProtocol
+from dynastore.tools.adaptive_chunk_sizing import (
+    estimate_doc_bytes,
+    next_adaptive_chunk_rows,
+)
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.execution_context import in_task_run
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.json import CustomJSONEncoder
+from dynastore.tools.memory_trim import trim_malloc_arenas
 from dynastore.modules.db_config import shared_queries
 from dynastore.modules.catalog.query_optimizer import QueryOptimizer
 from dynastore.modules.storage.drivers.pg_sidecars.base import FeaturePipelineContext
@@ -60,6 +65,42 @@ from dynastore.modules.catalog.item_query import ItemQueryMixin
 from dynastore.modules.catalog.item_distributed import ItemDistributedMixin
 
 logger = logging.getLogger(__name__)
+
+_WRITE_ID_CONTEXT_KEY = "write_id"
+
+# Byte budget for Phase 4's adaptive write-chunk sizing in ``upsert()``
+# (#3154). Mirrors StorageDrainTask's hydration byte budget (#3121/#2723):
+# bounds how much JSON-encoded hub+sidecar payload one write-transaction
+# chunk holds, independent of the row-count ceiling
+# (``CollectionPluginConfig.ingest_chunk_size``), so a deep bulk-ingest
+# backlog of multi-MB items can't materialize a full row-count chunk of them
+# per transaction regardless of size.
+_INGEST_CHUNK_BYTE_BUDGET: int = 16 * 1024 * 1024  # 16 MiB
+
+# First (probe) chunk size for the same adaptive sizing (#3154). Row sizes
+# are unknown until the first chunk is measured; mirrors
+# StorageDrainTask's ``_ID_ONLY_READ_PROBE_ROWS``.
+_INGEST_CHUNK_PROBE_ROWS: int = 1
+
+
+def _context_write_id(processing_context: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not processing_context:
+        return None
+    write_id = processing_context.get(_WRITE_ID_CONTEXT_KEY)
+    return write_id if isinstance(write_id, str) and write_id else None
+
+
+def _ensure_write_id_context(
+    processing_context: Optional[Dict[str, Any]],
+) -> tuple[str, Dict[str, Any]]:
+    write_id = _context_write_id(processing_context)
+    if write_id is None:
+        from dynastore.tools.identifiers import generate_uuidv7
+
+        write_id = str(generate_uuidv7())
+    merged = dict(processing_context or {})
+    merged[_WRITE_ID_CONTEXT_KEY] = write_id
+    return write_id, merged
 
 
 async def _run_query(conn, stmt, params=None):
@@ -244,9 +285,32 @@ async def _storage_resolves_columnar_async(
 
 
 soft_delete_item_query = DQLQuery(
-    "UPDATE {catalog_id}.{collection_id} SET deleted_at = NOW() WHERE geoid = :geoid AND deleted_at IS NULL;",
+    "UPDATE {catalog_id}.{collection_id} SET deleted_at = NOW(), write_id = :write_id WHERE geoid = :geoid AND deleted_at IS NULL;",
     result_handler=ResultHandler.ROWCOUNT,
 )
+
+
+@dataclass(frozen=True)
+class _AccessEnvelopeBase:
+    """Feature-independent access-envelope inputs, resolved once per batch.
+
+    ``visibility`` / ``owner`` are true batch-level values (see
+    :meth:`ItemService._resolve_access_envelope`). ``attrs_paths`` carries the
+    resolved :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
+    ``attribute_paths`` so a caller writing many items can apply
+    :func:`~dynastore.modules.iam.stamping_config.stamp_attrs_from_feature` per
+    item — cheap, no I/O — instead of re-resolving the policy per row.  ``None``
+    (the whole base, not this field) means the collection does not route WRITE
+    to an access-aware driver.
+
+    Mirrors the drain-time split in ``canonical_index_read._resolve_access_context``
+    / ``_apply_access_envelope`` (#2687) so write-time and drain-time ``_attrs``
+    are derived the same way — batch-level paths, per-item extraction (#3175).
+    """
+
+    visibility: str
+    owner: Optional[str]
+    attrs_paths: Dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -260,6 +324,12 @@ class _IndexStampContext:
     path (:meth:`ItemService.upsert_bulk`). ``access_envelope`` is ``None``
     unless the collection routes WRITE to an access-aware driver.
 
+    ``access_envelope`` carries only the batch-level ``_visibility`` /
+    ``_owner`` values — ``_attrs`` is per-item (a Feature's declared attribute
+    values differ item to item) and is stamped separately by
+    :meth:`ItemService._apply_index_stamp` from ``access_envelope_attrs_paths``
+    applied to that item's own payload (#3175).
+
     ``external_id`` carries the pre-resolved value from the inbound item (set
     on ``processing_context["external_id"]`` by the sidecar or write-boundary).
     When present it takes precedence over path-based extraction so the stamped
@@ -271,6 +341,7 @@ class _IndexStampContext:
     asset_id: Optional[Any]
     access_envelope: Optional[Dict[str, Any]]
     external_id: Optional[str] = None
+    access_envelope_attrs_paths: Dict[str, str] = field(default_factory=dict)
 
 
 class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
@@ -1330,6 +1401,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         engine = db_resource or self.engine
         from dynastore.tools.identifiers import generate_geoid
+        write_id, processing_context = _ensure_write_id_context(processing_context)
 
         # Phase 1 — config + sidecars + physical table
         async with managed_transaction(engine) as conn:
@@ -1498,20 +1570,36 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 _items_schema = None
             schema_validator = _build_write_validator(_items_schema)
 
-        # G1 (#1457): Pre-resolve the access envelope once for the whole batch.
-        # ``_resolve_access_envelope`` returns a non-None dict only when
-        # ``_collection_uses_access_aware_driver`` is True (G4 wires in PG-sidecar
-        # detection).  Resolving here — outside the per-item loop and outside any
-        # DB transaction — avoids repeated async calls and ensures the envelope is
-        # identical for every item in the batch (visibility + owner are batch-level
-        # properties, not per-item).  The result is injected into ``item_context``
-        # below so ``AccessEnvelopeSidecar.prepare_upsert_payload`` receives it
-        # via ``context["_access_envelope"]``.
-        _batch_access_envelope: Optional[Dict[str, Any]] = (
-            await self._resolve_access_envelope(
+        # G1 (#1457): Pre-resolve the access-envelope BASE once for the whole
+        # batch. ``_resolve_access_envelope_base`` returns non-None only when
+        # ``_collection_uses_access_aware_driver`` is True (G4 wires in
+        # PG-sidecar detection). ``_visibility``/``_owner`` are true
+        # batch-level values and are stamped as-is below; ``_attrs`` is NOT
+        # — a Feature's declared attribute values differ item to item, so
+        # freezing one stamp for the whole batch would either stamp the
+        # wrong item's values onto every row or (in production, since no
+        # feature was ever threaded here) always stamp an empty ``_attrs``
+        # (#3175). Instead ``attrs_paths`` (the resolved
+        # ``AttributeStampingPolicy``) is resolved once here and applied per
+        # item below via ``stamp_attrs_from_feature`` on that item's own
+        # ``raw_item`` — mirroring the drain-time recompute in
+        # ``canonical_index_read._apply_access_envelope``. The per-item
+        # result is injected into ``item_context`` below so
+        # ``AccessEnvelopeSidecar.prepare_upsert_payload`` receives it via
+        # ``context["_access_envelope"]``.
+        _access_envelope_base: Optional[_AccessEnvelopeBase] = (
+            await self._resolve_access_envelope_base(
                 catalog_id, collection_id, processing_context,
             )
         )
+
+        # #2687: resolve the write-time owner once for the whole batch — mirrors
+        # ``_access_envelope_base.owner`` above but is stamped onto every item's hub
+        # row UNCONDITIONALLY (no access-aware gate; a cheap nullable column,
+        # same rollout shape as ``write_id``) so the storage-plane drain can
+        # recompute ``_owner`` from stored state instead of the write-time-only
+        # ``processing_context``. ``None`` when no principal is present.
+        _batch_owner: Optional[str] = self._resolve_write_owner(processing_context)
 
         prepared: List[Dict[str, Any]] = []
         unique_partition_values: set = set()
@@ -1535,6 +1623,29 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             try:
                 _validate_feature_properties(schema_validator, raw_item)
 
+                # #3175: stamp this item's ``_attrs`` from its OWN (still
+                # pristine at this point — no sidecar has run yet) inbound
+                # ``raw_item``, applying the batch-resolved
+                # ``AttributeStampingPolicy`` paths. A fresh dict per item —
+                # never share ``_access_envelope_base`` across items — so one
+                # item's attribute values can never leak onto another's.
+                _item_access_envelope: Optional[Dict[str, Any]] = None
+                if _access_envelope_base is not None:
+                    _item_access_envelope = {
+                        "_visibility": _access_envelope_base.visibility,
+                        "_owner": _access_envelope_base.owner,
+                    }
+                    if _access_envelope_base.attrs_paths:
+                        from dynastore.modules.iam.stamping_config import (
+                            stamp_attrs_from_feature,
+                        )
+
+                        _item_attrs = stamp_attrs_from_feature(
+                            raw_item, _access_envelope_base.attrs_paths,
+                        )
+                        if _item_attrs:
+                            _item_access_envelope["_attrs"] = _item_attrs
+
                 geoid = generate_geoid()
                 item_context: Dict[str, Any] = {
                     "geoid": geoid,
@@ -1550,12 +1661,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     "_pristine_item": copy.deepcopy(raw_item),
                     "_items_write_policy": items_write_policy,
                     **(processing_context or {}),
-                    # G1 (#1457): inject the pre-resolved access envelope so
+                    # G1 (#1457): inject this item's access envelope so
                     # AccessEnvelopeSidecar.prepare_upsert_payload can build the
                     # sub-table row.  None when the collection does not use an
                     # access-aware driver; the sidecar skips the write in that case.
-                    **({"_access_envelope": _batch_access_envelope}
-                       if _batch_access_envelope is not None else {}),
+                    **({"_access_envelope": _item_access_envelope}
+                       if _item_access_envelope is not None else {}),
                 }
                 # Pre-resolve external_id from the inbound feature before any
                 # sidecar runs so PG sidecars and the index-stamp path share
@@ -1567,9 +1678,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                         item_context["external_id"] = _ext
                 hub_payload: Dict[str, Any] = {
                     "geoid": geoid,
+                    "write_id": write_id,
                     "transaction_time": datetime.now(timezone.utc),
                     "deleted_at": None,
                 }
+                if _batch_owner is not None:
+                    hub_payload["access_owner"] = _batch_owner
                 sidecar_payloads: Dict[str, Dict[str, Any]] = {}
                 partition_values: Dict[str, Any] = {}
 
@@ -1640,10 +1754,17 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         # Phase 4 — chunked writes. Each chunk commits its own tx; row locks
         # are released between chunks instead of accumulating across the whole
-        # ingestion. Per-collection knob via `CollectionPluginConfig.ingest_chunk_size`
+        # ingestion. Rows-per-chunk are now byte-adaptive (#3154): a fixed
+        # chunk size applies the same row count to a chunk of lightweight
+        # items as it does to a chunk of multi-MB ones — the same gap #3121
+        # closed for StorageDrainTask's id-only re-read chunks. Chunk rows
+        # start at a 1-row probe and resize from the previous chunk's
+        # measured hub+sidecar payload bytes via the shared estimator, with
+        # `CollectionPluginConfig.ingest_chunk_size` retained as the ceiling
         # (default 50 — safe for geometry-heavy payloads; lightweight
         # attribute-only collections can raise it).
-        chunk_size = collection_config.ingest_chunk_size
+        ingest_chunk_ceiling = collection_config.ingest_chunk_size
+        chunk_rows = min(_INGEST_CHUNK_PROBE_ROWS, ingest_chunk_ceiling)
         write_results: List[Dict[str, Any]] = []
         # Per-item generated info for the ingestion audit report, built 1:1
         # with ``write_results`` (and therefore with the ``results`` read-back
@@ -1675,8 +1796,23 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             items_write_policy is not None
             and getattr(items_write_policy, "enable_batch_insert", False)
         )
-        for start in range(0, len(prepared), chunk_size):
-            chunk = prepared[start:start + chunk_size]
+        start = 0
+        while start < len(prepared):
+            chunk = prepared[start:start + chunk_rows]
+            chunk_start = start
+            start += len(chunk)
+            # Measured once per chunk (write-path-independent — both the
+            # batch and per-row paths below write the exact same `chunk`
+            # content) and reused to size the *next* chunk after whichever
+            # path runs.
+            chunk_bytes = sum(
+                estimate_doc_bytes(plan["hub_payload"])
+                + sum(
+                    estimate_doc_bytes(sc_payload)
+                    for sc_payload in plan["sidecar_payloads"].values()
+                )
+                for plan in chunk
+            )
 
             # ── Batch fast path ────────────────────────────────────────────
             # Attempt a multi-row INSERT when enable_batch_insert is True and
@@ -1725,9 +1861,14 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 except Exception as _batch_exc:
                     logger.warning(
                         "Batch insert fell back to per-row for chunk [%d:%d]: %s",
-                        start, start + chunk_size, _batch_exc,
+                        chunk_start, chunk_start + len(chunk), _batch_exc,
                     )
                 if _batch_ok:
+                    chunk_rows = next_adaptive_chunk_rows(
+                        chunk_bytes=chunk_bytes, rows_read=len(chunk),
+                        byte_budget=_INGEST_CHUNK_BYTE_BUDGET, current=chunk_rows,
+                        ceiling=ingest_chunk_ceiling,
+                    )
                     continue
 
             # ── Per-row path (unchanged) ───────────────────────────────────
@@ -1789,6 +1930,22 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                             plan["sidecar_payloads"], stat_names
                         ),
                     })
+
+            chunk_rows = next_adaptive_chunk_rows(
+                chunk_bytes=chunk_bytes, rows_read=len(chunk),
+                byte_budget=_INGEST_CHUNK_BYTE_BUDGET, current=chunk_rows,
+                ceiling=ingest_chunk_ceiling,
+            )
+
+        # Trim retained heap pages after a bulk-ingest burst (#3154):
+        # mirrors StorageDrainTask's post-run malloc_trim(0) (#3121) — glibc
+        # keeps pages freed by this chunk loop's decode/hydration transients
+        # cached in its arenas instead of returning them to the kernel, so
+        # RSS stays pinned at the burst peak. Single-item writes are not a
+        # burst and are left untouched to avoid paying a trim on every
+        # ordinary create/update request.
+        if not is_single:
+            trim_malloc_arenas()
 
         # Hand rejections to the caller via the typed DriverContext escape
         # hatch. The OGC mixin seeds an empty list before the call and drains
@@ -1938,6 +2095,76 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             return None
         return str(path) if path else None
 
+    @staticmethod
+    def _resolve_write_owner(
+        processing_context: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Resolve the creating principal's subject id from ``processing_context``.
+
+        Single source for the write-time owner value (``owner`` /
+        ``principal_id`` / ``subject_id``, first match wins). Used both to
+        persist ``access_owner`` on every hub row unconditionally (#2687 —
+        a cheap nullable column, no access-aware gate) and, when the
+        collection routes to an access-aware driver, to stamp ``_owner`` on
+        the index payload via :meth:`_resolve_access_envelope`.
+        """
+        pc = processing_context or {}
+        owner = pc.get("owner") or pc.get("principal_id") or pc.get("subject_id")
+        return str(owner) if owner is not None else None
+
+    async def _resolve_access_envelope_base(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        processing_context: Optional[Dict[str, Any]],
+    ) -> Optional[_AccessEnvelopeBase]:
+        """Resolve the batch-level (feature-independent) access-envelope inputs once.
+
+        Returns ``None`` when the collection does NOT route WRITE to an
+        access-aware driver — nothing is stamped in that case. Otherwise
+        resolves ``_visibility`` / ``_owner`` (true batch-level values) plus
+        the ``AttributeStampingPolicy.attribute_paths`` so a caller writing
+        many items can apply :func:`~dynastore.modules.iam.stamping_config.
+        stamp_attrs_from_feature` per item — no config round trip per row.
+        Every sub-resolution degrades to a closed default on failure (a
+        config lookup failure must never block a write); mirrors the
+        drain-time ``canonical_index_read._resolve_access_context`` split
+        (#2687, #3175).
+        """
+        if not await self._collection_uses_access_aware_driver(
+            catalog_id, collection_id,
+        ):
+            return None
+
+        owner = self._resolve_write_owner(processing_context)
+
+        visibility = "private"  # closed default for the tenant-isolated index
+        try:
+            from dynastore.modules.storage.access_envelope import (
+                resolve_catalog_visibility,
+            )
+
+            visibility = await resolve_catalog_visibility(catalog_id)
+        except Exception:
+            # Missing/unavailable audience config → keep the closed default.
+            pass
+
+        attrs_paths: Dict[str, str] = {}
+        try:
+            from dynastore.modules.storage.access_envelope import (
+                resolve_attribute_stamping_paths,
+            )
+
+            attrs_paths = await resolve_attribute_stamping_paths(
+                catalog_id, collection_id,
+            )
+        except Exception:
+            attrs_paths = {}
+
+        return _AccessEnvelopeBase(
+            visibility=visibility, owner=owner, attrs_paths=attrs_paths,
+        )
+
     async def _resolve_access_envelope(
         self,
         catalog_id: str,
@@ -1945,7 +2172,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         processing_context: Optional[Dict[str, Any]],
         feature: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Resolve the access-envelope stamping values for an index dispatch.
+        """Resolve the access-envelope stamping values for a single item.
 
         Returns ``{_visibility, _owner, _attrs}`` to stamp onto the index
         payload, or ``None`` when the collection does NOT route to an
@@ -1959,86 +2186,37 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
           ``subject_id``).
         * ``_visibility`` ← catalog's ``CatalogLookupAudience.is_public``
           (``"public"`` / ``"private"``). Defaults to ``"private"``.
-        * ``_attrs``      ← per-collection ``AttributeStampingPolicy``.
-          When the policy is absent or ``attribute_paths`` is empty the key is
-          omitted entirely (behaviour unchanged vs. pre-#1441).  Only
-          ``$.properties.<field>`` paths are resolved in this slice.
+        * ``_attrs``      ← per-collection ``AttributeStampingPolicy``,
+          extracted from ``feature`` (falling back to ``processing_context``
+          when no feature is given). When the policy is absent or
+          ``attribute_paths`` is empty the key is omitted entirely (behaviour
+          unchanged vs. pre-#1441). Only ``$.properties.<field>`` paths are
+          resolved in this slice.
+
+        A caller writing many items in one batch should prefer
+        :meth:`_resolve_access_envelope_base` (resolved once) plus
+        :func:`~dynastore.modules.iam.stamping_config.stamp_attrs_from_feature`
+        applied per item — this method re-resolves the policy on every call,
+        which is fine for a single item but wasteful in a loop (#3175).
         """
-        if not await self._collection_uses_access_aware_driver(
-            catalog_id, collection_id,
-        ):
+        base = await self._resolve_access_envelope_base(
+            catalog_id, collection_id, processing_context,
+        )
+        if base is None:
             return None
 
+        from dynastore.modules.iam.stamping_config import stamp_attrs_from_feature
+
         pc = processing_context or {}
-        owner = pc.get("owner") or pc.get("principal_id") or pc.get("subject_id")
-
-        visibility = "private"  # closed default for the tenant-isolated index
-        try:
-            from dynastore.modules.iam.audience_configs import CatalogLookupAudience
-
-            configs = get_protocol(ConfigsProtocol)
-            if configs is not None:
-                audience = await configs.get_config(
-                    CatalogLookupAudience, catalog_id=catalog_id,
-                )
-                if audience is not None and getattr(audience, "is_public", False):
-                    visibility = "public"
-        except Exception:
-            # Missing/unavailable audience config → keep the closed default.
-            pass
-
         envelope: Dict[str, Any] = {
-            "_visibility": visibility,
-            "_owner": str(owner) if owner is not None else None,
+            "_visibility": base.visibility,
+            "_owner": base.owner,
         }
-
-        # --- Attribute stamping (#1441) -----------------------------------
-        attrs = await self._stamp_attrs(
-            catalog_id, collection_id, feature or pc,
-        )
-        if attrs:
-            envelope["_attrs"] = attrs
-        # ------------------------------------------------------------------
-
+        if base.attrs_paths:
+            attrs = stamp_attrs_from_feature(feature or pc, base.attrs_paths)
+            if attrs:
+                envelope["_attrs"] = attrs
         return envelope
-
-    async def _stamp_attrs(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        source: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Extract per-collection attribute values from ``source`` for ``_attrs``.
-
-        Reads :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
-        for the collection. For each declared path (only ``$.properties.<key>``
-        is supported in this slice) extracts the value from ``source`` (a raw
-        Feature dict or processing context dict).  Returns an empty dict when
-        the policy is absent or ``attribute_paths`` is empty.
-        """
-        try:
-            from dynastore.modules.iam.stamping_config import (
-                AttributeStampingPolicy,
-                stamp_attrs_from_feature,
-            )
-
-            configs = get_protocol(ConfigsProtocol)
-            if configs is None:
-                return {}
-            policy = await configs.get_config(
-                AttributeStampingPolicy,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-            )
-            if policy is None:
-                return {}
-            paths: Dict[str, str] = getattr(policy, "attribute_paths", {}) or {}
-            if not paths:
-                return {}
-        except Exception:
-            return {}
-
-        return stamp_attrs_from_feature(source, paths)
 
     async def _collection_uses_access_aware_driver(
         self,
@@ -2047,47 +2225,16 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
     ) -> bool:
         """True when any WRITE driver for the collection opts in to row-level ABAC.
 
-        Two detection branches:
-
-        1. **ES-envelope** — the driver class carries ``applies_access_filter=True``
-           (the standardised attribute set by the private Elasticsearch driver).
-        2. **PG-sidecar** — the driver exposes a ``get_driver_config`` method (PG
-           drivers) and its per-collection config lists a sidecar with
-           ``sidecar_type == "access_envelope"`` (#1457 G4).
-
-        Returns ``False`` on any resolution error so a misconfigured collection
-        never gets access fields stamped.
+        Thin delegate to the shared, driver-agnostic
+        :func:`~dynastore.modules.storage.access_envelope.collection_uses_access_aware_driver`
+        — the single derivation point shared by write-time stamping (here) and
+        drain-time envelope recompute (``canonical_index_read``, #2687).
         """
-        try:
-            from dynastore.modules.storage.router import get_write_drivers
+        from dynastore.modules.storage.access_envelope import (
+            collection_uses_access_aware_driver,
+        )
 
-            resolved = await get_write_drivers(catalog_id, collection_id)
-        except Exception:
-            return False
-
-        for r in resolved:
-            # Branch 1: ES-envelope driver (applies_access_filter class attr).
-            if getattr(type(r.driver), "applies_access_filter", False):
-                return True
-
-            # Branch 2: PG sidecar with sidecar_type == "access_envelope" (G4).
-            get_cfg = getattr(r.driver, "get_driver_config", None)
-            if callable(get_cfg):
-                try:
-                    from dynastore.modules.storage.drivers.pg_sidecars import (
-                        driver_sidecars,
-                    )
-
-                    drv_cfg = await get_cfg(catalog_id, collection_id)  # type: ignore[misc]
-                    if any(
-                        getattr(sc, "sidecar_type", None) == "access_envelope"
-                        for sc in driver_sidecars(drv_cfg)
-                    ):
-                        return True
-                except Exception:
-                    pass  # fail-open for this branch; ES check already handled above
-
-        return False
+        return await collection_uses_access_aware_driver(catalog_id, collection_id)
 
     async def _resolve_index_stamp_context(
         self,
@@ -2102,17 +2249,31 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         (:meth:`upsert_bulk`) so a collection populated via either path indexes
         the same canonical ``_external_id`` / ``_asset_id`` — and, when it
         routes WRITE to an access-aware driver, the same ``_visibility`` /
-        ``_owner`` / ``_attrs``. See #1287 and #1441.
+        ``_owner``. See #1287 and #1441.
+
+        ``access_envelope`` here carries only the batch-level ``_visibility`` /
+        ``_owner`` — ``_attrs`` is per-item and is stamped by
+        :meth:`_apply_index_stamp` from ``access_envelope_attrs_paths``
+        applied to that item's own payload (#3175: a feature was never in
+        hand at this batch-level call, so freezing ``_attrs`` here always
+        stamped an empty dict in production).
         """
+        base = await self._resolve_access_envelope_base(
+            catalog_id, collection_id, processing_context,
+        )
+        access_envelope: Optional[Dict[str, Any]] = None
+        attrs_paths: Dict[str, str] = {}
+        if base is not None:
+            access_envelope = {"_visibility": base.visibility, "_owner": base.owner}
+            attrs_paths = base.attrs_paths
         return _IndexStampContext(
             external_id_path=await self._resolve_external_id_path(
                 catalog_id, collection_id,
             ),
             asset_id=(processing_context or {}).get("asset_id"),
-            access_envelope=await self._resolve_access_envelope(
-                catalog_id, collection_id, processing_context,
-            ),
+            access_envelope=access_envelope,
             external_id=(processing_context or {}).get("external_id"),
+            access_envelope_attrs_paths=attrs_paths,
         )
 
     def _apply_index_stamp(
@@ -2131,7 +2292,11 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         ``_attrs`` is stamped when the collection has an
         :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
-        with a non-empty ``attribute_paths`` map.
+        with a non-empty ``attribute_paths`` map, extracted from ``payload``
+        itself — the per-item Feature dict already in hand at this call site
+        (#3175). ``payload`` is the same post-write/post-read-back Feature
+        shape the drain-time recompute derives ``_attrs`` from, so the two
+        agree for the same stored item.
         """
         if ctx.external_id is not None:
             payload["_external_id"] = str(ctx.external_id)
@@ -2148,10 +2313,18 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             payload.setdefault("_visibility", ctx.access_envelope["_visibility"])
             if ctx.access_envelope["_owner"] is not None:
                 payload.setdefault("_owner", ctx.access_envelope["_owner"])
-            # ``_attrs`` from the per-collection stamping policy (#1441).
-            attrs = ctx.access_envelope.get("_attrs")
-            if attrs:
-                payload.setdefault("_attrs", attrs)
+            # ``_attrs`` from the per-collection stamping policy (#1441),
+            # extracted per item from this item's own payload (#3175).
+            if ctx.access_envelope_attrs_paths:
+                from dynastore.modules.iam.stamping_config import (
+                    stamp_attrs_from_feature,
+                )
+
+                attrs = stamp_attrs_from_feature(
+                    payload, ctx.access_envelope_attrs_paths,
+                )
+                if attrs:
+                    payload.setdefault("_attrs", attrs)
         return payload
 
     async def _dispatch_index_upsert(
@@ -2178,10 +2351,11 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         Phase 2f atomic OUTBOX: when an engine is supplied, the dispatch
         is wrapped in its own ``managed_transaction`` so ``ctx.pg_conn``
-        is non-None.  The ``TaskTableOutboxWriter.enqueue`` INSERT and the
-        indexer attempt then live in the same TX — outbox writes are
-        durable instead of being skipped with a warning.  Cost: one extra
-        TX open/commit per dispatch call (cheap vs the indexer
+        is non-None.  ``StoragePlaneOutboxWriter.enqueue`` (via
+        ``enqueue_storage_op_id_only`` / ``enqueue_storage_op_write_id``)
+        and the indexer attempt then live in the same TX — outbox writes
+        are durable instead of being skipped with a warning.  Cost: one
+        extra TX open/commit per dispatch call (cheap vs the indexer
         round-trip).  Non-OUTBOX policies (FATAL, WARN, IGNORE) are
         unaffected by the wrapping TX since they don't write to the outbox
         table.
@@ -2251,6 +2425,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 entity_type="item",
                 entity_id=str(r.id),
                 payload=payload,
+                write_id=_context_write_id(processing_context),
             ))
         if not ops:
             return {}
@@ -2488,7 +2663,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         the module-level ``enqueue_storage_op`` (#1807 P4), which tests patch
         directly — there is no separate outbox-store seam.
         """
-        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.models.protocols.indexing import WriteIdOutboxRecord
         from dynastore.modules.storage.driver_instance_id import (
             compute_driver_instance_id,
         )
@@ -2499,6 +2674,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         if not items:
             return []
+        write_id, write_context = _ensure_write_id_context(processing_context)
 
         # ── Coalesce same-item ops (latest wins) ──────────────────────
         coalesced: Dict[str, Dict[str, Any]] = {}
@@ -2592,79 +2768,99 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     )
                 await driver.write_entities(
                     catalog_id, collection_id, deduped,
+                    context=write_context,
                     db_resource=conn,
                 )
 
-            # ASYNC OUTBOX entries: build OutboxRecords + enqueue on the
+            # ASYNC OUTBOX entries: build lightweight write-id rows + enqueue on the
             # SAME conn. Failure here rolls back the PG write above — the
             # atomicity guarantee that closes the drift hole.
+            #
+            # Write-id rows are only hydratable when the primary WRITE
+            # driver exposes the write-id chunk-read capability (#3116) —
+            # the drain hydrates from the first resolved WRITE driver, so
+            # enqueueing a row it cannot serve would retry forever.
+            write_id_supported = True
             if async_outbox_entries:
-                # Resolve the identity + access-envelope stamping inputs once
-                # for this collection (#1287). Applied to a per-record copy
-                # below so the inline FATAL primary write above keeps the
-                # unstamped items.
-                stamp_ctx = await self._resolve_index_stamp_context(
-                    catalog_id, collection_id, processing_context,
+                from dynastore.modules.storage.storage_emit import (
+                    driver_supports_write_id_reads,
                 )
-                # Resolve the write policy once for per-item external_id
-                # resolution. When no policy is configured, this is None and
-                # per-item resolution below is skipped. Failure is intentionally
-                # swallowed — missing write-policy means no external_id stamp,
-                # not a crash.
-                _write_policy = None
-                try:
-                    _bulk_configs = get_protocol(ConfigsProtocol)
-                    if _bulk_configs is not None:
-                        _write_policy = await _bulk_configs.get_config(
-                            ItemsWritePolicy,
-                            catalog_id=catalog_id,
-                            collection_id=collection_id,
-                        )
-                except Exception:
-                    _write_policy = None
-                records: List[OutboxRecord] = []
+
+                primary_driver = (
+                    await _resolve_driver(write_entries[0].driver_ref)
+                    if write_entries else None
+                )
+                write_id_supported = driver_supports_write_id_reads(primary_driver)
+                if not write_id_supported:
+                    logger.warning(
+                        "upsert_bulk: primary WRITE driver %r for %s/%s does "
+                        "not support write-id chunk reads — falling back to "
+                        "per-entity id-only outbox rows for %d target(s) "
+                        "(see #3116).",
+                        write_entries[0].driver_ref if write_entries else None,
+                        catalog_id, collection_id, len(async_outbox_entries),
+                    )
+            if async_outbox_entries and write_id_supported:
+                records: List[WriteIdOutboxRecord] = []
+                for entry in async_outbox_entries:
+                    inst = compute_driver_instance_id(
+                        entry.driver_ref, catalog_id, collection_id,
+                    )
+                    records.append(WriteIdOutboxRecord(
+                        op_id=generate_uuidv7(),
+                        driver_id=entry.driver_ref,
+                        driver_instance_id=inst,
+                        collection_id=collection_id,
+                        op="upsert",
+                        write_id=write_id,
+                        idempotency_key=write_id,
+                    ))
+                if records:
+                    # Enqueue storage rows and drain trigger co-transactionally
+                    # on the caller's conn so a primary-write rollback leaves no
+                    # rows in tasks.storage either.
+                    from dynastore.modules.storage.storage_emit import (
+                        enqueue_storage_op_write_id,
+                    )
+                    await enqueue_storage_op_write_id(
+                        conn,
+                        catalog_id=catalog_id,
+                        rows=records,
+                    )
+            elif async_outbox_entries:
+                # Primary lacks write-id chunk reads: fall back to
+                # per-entity id-only rows (one per coalesced item per
+                # secondary target) — the drain re-reads canonical state
+                # for these instead of hydrating by write_id.
+                from dynastore.models.protocols.indexing import OutboxRecord
+                from dynastore.modules.storage.storage_emit import (
+                    enqueue_storage_op_id_only,
+                )
+
+                id_only_records: List[OutboxRecord] = []
                 for entry in async_outbox_entries:
                     inst = compute_driver_instance_id(
                         entry.driver_ref, catalog_id, collection_id,
                     )
                     for it in deduped:
                         item_id = it.get("id") if isinstance(it, dict) else None
-                        item_id_str = str(item_id) if item_id is not None else None
-                        payload_copy = dict(it)
-                        # Per-item external_id resolution: inject _external_id
-                        # from the inbound item so every OUTBOX record carries
-                        # the correct identity even when stamp_ctx.external_id
-                        # is None (batch-level context has no per-item value)
-                        # and stamp_ctx.external_id_path is None (no path
-                        # configured). When stamp_ctx already resolved a value
-                        # via ctx.external_id or path extraction, _apply_index_stamp
-                        # will overwrite this — the per-item pre-set only fills
-                        # the gap for the no-path case.
-                        if _write_policy is not None:
-                            _item_ext = _write_policy.resolve_external_id(payload_copy)
-                            if _item_ext is not None and "_external_id" not in payload_copy:
-                                payload_copy["_external_id"] = _item_ext
-                        records.append(OutboxRecord(
+                        if item_id is None:
+                            continue
+                        item_id = str(item_id)
+                        id_only_records.append(OutboxRecord(
                             op_id=generate_uuidv7(),
                             driver_id=entry.driver_ref,
                             driver_instance_id=inst,
                             collection_id=collection_id,
                             op="upsert",
-                            payload=self._apply_index_stamp(payload_copy, stamp_ctx),
-                            item_id=item_id_str,
-                            idempotency_key=item_id_str or str(generate_uuidv7()),
+                            item_id=item_id,
+                            idempotency_key=item_id,
                         ))
-                if records:
-                    # Enqueue storage rows and drain trigger co-transactionally
-                    # on the caller's conn so a primary-write rollback leaves no
-                    # rows in tasks.storage either.
-                    from dynastore.modules.storage.storage_emit import (
-                        enqueue_storage_op,
-                    )
-                    await enqueue_storage_op(
+                if id_only_records:
+                    await enqueue_storage_op_id_only(
                         conn,
                         catalog_id=catalog_id,
-                        rows=records,
+                        rows=id_only_records,
                     )
 
         return deduped
@@ -3254,4 +3450,3 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             return sql, {"asset_id": asset_id}
 
         return DQLQuery.from_builder(_builder, result_handler=ResultHandler.ALL_DICTS)
-

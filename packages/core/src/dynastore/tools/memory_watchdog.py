@@ -82,6 +82,7 @@ import os
 import random
 import signal
 import time
+import tracemalloc
 from typing import Callable, ClassVar, Optional, Tuple
 
 from pydantic import Field, model_validator
@@ -94,40 +95,46 @@ from dynastore.tools.background_service import (
     PodPolicy,
     ServiceContext,
 )
+from dynastore.tools.memory_units import (
+    detect_cgroup_memory_limit_mb,
+    detect_container_memory_mb,
+    parse_memory_to_mb,
+)
 from dynastore.tools.serving_state import clear_draining, set_draining
 
 logger = logging.getLogger(__name__)
 
 _PROC_STATUS_PATH = "/proc/self/status"
 
-_CGROUP_V2_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
-_CGROUP_V1_MEMORY_LIMIT_PATH = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-
-# Deploy-injected env vars used to derive the per-worker memory budget on
-# Cloud Run, where cgroup memory files are absent. ``RAM`` is the container
-# memory size (e.g. "8Gi"); ``GUNICORN_WORKERS`` is the process count sharing
-# it. See ``resolve_watchdog_budget_mb``.
-_RAM_ENV = "RAM"
+# The process count sharing the container's memory; each worker's budget is
+# the total divided by this. See ``resolve_watchdog_budget_mb``.
 _WORKERS_ENV = "GUNICORN_WORKERS"
 
-# Kubernetes/Cloud-Run memory-quantity suffix factors (binary vs decimal).
-_MEM_SUFFIX_FACTORS = {
-    "k": 1000,
-    "ki": 1024,
-    "m": 1000**2,
-    "mi": 1024**2,
-    "g": 1000**3,
-    "gi": 1024**3,
-    "t": 1000**4,
-    "ti": 1024**4,
-}
+# Number of stack frames tracemalloc keeps per allocation for the diagnostic
+# (geoid#3121). One frame only ever names the leaf, which for the spikes seen on
+# dev is always ``json/decoder.py`` — true and useless. Reaching the code that
+# asked for the decode costs four frames (raw_decode <- decode <- loads <-
+# caller); six leaves room for one wrapper. tracemalloc interns tracebacks and
+# stores one pointer per traced block, so depth costs a bounded number of
+# traceback objects, not per-allocation memory.
+_TRACEMALLOC_FRAMES = 6
 
-# Cgroup v1 reports "no limit" as a huge sentinel (commonly
-# 9223372036854771712, close to but not exactly int64-max, since the kernel
-# rounds it to a page boundary). Anything at or above this threshold is
-# treated as unlimited rather than a real memory budget — no real container
-# or host has anywhere near this much RAM.
-_UNLIMITED_THRESHOLD_BYTES = 1 << 62
+# tracemalloc groups by leaf line under "lineno"; "traceback" keys each
+# statistic by the whole retained frame chain, which is the point of keeping
+# more than one frame.
+_TRACEMALLOC_GROUP_BY = "traceback"
+
+
+def _format_alloc_site(traceback: "tracemalloc.Traceback") -> str:
+    """Render a traced allocation's frame chain, leaf first.
+
+    ``str(Traceback)`` shows only the most recent frame, so a multi-frame
+    snapshot would still read as a bare ``json/decoder.py:361``.
+    """
+    frames = [f"{frame.filename}:{frame.lineno}" for frame in reversed(traceback)]
+    if not frames:
+        return "<no traceback>"
+    return "\n".join(f"       {frame}" for frame in frames)
 
 
 def read_process_rss_bytes() -> Optional[int]:
@@ -150,6 +157,49 @@ def read_process_rss_bytes() -> Optional[int]:
     except (OSError, ValueError):
         return None
     return None
+
+
+def read_process_rss_breakdown_bytes() -> Optional[Tuple[int, int]]:
+    """Return this process's ``(RssAnon, RssFile)`` in bytes.
+
+    ``VmRSS`` — what :func:`read_process_rss_bytes` returns — is the sum of
+    private anonymous pages, resident file-backed pages and shared memory.
+    Only ``RssAnon`` is private to this worker and therefore additive across
+    the gunicorn fleet; file-backed pages (shared-library text, mmap'd data)
+    are counted in full by *every* process that maps them, so ``VmRSS`` can
+    overstate a worker's own share of the container. How much it overstates is
+    a property of the service, not a constant: dev catalog measured ``anon
+    1976MiB, file 116MiB``, so there its ``VmRSS`` was very nearly all private.
+    Log both rather than assuming either.
+
+    Returns ``None`` when the fields are absent (Linux < 4.5, or non-Linux),
+    so callers degrade to reporting ``VmRSS`` alone rather than raising.
+    """
+    anon: Optional[int] = None
+    file_backed: Optional[int] = None
+    try:
+        with open(_PROC_STATUS_PATH, "r", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("RssAnon:"):
+                    anon = int(line.split()[1]) * 1024
+                elif line.startswith("RssFile:"):
+                    file_backed = int(line.split()[1]) * 1024
+                if anon is not None and file_backed is not None:
+                    return anon, file_backed
+    except (OSError, IndexError, ValueError):
+        return None
+    return None
+
+
+def _rss_breakdown_suffix() -> str:
+    """Render ``" [anon NMiB, file NMiB]"`` for the watchdog log lines, or ``""``."""
+    breakdown = read_process_rss_breakdown_bytes()
+    if breakdown is None:
+        return ""
+    anon, file_backed = breakdown
+    return " [anon {:.0f}MiB, file {:.0f}MiB]".format(
+        anon / (1024 * 1024), file_backed / (1024 * 1024)
+    )
 
 
 class MemoryWatchdogService(PeriodicService):
@@ -211,6 +261,14 @@ class MemoryWatchdogService(PeriodicService):
         # hot-reload kill-switches).
         self._started_at = time.monotonic()
         self._last_recycle_attempt: Optional[float] = None
+        # Diagnostic (geoid#3121) bookkeeping: throttle tracemalloc snapshots,
+        # remember whether THIS service started tracing (so it can stop it
+        # again when the flag is turned back off), and hold the previous
+        # snapshot each growth report is diffed against (captured on the
+        # arming tick, rolled forward on every report).
+        self._last_diag_snapshot: Optional[float] = None
+        self._diag_started = False
+        self._diag_baseline: Optional[tracemalloc.Snapshot] = None
 
     def _effective_limit_bytes(
         self, config: "MemoryWatchdogConfig"
@@ -233,6 +291,16 @@ class MemoryWatchdogService(PeriodicService):
         config = await load_memory_watchdog_config()
         limit_bytes = self._effective_limit_bytes(config)
 
+        # Apply the configured cadence live: PeriodicService.run() reads
+        # self.cadence_seconds before every sleep, but the service is built
+        # before the config store is reachable, so the constructor only ever
+        # sees the code default (15s). An OOM spike that completes between two
+        # 15s ticks is invisible to the diagnostic; operators need to be able
+        # to shorten the sampling window through the config store without a
+        # redeploy.
+        if config.cadence_seconds > 0:
+            self.cadence_seconds = config.cadence_seconds
+
         rss_bytes = self._get_rss_bytes()
         if rss_bytes is None or limit_bytes is None:
             if limit_bytes is None and not self._inert_warned:
@@ -249,10 +317,11 @@ class MemoryWatchdogService(PeriodicService):
         ratio = rss_bytes / limit_bytes
         if ratio >= self._critical_ratio:
             logger.error(
-                "memory_watchdog: RSS %.0fMiB is %.0f%% of the %.0fMiB budget "
+                "memory_watchdog: RSS %.0fMiB%s is %.0f%% of the %.0fMiB budget "
                 "(>= critical %.0f%%) on %s; instance is at high risk of an "
                 "imminent OOM kill.",
                 rss_bytes / (1024 * 1024),
+                _rss_breakdown_suffix(),
                 ratio * 100,
                 limit_bytes / (1024 * 1024),
                 self._critical_ratio * 100,
@@ -262,9 +331,10 @@ class MemoryWatchdogService(PeriodicService):
         elif ratio >= self._warn_ratio:
             if not self._warned:
                 logger.warning(
-                    "memory_watchdog: RSS %.0fMiB is %.0f%% of the %.0fMiB budget "
+                    "memory_watchdog: RSS %.0fMiB%s is %.0f%% of the %.0fMiB budget "
                     "(>= warn %.0f%%) on %s.",
                     rss_bytes / (1024 * 1024),
+                    _rss_breakdown_suffix(),
                     ratio * 100,
                     limit_bytes / (1024 * 1024),
                     self._warn_ratio * 100,
@@ -274,7 +344,169 @@ class MemoryWatchdogService(PeriodicService):
         else:
             self._warned = False
 
+        self._maybe_emit_tracemalloc(ctx, config, ratio, rss_bytes, limit_bytes)
         await self._maybe_self_recycle(ctx, config, ratio, limit_bytes)
+
+    def _maybe_emit_tracemalloc(
+        self,
+        ctx: ServiceContext,
+        config: "MemoryWatchdogConfig",
+        ratio: float,
+        rss_bytes: int,
+        limit_bytes: int,
+    ) -> None:
+        """Diagnostic (geoid#3121): log which allocation sites GREW as a worker
+        climbs toward its budget.
+
+        A kernel OOM kill is a bare SIGKILL between watchdog polls — no handler
+        runs, so the allocation that spiked RSS is otherwise invisible. When
+        ``diagnostic_tracemalloc_enabled`` is on, this lazily starts tracemalloc,
+        captures a baseline snapshot on that same arming tick, and from the next
+        qualifying tick on logs ``snapshot.compare_to(baseline, "traceback")`` —
+        the sites whose footprint grew since the previous report — rather than
+        an absolute top-N, which is dominated by legitimate steady-state
+        allocations (SQLAlchemy metadata, client buffers) and never names the
+        *growing* site. Grouping by traceback rather than leaf line keeps the
+        calling frames: a spike inside ``json.loads`` is attributable to the
+        code that asked for the decode, not to ``json/decoder.py``. The
+        baseline rolls forward after every report, so
+        one-time warm-up allocations appear once and disappear while a genuine
+        leak dominates every subsequent report, with a per-interval growth rate.
+
+        Every report also logs tracemalloc's own traced total next to RSS: a
+        large RSS-vs-traced gap (or a report with no Python-level growth while
+        RSS keeps climbing) means the growth is happening outside CPython's
+        allocator — native/C-extension memory tracemalloc cannot see — and the
+        next tool is a native profiler, not more Python-side reading.
+
+        ``diagnostic_ratio`` sits deliberately below the OOM point so the
+        snapshot's own allocation has headroom and the *climb* toward the kill
+        is captured. Reports are throttled to
+        ``diagnostic_min_interval_seconds``. Off by default — tracemalloc adds
+        per-allocation overhead.
+
+        The flag is read live here (per tick), not at service-build time: the
+        watchdog is built before the platform config store is reachable (see
+        ``build_memory_watchdog_service``), so a build-time read would always
+        see the default (off) and the diagnostic could never be turned on
+        through the config store. Starting tracemalloc on the first tick that
+        sees the flag misses allocations made before that tick, but a recurring
+        leak keeps allocating, so the culprit still surfaces on the climb.
+        """
+        if not config.diagnostic_tracemalloc_enabled:
+            # Turned back off: release tracemalloc's per-allocation overhead if
+            # this service was the one that started it.
+            if self._diag_started and tracemalloc.is_tracing():
+                tracemalloc.stop()
+            self._diag_started = False
+            self._diag_baseline = None
+            return
+        if ratio < config.diagnostic_ratio:
+            return
+        if not tracemalloc.is_tracing():
+            # Lazy start: arm tracing and capture the baseline on THIS tick (a
+            # snapshot taken the instant tracing starts is near-empty and
+            # cheap), so the very next qualifying tick already emits a
+            # meaningful growth diff — a worker OOM-killed shortly after
+            # arming still leaves one report behind.
+            tracemalloc.start(_TRACEMALLOC_FRAMES)
+            self._diag_started = True
+            self._diag_baseline = tracemalloc.take_snapshot()
+            logger.warning(
+                "memory_watchdog: diagnostic_tracemalloc_enabled — started "
+                "tracemalloc (%d frames) and captured the baseline snapshot on "
+                "%s; allocation-growth reports begin on the next tick above "
+                "diagnostic_ratio.",
+                _TRACEMALLOC_FRAMES,
+                ctx.name,
+            )
+            return
+
+        now = time.monotonic()
+        if (
+            self._last_diag_snapshot is not None
+            and now - self._last_diag_snapshot
+            < config.diagnostic_min_interval_seconds
+        ):
+            return
+        interval = (
+            now - self._last_diag_snapshot
+            if self._last_diag_snapshot is not None
+            else None
+        )
+        self._last_diag_snapshot = now
+
+        snapshot = tracemalloc.take_snapshot()
+        traced_bytes, _ = tracemalloc.get_traced_memory()
+        top_n = max(1, config.diagnostic_top_n)
+
+        if self._diag_baseline is None:
+            # Tracing was already on before this service saw the flag (e.g. a
+            # PYTHONTRACEMALLOC boot or another component armed it), so there
+            # is no arming-tick baseline. Report the absolute top sites once —
+            # this is the baseline report — and diff from here on.
+            self._diag_baseline = snapshot
+            stats = snapshot.statistics(_TRACEMALLOC_GROUP_BY)
+            top = stats[:top_n]
+            lines = "\n".join(
+                f"  {i + 1}. {s.size / (1024 * 1024):.1f}MiB in {s.count} blocks:\n"
+                f"{_format_alloc_site(s.traceback)}"
+                for i, s in enumerate(top)
+            )
+            logger.error(
+                "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB "
+                "budget) on %s; tracemalloc traced total %.1fMiB — baseline "
+                "report, top %d Python allocation sites by size (growth diffs "
+                "follow from the next report):\n%s",
+                rss_bytes / (1024 * 1024),
+                ratio * 100,
+                limit_bytes / (1024 * 1024),
+                ctx.name,
+                traced_bytes / (1024 * 1024),
+                len(top),
+                lines,
+            )
+            return
+
+        diffs = snapshot.compare_to(self._diag_baseline, _TRACEMALLOC_GROUP_BY)
+        self._diag_baseline = snapshot
+        since = f"{interval:.0f}s ago" if interval is not None else "arming"
+        grown = [d for d in diffs if d.size_diff > 0][:top_n]
+        if not grown:
+            logger.error(
+                "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB "
+                "budget) on %s; tracemalloc traced total %.1fMiB — NO "
+                "Python-level allocation growth since the previous snapshot "
+                "(%s). If RSS keeps climbing, the growth is outside CPython's "
+                "allocator (native/C-extension memory tracemalloc cannot see).",
+                rss_bytes / (1024 * 1024),
+                ratio * 100,
+                limit_bytes / (1024 * 1024),
+                ctx.name,
+                traced_bytes / (1024 * 1024),
+                since,
+            )
+            return
+
+        lines = "\n".join(
+            f"  {i + 1}. +{d.size_diff / (1024 * 1024):.1f}MiB "
+            f"(+{d.count_diff} blocks, total {d.size / (1024 * 1024):.1f}MiB):\n"
+            f"{_format_alloc_site(d.traceback)}"
+            for i, d in enumerate(grown)
+        )
+        logger.error(
+            "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB budget) "
+            "on %s; tracemalloc traced total %.1fMiB — top %d Python allocation "
+            "sites by growth since the previous snapshot (%s):\n%s",
+            rss_bytes / (1024 * 1024),
+            ratio * 100,
+            limit_bytes / (1024 * 1024),
+            ctx.name,
+            traced_bytes / (1024 * 1024),
+            len(grown),
+            since,
+            lines,
+        )
 
     async def _maybe_self_recycle(
         self,
@@ -330,9 +562,10 @@ class MemoryWatchdogService(PeriodicService):
 
         pid = os.getpid()
         logger.warning(
-            "self-recycle: RSS %.0f%%>=%.0f%%, SIGTERM worker pid %d to "
+            "self-recycle: RSS %.0f%%>=%.0f%%%s, SIGTERM worker pid %d to "
             "drain before OOM (uptime=%.0fs) on %s.",
-            recheck_ratio * 100, config.recycle_ratio * 100, pid, uptime, ctx.name,
+            recheck_ratio * 100, config.recycle_ratio * 100,
+            _rss_breakdown_suffix(), pid, uptime, ctx.name,
         )
         os.kill(pid, signal.SIGTERM)
 
@@ -455,6 +688,52 @@ class MemoryWatchdogConfig(PluginConfig):
         ),
     )
 
+    diagnostic_tracemalloc_enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Diagnostic (geoid#3121): when True, the watchdog lazily starts "
+            "tracemalloc and logs the top Python allocation sites by size once "
+            "RSS climbs past diagnostic_ratio, so a between-poll OOM spike "
+            "leaves a breadcrumb naming the allocation instead of a bare "
+            "SIGKILL. Off by default — tracemalloc adds per-allocation "
+            "overhead — and meant to be switched on transiently in one "
+            "environment to locate a leak/spike, then switched back off (which "
+            "stops tracemalloc again — no restart needed either way). Read "
+            "live every tick."
+        ),
+    )
+
+    diagnostic_ratio: Mutable[float] = Field(
+        default=0.60,
+        gt=0,
+        le=1,
+        description=(
+            "Ratio of the per-worker budget at which a diagnostic tracemalloc "
+            "snapshot is logged (when diagnostic_tracemalloc_enabled). "
+            "Deliberately well below the OOM point so the snapshot's own "
+            "allocation has headroom and the climb toward the kill is "
+            "captured. Read live every tick."
+        ),
+    )
+
+    diagnostic_top_n: Mutable[int] = Field(
+        default=12,
+        gt=0,
+        description=(
+            "How many top allocation sites (by size) the diagnostic snapshot "
+            "logs. Read live every tick."
+        ),
+    )
+
+    diagnostic_min_interval_seconds: Mutable[float] = Field(
+        default=6.0,
+        ge=0,
+        description=(
+            "Minimum time between two diagnostic tracemalloc snapshots so a "
+            "sustained climb does not log one every tick. Read live every tick."
+        ),
+    )
+
     @model_validator(mode="after")
     def _warn_below_critical(self) -> "MemoryWatchdogConfig":
         if not 0 < self.warn_ratio < self.critical_ratio <= 1:
@@ -474,86 +753,8 @@ class MemoryWatchdogConfig(PluginConfig):
         return self
 
 
-def _read_cgroup_memory_limit_bytes(path: str) -> Optional[int]:
-    """Read and parse one cgroup memory-limit file.
-
-    Returns ``None`` if the file is absent, unreadable, reports the cgroup
-    v2 "max" sentinel, or reports a value at/above ``_UNLIMITED_THRESHOLD_BYTES``
-    (the cgroup v1 "no limit" sentinel).
-    """
-    try:
-        with open(path, "r", encoding="ascii") as fh:
-            raw = fh.read().strip()
-    except OSError:
-        return None
-    if raw == "max":
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    if value <= 0 or value >= _UNLIMITED_THRESHOLD_BYTES:
-        return None
-    return value
 
 
-def detect_cgroup_memory_limit_mb() -> Optional[int]:
-    """Best-effort auto-detection of the container's memory budget, in MB.
-
-    Tries cgroup v2 (``memory.max``) first, then cgroup v1
-    (``memory.limit_in_bytes``). Returns ``None`` when neither file exists
-    or both report "no limit" — e.g. local dev on macOS, or a container run
-    without a memory limit.
-    """
-    limit_bytes = _read_cgroup_memory_limit_bytes(_CGROUP_V2_MEMORY_MAX_PATH)
-    if limit_bytes is None:
-        limit_bytes = _read_cgroup_memory_limit_bytes(_CGROUP_V1_MEMORY_LIMIT_PATH)
-    if limit_bytes is None:
-        return None
-    return limit_bytes // (1024 * 1024)
-
-
-def parse_memory_to_mb(raw: Optional[str]) -> Optional[int]:
-    """Parse a Kubernetes/Cloud-Run memory quantity into whole MB.
-
-    Accepts values like ``"8Gi"``, ``"2G"``, ``"512Mi"`` or a bare byte count.
-    Binary suffixes (``Ki``/``Mi``/``Gi``/``Ti``) use 1024; decimal suffixes
-    (``K``/``M``/``G``/``T``) use 1000, per the Kubernetes quantity spec.
-    Returns ``None`` for empty or unparseable input.
-    """
-    if not raw:
-        return None
-    text = raw.strip()
-    if not text:
-        return None
-    lowered = text.lower()
-    # Longest suffix first so "gi" matches before "g".
-    for suffix in ("ki", "mi", "gi", "ti", "k", "m", "g", "t"):
-        if lowered.endswith(suffix):
-            number = text[: -len(suffix)].strip()
-            factor = _MEM_SUFFIX_FACTORS[suffix]
-            break
-    else:
-        number, factor = text, 1
-    try:
-        value_bytes = float(number) * factor
-    except ValueError:
-        return None
-    if value_bytes <= 0:
-        return None
-    return int(value_bytes) // (1024 * 1024)
-
-
-def _detect_total_container_mb() -> Optional[int]:
-    """Total container memory budget (MB) from the deploy env, then cgroup.
-
-    Cloud Run (gen2) does not expose a readable ``/sys/fs/cgroup`` (see the
-    module docstring), so cgroup auto-detection returns ``None`` there. The
-    deploy does inject the container memory size as the ``RAM`` env var, so we
-    read that first and fall back to cgroup for platforms that expose it
-    (GKE / on-prem). ``None`` when neither yields a value (e.g. local dev).
-    """
-    return parse_memory_to_mb(os.environ.get(_RAM_ENV)) or detect_cgroup_memory_limit_mb()
 
 
 def resolve_watchdog_budget_mb() -> Optional[int]:
@@ -566,7 +767,7 @@ def resolve_watchdog_budget_mb() -> Optional[int]:
     available from the very first tick, even before that store is reachable.
     Returns ``None`` when no total-memory source is available.
     """
-    total_mb = _detect_total_container_mb()
+    total_mb = detect_container_memory_mb()
     if total_mb is None:
         return None
     try:
@@ -620,6 +821,10 @@ async def build_memory_watchdog_service(
         logger.debug("memory_watchdog: disabled via config — skipping.")
         return None
 
+    # The tracemalloc diagnostic is armed lazily from the tick path, not here:
+    # this runs at lifespan start, before the platform config store is
+    # reachable, so ``config`` is always the code defaults at build time and any
+    # store-set flag would be missed. See ``_maybe_emit_tracemalloc``.
     return MemoryWatchdogService(
         warn_ratio=config.warn_ratio,
         critical_ratio=config.critical_ratio,
@@ -635,5 +840,6 @@ __all__ = [
     "load_memory_watchdog_config",
     "parse_memory_to_mb",
     "read_process_rss_bytes",
+    "read_process_rss_breakdown_bytes",
     "resolve_watchdog_budget_mb",
 ]

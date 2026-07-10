@@ -20,6 +20,48 @@ tasks.tasks  PARTITION BY RANGE (timestamp)
 A single global dispatcher claims tasks across all tenants via `FOR UPDATE SKIP LOCKED`.
 Runners receive the `schema_name` so they can operate in the correct tenant context.
 
+## Storage Outbox (`tasks.storage`)
+
+A second global partitioned table (`{DYNASTORE_TASK_SCHEMA}.storage`, default
+`tasks.storage`), RANGE-partitioned by `day`, carries async storage
+obligations (secondary-index writes and similar) enqueued by the storage
+module (see [`../storage/README.md`](../storage/README.md)) and drained by
+`StorageDrainTask` (`dynastore.tasks.workclass_drain.storage_drain_task`):
+
+```
+tasks.storage  PARTITION BY RANGE (day)
+  ├─ op_id           UUID      row identifier
+  ├─ catalog_id      TEXT      tenant discriminator
+  ├─ driver_id       TEXT      target secondary driver
+  ├─ collection_id   TEXT
+  ├─ entity_id       TEXT      set on an id-only row; NULL on a write-id row
+  ├─ write_id        TEXT      set on a write-id row; NULL on an id-only row
+  ├─ op              TEXT      upsert | delete
+  ├─ idempotency_key TEXT
+  └─ ...
+```
+
+There is no `op_payload` column — the ledger carries identifiers only, never
+a payload snapshot. `StorageDrainTask` classifies each claimed row
+structurally:
+
+- **write-id row** — `write_id` set, `entity_id` NULL, `idempotency_key =
+  write_id`; one row per `(write_id, driver_id, collection_id, op)`. The
+  drain hydrates current state from the collection's primary WRITE driver's
+  hub by `write_id`, via keyset-paged chunk reads (`read_indexable_write_batch`,
+  or the `read_active_rows_by_write_id` / `read_tombstoned_ids_by_write_id`
+  pair).
+- **id-only row** — `entity_id` set, `write_id` NULL. The drain re-reads
+  canonical PG state for that id at replay time instead of indexing a
+  payload frozen at enqueue time.
+- A row with **neither** `write_id` nor `entity_id` can never hydrate and is
+  marked `dead`.
+
+A write-id row is only produced when the collection's primary WRITE driver
+exposes the write-id chunk-read capability; otherwise the producer falls
+back to an id-only row (#3116 guard — see the storage module's README for
+the producer-side detail).
+
 ## Key Components
 
 | File | Purpose |
@@ -51,6 +93,14 @@ returning the ordered candidate list. When **both** maps are empty the
 `_materialize_if_empty` validator builds the full cloud matrix from the live task
 registry, so an empty seed still yields a complete, consumer-bearing config
 (visible at `GET /configs/?resolved=true`).
+
+The dispatcher claim gate uses the same routing selection model as execution:
+`CapabilityMap.refresh()` evaluates the selected `RunnerTarget` for each task
+and advertises the task only when this process has that target's `runner` type.
+This matters for offloaded work such as `catalog_provision`: under the cloud
+profile it is claimable only by a service that has a matching `gcp_cloud_run`
+runner. Under the on-prem profile the target runner is `background`, so the
+same task remains claimable by the in-process worker tier.
 
 ### RunnerTarget
 
@@ -122,15 +172,83 @@ loud (a WARN plus the `starving` report) instead of an indefinitely PENDING row.
   Two tenants sharing the same `dedup_key` do not collide.
 - The cross-partition dedup guard in `enqueue()` is also scoped by `schema_name`.
 
+## Claim Leases
+
+`tasks.tasks.locked_until` is the queue visibility timeout. Claiming a PENDING
+row sets `status = 'ACTIVE'`, `owner_id`, and `locked_until`; runners heartbeat
+or extend that lease while work continues. The task reaper moves expired ACTIVE
+rows back to PENDING, or to DEAD_LETTER when retry limits are exhausted. It is a
+lease column, not a permanent ownership flag.
+
+Drain workclasses (`event_drain`, `storage_drain`, `storage_drain_offload`)
+get a reclaim grace: the reaper only resets their rows once `locked_until`
+has lapsed by more than two heartbeat visibility windows
+(`DRAIN_RECLAIM_GRACE_SECONDS` in `tasks_module.py`). Heartbeat writes can
+lag behind a congested pooler while the run itself is healthy — reclaiming
+instantly re-queues work a live run is still processing and can spawn a
+duplicate offload execution. A genuinely dead drain worker just recovers
+those minutes later.
+
+In-process drain runs are additionally single-flight platform-wide per
+workclass: a session-scoped advisory lock on a direct (non-pooled)
+connection, held for the whole run and failing open when no trustworthy
+direct lane is configured (`dynastore.tasks.workclass_drain.single_flight`).
+The offloaded job flavors never take the gate, so they can neither be fenced
+out nor fence each other.
+
 ## Initialization
 
 On startup `TasksModule` (priority=15, before `CatalogModule` at 20):
 
 1. Acquires an advisory lock for the duration of all DDL — prevents concurrent-revision
-   races on Cloud Run rolling deploys.
-2. Creates the `tasks` table, indexes, and pg_notify triggers if absent.
-3. Ensures 12 monthly future partitions exist and registers retention cron jobs.
+   races on rolling deploys. If that outer startup lock times out, the module
+   replays idempotent startup DDL in a scoped fallback that skips only the nested
+   per-query advisory wait. Verified idempotent peer races are tolerated after a
+   successful existence re-check; ordinary DDL errors still fail startup.
+2. Creates the `tasks` table, indexes, pg_notify triggers, and the DEFAULT
+   partition if absent. Warm starts also repair `tasks.tasks_default` with a
+   separate `to_regclass` check so the sentinel-skipped DDL batch cannot leave
+   retention pointing at a missing default partition.
+3. Ensures 12 monthly future partitions exist.
 4. Asserts the current-month partition is present before starting the dispatcher.
+
+The dispatcher is submitted to the background supervisor during startup, but its
+first claim/reconcile pass waits `DYNASTORE_DISPATCHER_INITIAL_DELAY_SECONDS`
+(default `30`) so later modules and extension drivers can finish registration
+before task routing is resolved. The proactive capability sweep also waits one
+sweep interval before its first pass by default; override with
+`DYNASTORE_PROACTIVE_SWEEP_INITIAL_DELAY_SECONDS` when a deployment needs a
+different cold-start delay.
+
+## Maintenance Schedule
+
+Periodic task maintenance is driven by `tasks.maintenance_schedule`; it is the
+single scheduler table for the in-process maintenance supervisor. Each row has a
+`job_name`, cadence (`interval_seconds`), the latest run outcome, and
+`running_since` while a leader is executing it. The supervisor reclaims stale
+`running_since` values by comparing them to `now - make_interval(...)` with a
+row-derived threshold:
+`min(600s, max(180s, interval_seconds * 3))`. Short-cadence jobs such as
+`task_reaper` recover after about three minutes; daily jobs still recover within
+ten minutes.
+
+Optional jobs are dependency-aware. `iam_prune` is registered only when the IAM
+tables exist, and `es_logs_retention` is registered only when the OpenSearch
+client dependency is available. If an old schedule row remains, the job records
+`last_status = 'skipped'` instead of creating recurring errors.
+
+The supervisor also owns `control_plane_retention`, a daily bounded cleanup job
+for small control-plane tables:
+
+- `configs.leader_lease` rows whose leases are comfortably expired.
+- `configs.task_capability_registry` rows older than the configured capability
+  publisher TTL multiplied by ten.
+- `configs.instance_liveness` rows older than twice the zombie-session liveness
+  window, with a one-hour minimum.
+
+These rows are operational state. They should remain in PostgreSQL because they
+coordinate durable task routing, leadership, and session safety, but they are
+prunable by age and should stay roughly bounded by deployed services/instances.
 
 ## Task Attribution
 

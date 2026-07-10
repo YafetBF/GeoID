@@ -61,15 +61,15 @@ degrades to an in-process ``background`` run when none does (e.g. onprem).
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import time
 from dataclasses import replace as _dataclass_replace
-from typing import Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Tuple, cast
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
 from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 
 from dynastore.models.protocols.indexing import (
-    STORAGE_PLANE_ID_ONLY_MARKER_KEY,
     BulkIndexer,
     BulkIndexResult,
     IndexableOp,
@@ -77,7 +77,13 @@ from dynastore.models.protocols.indexing import (
 from dynastore.models.tasks import TaskPayload
 from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.report import TaskReport
+from dynastore.tasks.workclass_drain.single_flight import DrainSingleFlightGate
+from dynastore.tools.adaptive_chunk_sizing import (
+    estimate_doc_bytes as _shared_estimate_doc_bytes,
+    next_adaptive_chunk_rows as _next_id_only_chunk_rows,
+)
 from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.memory_trim import trim_malloc_arenas
 
 logger = logging.getLogger(__name__)
 
@@ -113,16 +119,29 @@ _UNESTIMATED_DOC_BYTES: int = 8 * 1024 * 1024  # 8 MiB
 # documents per _bulk call for reasonable ES throughput.
 _DEFAULT_HYDRATION_BYTE_BUDGET: int = 16 * 1024 * 1024
 
-# Row-count cap on a single canonical-re-read SELECT for one id-only group
-# (#2723): read_canonical_index_inputs batches ALL geoids handed to it into
-# one query, materializing every row's raw geometry at once. A group can
-# hold up to storage_drain_batch_size rows sharing one (catalog_id,
+# Row-count CEILING on a single canonical-re-read SELECT for one id-only
+# group (#2723): read_canonical_index_inputs batches ALL geoids handed to it
+# into one query, materializing every row's raw geometry at once. A group
+# can hold up to storage_drain_batch_size rows sharing one (catalog_id,
 # collection_id) — for MB-scale GAUL polygons that alone can spike memory
-# even though the group is already row-count-bounded. This fixed, small
-# sub-chunk keeps a single PG round trip's raw-row materialization bounded,
-# independent of the (adaptive) hydration byte budget, which governs the
-# BUILT-document dispatch below instead.
+# even though the group is already row-count-bounded. Chunk size within a
+# group is ADAPTIVE (#3121, see _next_id_only_chunk_rows below): it starts
+# at _ID_ONLY_READ_PROBE_ROWS and resizes from each chunk's measured
+# hydrated byte cost, with this constant as the upper bound, so a single PG
+# round trip's raw-row materialization — and asyncpg's json.loads decode
+# transient on it, roughly an order of magnitude larger than the raw bytes —
+# stays bounded regardless of per-row document size.
 _ID_ONLY_READ_CHUNK_ROWS: int = 50
+
+# First (probe) chunk size for an id-only group's adaptive re-read (#3121).
+# Row sizes are unknown until the first chunk is hydrated, so the probe
+# materializes exactly ONE row before the measured average takes over: a
+# pathological row (a country-scale boundary's ST_AsGeoJSON output runs to
+# tens of MB, and its json.loads decode transient roughly 10x that) must
+# never be multiplied by a guessed row count the process cannot afford.
+# The cost is one extra PG round trip per id-only group; the rows are
+# hydrated either way.
+_ID_ONLY_READ_PROBE_ROWS: int = 1
 
 # Default in-process drain budget (#2732 step 4). Matches
 # TasksPluginConfig.storage_drain_inprocess_max_bytes: the cumulative
@@ -149,17 +168,47 @@ def _backoff(attempts: int) -> int:
 def _estimate_doc_bytes(doc: Dict[str, Any]) -> int:
     """Estimate a hydrated doc's wire size via the same JSON encoding the ES
     bulk indexer will eventually produce. Used only to decide sub-chunk
-    flush boundaries (#2723) — not for exact accounting."""
-    try:
-        return len(json.dumps(doc, default=str).encode("utf-8"))
-    except Exception:  # noqa: BLE001 — an unestimable doc still forces a flush
-        return _UNESTIMATED_DOC_BYTES
+    flush boundaries (#2723) — not for exact accounting.
+
+    Thin wrapper over the shared estimator (:mod:`tools.adaptive_chunk_sizing`,
+    factored out for #3154 so ``ItemService.upsert()``'s write-chunk loop can
+    reuse the same mechanism) pinned to this module's fallback constant.
+    """
+    return _shared_estimate_doc_bytes(doc, fallback_bytes=_UNESTIMATED_DOC_BYTES)
 
 
-def _chunked(items: List[Dict[str, Any]], size: int) -> Iterator[List[Dict[str, Any]]]:
-    """Yield ``items`` in fixed-size slices (last slice may be shorter)."""
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
+# ``_next_id_only_chunk_rows`` — sizes the next id-only re-read chunk from the
+# previous chunk's measured hydrated byte cost (#3121). Imported above from
+# the shared ``tools.adaptive_chunk_sizing`` module (factored out for #3154);
+# call sites pass ``ceiling=_ID_ONLY_READ_CHUNK_ROWS`` (the pre-#3121 fixed
+# size) explicitly since the shared version takes the ceiling as a parameter
+# instead of reading this module's constant.
+
+
+# Per-event-loop storage-drain concurrency gates (#3121). Two storage_drain
+# runs claimed and dispatched onto the same worker each materialize their
+# own id-only decode transient; concurrent runs stack those spikes on one
+# gunicorn worker's budget (observed: flat ~13% RSS to kernel OOM inside a
+# single 60s metric sample while two drains ran). One gate per running loop
+# — a worker process runs a single loop, so this is the per-process gate in
+# production, shared by every task instance including
+# StorageDrainOffloadTask — created lazily because an asyncio.Semaphore
+# pins itself to the first loop that awaits it. Waiting runs are NOT lost
+# work: rows stay claimed/fenced and the gated run drains whatever is still
+# pending when it acquires.
+_DRAIN_RUN_GATES: "WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    WeakKeyDictionary()
+)
+
+
+def _drain_run_gate() -> asyncio.Semaphore:
+    """Return this event loop's drain gate, creating it on first use."""
+    loop = asyncio.get_running_loop()
+    gate = _DRAIN_RUN_GATES.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(1)
+        _DRAIN_RUN_GATES[loop] = gate
+    return gate
 
 
 class StorageDrainTask(TaskProtocol):
@@ -224,13 +273,17 @@ class StorageDrainTask(TaskProtocol):
         self._last_batch_bytes: int = 0
         # driver_id -> resolved BulkIndexer, memoised for this run.
         self._indexer_cache: Dict[str, BulkIndexer] = {}
+        # driver_ids resolved to an access-aware ES driver
+        # (``applies_access_filter=True``, e.g. the envelope driver) this run
+        # (#2687). Populated by ``_resolve_indexer``; consulted by
+        # ``_build_canonical_doc`` to pick the envelope-shaped doc builder and
+        # to enforce the fail-closed "never index without an envelope"
+        # invariant.
+        self._envelope_driver_ids: set[str] = set()
         # catalog_id -> resolved known-fields set, memoised for this run
         # (#2494 P1 canonical re-read — shared by every id-only group under
         # the same catalog).
         self._known_fields_cache: Dict[str, Any] = {}
-        # driver_ids that have already logged the "empty payload, no
-        # id-only marker" anomaly warning this run (#2494 P1 dedup).
-        self._empty_payload_warned: set = set()
         # Split completion counters for this run (#2731): 'indexed' rows went
         # through a BulkIndexer and were reported passed; 'auto_done' rows were
         # resolved as done WITHOUT the indexer (canonical row verifiably absent
@@ -245,6 +298,13 @@ class StorageDrainTask(TaskProtocol):
 
     async def run(self, payload: TaskPayload) -> TaskReport:
         """Drain ``tasks.storage``, then return.
+
+        Serialized per worker process on its event loop's drain gate
+        (``_drain_run_gate``, #3121): concurrent
+        drain runs on one worker stack their hydration/decode memory spikes,
+        which is what burst-OOMed the catalog pod. A run that arrives while
+        another is active simply waits — its rows stay claimed and fenced,
+        and it drains whatever is still pending once it acquires the gate.
 
         Loops ``drain_once()`` until it reports zero claimed rows (drain to
         empty) — the dispatcher re-enters via NOTIFY when new rows appear.
@@ -266,6 +326,17 @@ class StorageDrainTask(TaskProtocol):
         (#1807 P2).  ``drain_once`` retains its ``int`` return type so internal
         callers and existing tests are unaffected.
         """
+        gate = _drain_run_gate()
+        if gate.locked():
+            logger.info(
+                "StorageDrainTask: another storage drain run is active in "
+                "this process — waiting for it to finish."
+            )
+        async with gate:
+            return await self._run_drain(payload)
+
+    async def _run_drain(self, payload: TaskPayload) -> TaskReport:
+        """Gate-held body of :meth:`run` — see its docstring."""
         from dynastore.modules.db_config.db_config import DBConfig
         from dynastore.modules.db_config.db_timeout_config import create_task_engine
 
@@ -294,10 +365,58 @@ class StorageDrainTask(TaskProtocol):
         # Reset the split counters for this run — drain_once accumulates
         # into self._run_metrics as it classifies each claimed batch (#2731).
         self._run_metrics = {"indexed": 0, "auto_done": 0, "retried": 0}
+        # Cross-pod single-flight (#3144): at most one in-process storage
+        # drain runs platform-wide, so a reclaim after lagging heartbeat
+        # writes can no longer make two pods pay the same hydration transient
+        # concurrently. Session-scoped advisory lock on a direct lane, held
+        # for the whole run; fails open when no trustworthy lane exists. The
+        # offload subclass never gates (``_inprocess_budget_enabled`` False).
+        cross_pod_gate = (
+            DrainSingleFlightGate("storage")
+            if self._inprocess_budget_enabled
+            else None
+        )
         total = 0
         cumulative_bytes = 0
         start_time = time.monotonic()
         try:
+            if cross_pod_gate is not None and not await cross_pod_gate.acquire():
+                logger.info(
+                    "StorageDrainTask: skipping in-process drain — another "
+                    "in-process storage drain run holds the single-flight gate.",
+                )
+                return TaskReport.completed(
+                    message=(
+                        "storage drain skipped: another in-process storage "
+                        "drain run is active"
+                    ),
+                    metrics={"drained": 0, **self._run_metrics},
+                    correlation={"owner_id": owner_id},
+                )
+            # A live storage_drain_offload run already owns the backlog
+            # (#3121): every byte this budgeted run would hydrate is a
+            # redundant decode transient inside an API-serving container the
+            # offload runner is about to process anyway — at a fraction of
+            # this container's throughput. Skip without claiming a single
+            # row; the offload lease expiring (completion, crash, reap)
+            # re-opens the in-process fast path automatically. The offload
+            # subclass never checks this (``_inprocess_budget_enabled`` is
+            # False there), so the offload run can never fence itself out.
+            if self._inprocess_budget_enabled and await self._offload_drain_is_active(
+                engine
+            ):
+                logger.info(
+                    "StorageDrainTask: skipping in-process drain — a live "
+                    "storage_drain_offload run owns the backlog.",
+                )
+                return TaskReport.completed(
+                    message=(
+                        "storage drain skipped: a live storage_drain_offload "
+                        "run owns the backlog"
+                    ),
+                    metrics={"drained": 0, **self._run_metrics},
+                    correlation={"owner_id": owner_id},
+                )
             while True:
                 n = await self.drain_once(
                     engine=engine, owner_id=owner_id, batch_size=batch_size,
@@ -320,7 +439,13 @@ class StorageDrainTask(TaskProtocol):
                         await self._handoff_to_offload_job(engine)
                         break
         finally:
+            if cross_pod_gate is not None:
+                await cross_pod_gate.release()
             await engine.dispose()
+            # The decode/hydration transients this run freed are retained in
+            # glibc's malloc arenas — RSS stays pinned at the burst peak and
+            # successive runs stack on top of it (#3121). Hand the pages back.
+            trim_malloc_arenas()
 
         # 'drained' stays the total claimed count for backward compat; the
         # split counters distinguish rows actually written to the index from
@@ -466,6 +591,52 @@ class StorageDrainTask(TaskProtocol):
             "backlog remaining — handed off remainder to the "
             "storage_drain_offload job.",
         )
+
+    async def _offload_drain_is_active(self, engine: Any) -> bool:
+        """True when a live ``storage_drain_offload`` run owns the backlog.
+
+        "Live" mirrors the wedge-tolerance rule in
+        ``storage_emit._enqueue_drain_trigger``: an ACTIVE trigger row whose
+        claim lease (``locked_until``) has not yet expired. A wedged row —
+        owner died mid-run, lease lapsed, reaper not yet caught up — does
+        NOT count, so a crashed offload run can never permanently fence out
+        the in-process path (#2715's lesson applied in reverse).
+
+        Fail-open: any error reads as False so the in-process drain proceeds
+        exactly as it did before this gate existed — environments without
+        the tasks table (storage-only test fixtures) or with a transiently
+        unreachable DB must not lose the drain that was about to run.
+        """
+        from dynastore.modules.db_config.query_executor import (
+            DQLQuery,
+            ResultHandler,
+            managed_transaction,
+        )
+        from dynastore.modules.tasks.tasks_module import get_task_schema
+
+        try:
+            task_schema = get_task_schema()
+            probe_sql = (
+                f"SELECT 1 FROM {task_schema}.tasks"
+                f" WHERE dedup_key = :dedup_key"
+                f"   AND catalog_id = 'platform'"
+                f"   AND status = 'ACTIVE'"
+                f"   AND locked_until > now()"
+                f" LIMIT 1"
+            )
+            async with managed_transaction(engine) as conn:
+                row = await DQLQuery(
+                    probe_sql,
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, dedup_key="storage_drain_offload")
+            return row is not None
+        except Exception:  # noqa: BLE001 — the gate is best-effort by design
+            logger.debug(
+                "StorageDrainTask: offload-liveness probe failed — "
+                "proceeding with the in-process drain.",
+                exc_info=True,
+            )
+            return False
 
     async def drain_once(
         self, *, engine: Any, owner_id: str, batch_size: Optional[int] = None,
@@ -623,7 +794,7 @@ class StorageDrainTask(TaskProtocol):
             f" FROM claimed"
             f" WHERE w.day = claimed.day AND w.op_id = claimed.op_id"
             f" RETURNING w.day, w.op_id, w.driver_id, w.catalog_id, w.collection_id,"
-            f"           w.op, w.entity_id, w.op_payload, w.idempotency_key,"
+            f"           w.op, w.entity_id, w.write_id, w.idempotency_key,"
             f"           w.attempts, w.claim_version, w.claimed_by"
         )
 
@@ -697,6 +868,9 @@ class StorageDrainTask(TaskProtocol):
         from dynastore.modules.storage.drivers.elasticsearch import (
             ItemsElasticsearchDriver,
         )
+        from dynastore.modules.storage.drivers.elasticsearch_envelope.driver import (
+            ItemsElasticsearchEnvelopeDriver,
+        )
         from dynastore.modules.storage.driver_registry import DriverRegistry
         from dynastore.tasks.workclass_drain.es_indexer_adapter import ESBulkIndexer
 
@@ -707,7 +881,14 @@ class StorageDrainTask(TaskProtocol):
         )
 
         if driver is not None:
-            if isinstance(driver, ItemsElasticsearchDriver):
+            # ``ESBulkIndexer`` wraps either ES items driver: both resolve
+            # their index name / ``_routing`` / client entirely through the
+            # shared ``_ItemsElasticsearchBase`` seams the adapter delegates
+            # to, so one adapter serves the standard driver and the
+            # access-aware envelope driver alike (#2687) — the envelope
+            # driver's index naming/routing differences are handled by those
+            # seams, not by a separate adapter class.
+            if isinstance(driver, (ItemsElasticsearchDriver, ItemsElasticsearchEnvelopeDriver)):
                 if not driver.is_available():
                     logger.warning(
                         "StorageDrainTask: ES driver unavailable (opensearch-py "
@@ -716,6 +897,8 @@ class StorageDrainTask(TaskProtocol):
                         driver_id,
                     )
                     return None
+                if isinstance(driver, ItemsElasticsearchEnvelopeDriver):
+                    self._envelope_driver_ids.add(driver_id)
                 indexer = cast(BulkIndexer, ESBulkIndexer(driver))
                 self._indexer_cache[driver_id] = indexer
                 return indexer
@@ -768,7 +951,7 @@ class StorageDrainTask(TaskProtocol):
                 driver_id, catalog_id, collection_id,
             ),
             item_id=row.get("entity_id"),  # entity_id column → IndexableOp.item_id
-            payload=dict(row.get("op_payload") or {}),
+            payload={},  # tasks.storage carries no payloads — ids only
             idempotency_key=row.get("idempotency_key") or "",
         )
 
@@ -790,10 +973,11 @@ class StorageDrainTask(TaskProtocol):
         """Hydrate and dispatch one driver's claimed rows in byte-budgeted
         sub-chunks (#2723).
 
-        Streams rather than batch-building: every row is converted to an
-        ``IndexableOp`` (payload-carrying rows directly; id-only rows via
-        the canonical re-read + doc build below, #2494 P1) and appended to
-        a pending sub-chunk. As soon as the pending sub-chunk's estimated
+        Streams rather than batch-building: every row is hydrated to one or
+        more ``IndexableOp``\\s (delete rows directly; id-only upsert rows
+        via the canonical re-read + doc build below, #2494 P1; write-id
+        rows via primary-driver chunk reads) and appended to a pending
+        sub-chunk. As soon as the pending sub-chunk's estimated
         JSON-encoded size reaches ``byte_budget``, it is dispatched to
         ``indexer.index_bulk`` and its outcomes applied immediately —
         BEFORE any further row in this driver's claimed batch is hydrated.
@@ -802,19 +986,22 @@ class StorageDrainTask(TaskProtocol):
         (``storage_drain_batch_size``, #2726 — row count only) or how many
         MB-scale documents (e.g. GAUL polygons) they hydrate to.
 
-        Delete rows and payload-carrying upsert rows convert to
-        ``IndexableOp`` unchanged (:meth:`_row_to_op`) — their payload is
-        already resident from the claim SELECT, so this is cheap. Id-only
-        upsert rows — ``op='upsert'`` whose ``op_payload`` carries the
-        explicit ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}`` sentinel,
-        written by ``IndexDispatcher._enqueue_storage_plane_ids`` when
-        ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled
-        — are grouped by ``(catalog_id, collection_id)``. Each group's
-        canonical re-read (:func:`read_canonical_index_inputs`) stays
-        batched, but in fixed ``_ID_ONLY_READ_CHUNK_ROWS``-sized read
-        chunks rather than the whole group at once, so a single PG round
-        trip never materializes an unbounded number of raw (pre-JSON)
-        geometry rows either:
+        ``tasks.storage`` carries no payloads, so classification is
+        structural: a row with ``write_id`` set references a whole primary
+        write batch (hydrated via the primary driver's write-id chunk
+        reads); otherwise ``entity_id`` must be set — ``op='delete'`` rows
+        convert to ``IndexableOp`` directly (:meth:`_row_to_op`; an id is
+        all the indexer needs), and ``op='upsert'`` rows are id-only
+        obligations written by ``IndexDispatcher._enqueue_storage_plane_ids``
+        when ``TasksPluginConfig.items_secondary_via_storage_plane`` is
+        enabled, grouped by ``(catalog_id, collection_id)``. A row with
+        neither ``write_id`` nor ``entity_id`` can never hydrate and is
+        marked dead. Each id-only group's canonical re-read
+        (:func:`read_canonical_index_inputs`) stays batched, but in
+        byte-adaptive read chunks (#3121, ``_next_id_only_chunk_rows``;
+        row-count ceiling ``_ID_ONLY_READ_CHUNK_ROWS``) rather than the
+        whole group at once, so a single PG round trip never materializes
+        an unbounded number of raw (pre-JSON) geometry rows either:
 
         * a resolved geoid becomes an ``IndexableOp`` carrying the
           freshly-built canonical document;
@@ -825,14 +1012,6 @@ class StorageDrainTask(TaskProtocol):
           row in that chunk to retry (a transient infra failure, not a
           poison classification — the geoid's existence is simply
           unknown).
-
-        Detection keys off the explicit marker, NOT payload emptiness: the
-        ``tasks.storage`` DDL default for ``op_payload`` is ALSO
-        ``'{}'::jsonb``, so a genuinely empty (unmarked) upsert payload is
-        legacy shape, not an id-only obligation — it falls through to the
-        normal ``_row_to_op`` conversion below, same as any other
-        payload-carrying row, with a one-time-per-driver WARNING since an
-        unmarked empty payload is unusual post-#2494 (review finding).
 
         Crash/partial-failure safety: a sub-chunk that fails
         ``index_bulk`` funnels only ITS rows to retry; rows in a sub-chunk
@@ -896,33 +1075,169 @@ class StorageDrainTask(TaskProtocol):
                 await _flush()
 
         id_only_by_group: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        write_id_by_group: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
         for row in driver_rows:
-            payload = row.get("op_payload") or {}
-            is_id_only = (
-                row["op"] == "upsert"
-                and isinstance(payload, dict)
-                and payload.get(STORAGE_PLANE_ID_ONLY_MARKER_KEY) is True
-            )
-            if is_id_only:
+            # Structural classification — ``tasks.storage`` carries no
+            # payloads. ``write_id`` set means a write-id batch reference;
+            # otherwise ``entity_id`` must be set (id-only upsert re-read,
+            # or a direct delete). A row with neither can never hydrate.
+            write_id = row.get("write_id")
+            if (
+                row["op"] in {"upsert", "delete"}
+                and isinstance(write_id, str)
+                and write_id
+            ):
+                key = (
+                    row["catalog_id"],
+                    row.get("collection_id") or "",
+                    row["op"],
+                    write_id,
+                )
+                write_id_by_group.setdefault(key, []).append(row)
+                continue
+            if not row.get("entity_id"):
+                logger.warning(
+                    "StorageDrainTask: driver_id=%r row op_id=%s (%s) has "
+                    "neither write_id nor entity_id — unhydratable, marking "
+                    "dead.",
+                    driver_id, row.get("op_id"), row["op"],
+                )
+                await self._mark_dead(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=row,
+                    owner_id=owner_id,
+                )
+                continue
+            if row["op"] == "upsert":
                 key = (row["catalog_id"], row.get("collection_id") or "")
                 id_only_by_group.setdefault(key, []).append(row)
                 continue
-            if row["op"] == "upsert" and not payload:
-                if driver_id not in self._empty_payload_warned:
-                    self._empty_payload_warned.add(driver_id)
-                    logger.warning(
-                        "StorageDrainTask: driver_id=%r has an upsert row "
-                        "with an EMPTY op_payload and no id-only marker — "
-                        "treating as a legacy payload-carrying row (empty "
-                        "body). Future occurrences for this driver_id are "
-                        "suppressed this run.",
-                        driver_id,
+            # Delete rows replay directly — an id is all the indexer needs.
+            await _append(self._row_to_op(row), row, {})
+
+        for (catalog_id, collection_id, op, write_id), group_rows in write_id_by_group.items():
+            ledger_row = group_rows[-1]
+            try:
+                hydrated_ops = list(
+                    await self._read_primary_write_batch(
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        driver_id=driver_id,
+                        write_id=write_id,
+                        op=op,
+                        engine=engine,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — missing protocol / lookup errors retry
+                logger.warning(
+                    "StorageDrainTask: write-id hydration failed for %s/%s "
+                    "(driver=%s write_id=%s): %s — funnelling row to retry.",
+                    catalog_id, collection_id, driver_id, write_id, exc,
+                )
+                await self._mark_retry(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                    error=f"write_id_hydration_failed: {exc}",
+                )
+                counts["retried"] += 1
+                continue
+
+            if not hydrated_ops:
+                await self._mark_done(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                )
+                counts["auto_done"] += 1
+                continue
+
+            pending_chunk: List[IndexableOp] = []
+            pending_chunk_bytes = 0
+
+            async def _flush_write_id_chunk() -> tuple[bool, Optional[str], Optional[str]]:
+                nonlocal pending_chunk, pending_chunk_bytes
+                if not pending_chunk:
+                    return True, None, None
+                ops_chunk = pending_chunk
+                pending_chunk, pending_chunk_bytes = [], 0
+                try:
+                    result = await indexer.index_bulk(ops_chunk)
+                except Exception as exc:  # noqa: BLE001 — retry whole ledger row
+                    return False, "retry", str(exc)
+                if result.transient:
+                    return False, "retry", result.transient[0][1]
+                if result.poison:
+                    return False, "dead", result.poison[0][1]
+                if len(result.passed) != len(ops_chunk):
+                    return False, "retry", (
+                        "indexer omitted op_id from grouped write_id batch"
                     )
-            await _append(self._row_to_op(row), row, payload)
+                return True, None, None
+
+            outcome: tuple[str, Optional[str]] = ("done", None)
+            for op_row in hydrated_ops:
+                doc_bytes = _estimate_doc_bytes(op_row.payload)
+                counts["bytes"] += doc_bytes
+                pending_chunk.append(op_row)
+                pending_chunk_bytes += doc_bytes
+                if pending_chunk_bytes >= byte_budget:
+                    ok, action, reason = await _flush_write_id_chunk()
+                    if not ok:
+                        outcome = (cast(str, action), reason)
+                        break
+            else:
+                ok, action, reason = await _flush_write_id_chunk()
+                if not ok:
+                    outcome = (cast(str, action), reason)
+
+            if outcome[0] == "done":
+                await self._mark_done(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                )
+                counts["indexed"] += 1
+            elif outcome[0] == "dead":
+                logger.error(
+                    "StorageDrainTask: write-id batch poison failure for "
+                    "%s/%s (driver=%s write_id=%s): %s — marking ledger row "
+                    "dead.",
+                    catalog_id, collection_id, driver_id, write_id,
+                    outcome[1] or "unclassified poison failure",
+                )
+                await self._mark_dead(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                )
+            else:
+                await self._mark_retry(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                    error=outcome[1] or "grouped write-id batch failed",
+                )
+                counts["retried"] += 1
 
         for (catalog_id, collection_id), group_rows in id_only_by_group.items():
             group_auto_done = 0
-            for row_chunk in _chunked(group_rows, _ID_ONLY_READ_CHUNK_ROWS):
+            # Adaptive re-read chunking (#3121): start each group with a
+            # small probe, then let the measured hydrated byte cost of each
+            # chunk size the next via _next_id_only_chunk_rows — bounding the
+            # raw-row decode transient a single SELECT can materialize.
+            row_idx = 0
+            chunk_rows = min(_ID_ONLY_READ_PROBE_ROWS, _ID_ONLY_READ_CHUNK_ROWS)
+            while row_idx < len(group_rows):
+                row_chunk = group_rows[row_idx : row_idx + chunk_rows]
+                row_idx += len(row_chunk)
+                bytes_before_chunk = counts["bytes"]
                 geoids = [r["entity_id"] for r in row_chunk if r.get("entity_id")]
                 try:
                     inputs = await self._read_canonical_inputs(
@@ -961,6 +1276,7 @@ class StorageDrainTask(TaskProtocol):
                     try:
                         doc = await self._build_canonical_doc(
                             catalog_id=catalog_id, collection_id=collection_id, ci=ci,
+                            driver_id=driver_id,
                         )
                     except Exception as exc:  # noqa: BLE001 — funnel to retry
                         logger.warning(
@@ -977,6 +1293,14 @@ class StorageDrainTask(TaskProtocol):
                         continue
                     op = _dataclass_replace(self._row_to_op(row), payload=doc)
                     await _append(op, row, doc)
+
+                chunk_rows = _next_id_only_chunk_rows(
+                    chunk_bytes=counts["bytes"] - bytes_before_chunk,
+                    rows_read=len(row_chunk),
+                    byte_budget=byte_budget,
+                    current=chunk_rows,
+                    ceiling=_ID_ONLY_READ_CHUNK_ROWS,
+                )
 
             # Observability (#2731): auto_done is a legitimate outcome (the
             # canonical row is verifiably absent, not merely unreadable), but
@@ -1007,6 +1331,7 @@ class StorageDrainTask(TaskProtocol):
 
     async def _build_canonical_doc(
         self, *, catalog_id: str, collection_id: str, ci: Any,
+        driver_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Assemble the canonical ES doc for one re-read row (test seam).
 
@@ -1015,12 +1340,44 @@ class StorageDrainTask(TaskProtocol):
         it instead of re-resolving per group.
 
         Couples this generically-named drain task to the ES-shaped
-        canonical envelope (``build_canonical_index_doc``); today the only
-        ``BulkIndexer`` the drain resolves is the ES adapter
-        (``items_elasticsearch_driver``), so this is not a behaviour change —
-        a future non-ES ``BulkIndexer`` would need its own re-read
-        strategy here.
+        canonical envelope; today the drain resolves only ES-family
+        ``BulkIndexer`` adapters, so this is not a behaviour change — a
+        future non-ES ``BulkIndexer`` would need its own re-read strategy
+        here.
+
+        ``driver_id`` selects the doc shape (#2687): when it names a driver
+        ``_resolve_indexer`` resolved to the access-aware envelope driver
+        (``self._envelope_driver_ids``), this builds the envelope-shaped doc
+        via :func:`build_envelope_feature_doc` and enforces the fail-closed
+        invariant below; otherwise (``None`` or any other driver) it builds
+        the standard canonical doc exactly as before.
+
+        Fail-closed (#2687): an access-aware driver's doc MUST carry its
+        ABAC envelope. ``ci.access`` is ``None`` when the collection does
+        not route to an access-aware WRITE driver — which cannot be true
+        here, since ``driver_id`` itself already resolved to one — or when
+        the envelope recompute failed (see
+        ``canonical_index_read._resolve_access_context``). Either way,
+        indexing this row without ``_visibility``/``_owner`` would be an
+        ABAC violation, so this raises instead of silently building a
+        doc-less-of-envelope; the caller (``_process_driver_rows``) funnels
+        the exception to retry, never to a poison/dead classification.
         """
+        if driver_id is not None and driver_id in self._envelope_driver_ids:
+            if not ci.access:
+                raise RuntimeError(
+                    f"access envelope unavailable for access-aware "
+                    f"driver_id={driver_id!r} ({catalog_id}/{collection_id}) — "
+                    f"refusing to index a document without its ABAC envelope."
+                )
+            from dynastore.modules.storage.drivers.elasticsearch_envelope.doc_builder import (
+                build_envelope_feature_doc,
+            )
+
+            return build_envelope_feature_doc(
+                ci, catalog_id=catalog_id, collection_id=collection_id,
+            )
+
         from dynastore.modules.elasticsearch.canonical_doc import (
             build_canonical_index_doc,
         )
@@ -1046,6 +1403,151 @@ class StorageDrainTask(TaskProtocol):
             access=ci.access,
             stac_reserved_members=ci.stac_reserved_members,
         )
+
+    async def _read_primary_write_batch(
+        self,
+        *,
+        catalog_id: str,
+        collection_id: str,
+        driver_id: str,
+        write_id: str,
+        op: str,
+        engine: Optional[Any] = None,
+    ) -> Sequence[IndexableOp]:
+        primary = await self._resolve_primary_write_source(
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+        )
+        if primary is None:
+            raise LookupError("primary driver does not expose write-id chunk reads")
+        reader: Any = getattr(primary, "read_indexable_write_batch", None)
+        if reader is not None:
+            return await reader(
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                write_id=write_id,
+                target_driver_id=driver_id,
+                op=op,
+            )
+
+        from dynastore.modules.storage.driver_instance_id import (
+            compute_driver_instance_id,
+        )
+
+        driver_instance_id = compute_driver_instance_id(
+            driver_id, catalog_id, collection_id,
+        )
+        ops: List[IndexableOp] = []
+        after_geoid: Optional[str] = None
+
+        if op == "upsert":
+            active_reader: Any = getattr(primary, "read_active_rows_by_write_id", None)
+            if active_reader is None:
+                raise LookupError(
+                    "primary driver does not expose read_active_rows_by_write_id"
+                )
+            while True:
+                rows, next_after = await active_reader(
+                    catalog_id,
+                    collection_id,
+                    write_id=write_id,
+                    limit=_ID_ONLY_READ_CHUNK_ROWS,
+                    after_geoid=after_geoid,
+                    db_resource=engine,
+                )
+                geoids = [str(row["geoid"]) for row in rows if row.get("geoid")]
+                if geoids:
+                    inputs = await self._read_canonical_inputs(
+                        engine=engine,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        geoids=geoids,
+                    )
+                    for geoid in geoids:
+                        ci = inputs.get(geoid)
+                        if ci is None:
+                            raise LookupError(
+                                f"canonical row missing for write_id={write_id} geoid={geoid}"
+                            )
+                        doc = await self._build_canonical_doc(
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            ci=ci,
+                            driver_id=driver_id,
+                        )
+                        ops.append(IndexableOp(
+                            op_id=uuid4(),
+                            op="upsert",
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            driver_instance_id=driver_instance_id,
+                            item_id=geoid,
+                            payload=doc,
+                            idempotency_key=geoid,
+                        ))
+                if next_after is None:
+                    break
+                after_geoid = next_after
+            return ops
+
+        if op == "delete":
+            tombstone_reader: Any = getattr(
+                primary, "read_tombstoned_ids_by_write_id", None,
+            )
+            if tombstone_reader is None:
+                raise LookupError(
+                    "primary driver does not expose read_tombstoned_ids_by_write_id"
+                )
+            while True:
+                ids, next_after = await tombstone_reader(
+                    catalog_id,
+                    collection_id,
+                    write_id=write_id,
+                    limit=_ID_ONLY_READ_CHUNK_ROWS,
+                    after_geoid=after_geoid,
+                    db_resource=engine,
+                )
+                for geoid in ids:
+                    gid = str(geoid)
+                    ops.append(IndexableOp(
+                        op_id=uuid4(),
+                        op="delete",
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        driver_instance_id=driver_instance_id,
+                        item_id=gid,
+                        payload={},
+                        idempotency_key=gid,
+                    ))
+                if next_after is None:
+                    break
+                after_geoid = next_after
+            return ops
+
+        raise ValueError(f"unsupported write-id op: {op}")
+
+    async def _resolve_primary_write_source(
+        self,
+        *,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[Any]:
+        from dynastore.modules.storage.router import get_write_drivers
+
+        try:
+            resolved = await get_write_drivers(catalog_id, collection_id)
+        except Exception as exc:  # noqa: BLE001 — routing unavailability retries the row
+            logger.debug(
+                "StorageDrainTask: primary-driver lookup failed for %s/%s: %s",
+                catalog_id, collection_id, exc,
+            )
+            return None
+        if not resolved:
+            return None
+        primary = getattr(resolved[0], "driver", None)
+        if primary is None:
+            return None
+        return primary
 
     # ------------------------------------------------------------------
     # Outcome application

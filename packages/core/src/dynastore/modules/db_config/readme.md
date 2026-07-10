@@ -27,6 +27,13 @@ table. All DDL is issued as `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT
 EXISTS` and is idempotent on re-entry. Schema is established at module startup
 or at provision time.
 
+Startup DDL helpers use advisory locks to reduce concurrent bootstrap work.
+When a lock wait times out during process startup, the helper replays the same
+idempotent DDL without the startup lock rather than failing the service boot. If
+the replay also sees a PostgreSQL lock timeout, startup continues to the
+caller's explicit readiness or post-condition checks; non-lock errors still
+propagate.
+
 ### Platform tables (`configs` schema)
 
 `PlatformConfigService.initialize_storage` (called from `ensure_init_db` during
@@ -105,6 +112,20 @@ COLUMN`, type changes, backfill loops) against an existing collection table.
 Schema columns are established once at provisioning via `CREATE TABLE IF NOT
 EXISTS`. Adding a column for real requires a fresh (re)provision. This invariant
 applies at all levels and is enforced by design; no migration runner bypasses it.
+
+---
+
+## Startup DDL Peer Races
+
+`DDLQuery` wraps idempotent startup DDL with advisory-lock coordination plus an
+existence re-check. If a concurrent worker wins a catalog race, PostgreSQL may
+raise either a duplicate-object SQLSTATE or the internal `tuple concurrently
+updated` catalog error for `CREATE OR REPLACE` statements. Those errors are
+treated as success only when the inferred existence check confirms the object is
+now present. Function checks resolve placeholders embedded in quoted function
+names (for example `maintain_partitions_{schema}_tasks`) before verifying
+`pg_proc`, so rendered maintenance-helper DDL participates in the same recovery
+path. Unrelated internal database errors still propagate.
 
 ---
 
