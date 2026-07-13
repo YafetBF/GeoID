@@ -144,6 +144,7 @@
 
             <div id="auth-buttons">
                 <a href="../auth/authorize?response_type=code&client_id=dynastore&redirect_uri=/web/&state=init"
+                   onclick="return handleSignInClick(event)"
                    title="Sign In"
                    class="w-9 h-9 rounded-full bg-slate-800/50 border border-white/10 hover:bg-blue-600/20 hover:border-blue-500/50 flex items-center justify-center text-slate-400 hover:text-white transition-all">
                     <i class="fa-solid fa-user text-sm"></i>
@@ -211,6 +212,28 @@
         </div>
         <div class="flex-grow relative bg-slate-950">
             <iframe id="app-viewer-frame" class="w-full h-full border-0" src="about:blank"></iframe>
+        </div>
+    </div>
+    <!-- LOGIN BLOCKED MODAL -->
+    <div id="login-blocked-modal" class="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm hidden opacity-0 transition-opacity duration-300">
+        <div class="glass-panel w-1/3 min-w-[320px] border border-white/10 rounded-2xl overflow-hidden shadow-2xl scale-95 transition-transform duration-300">
+            <div class="px-6 py-4 border-b border-white/10 flex items-center justify-between bg-dyna-dark">
+                <h3 class="text-xl font-bold text-white flex items-center gap-3">
+                    <i class="fa-solid fa-triangle-exclamation text-amber-400"></i> Sign-In Unavailable
+                </h3>
+                <button onclick="hideLoginBlockedModal()" class="text-slate-400 hover:text-white transition-colors">
+                    <i class="fa-solid fa-times text-xl"></i>
+                </button>
+            </div>
+            <div class="p-8 space-y-8">
+                <p class="text-slate-300 text-sm leading-relaxed">
+                    Login is not allowed from this page. Please initiate login from the Catalog page.
+                </p>
+                <a id="login-blocked-catalog-link" href="#"
+                   class="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold transition-colors">
+                    <i class="fa-solid fa-arrow-up-right-from-square"></i> Go to Catalog
+                </a>
+            </div>
         </div>
     </div>
     <!-- PROFILES MODAL -->

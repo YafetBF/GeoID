@@ -38,6 +38,65 @@ function apiRoot() {
     return _SCRIPT_ROOT;
 }
 
+// Some services (e.g. maps, tools) run with no IAM extension mounted at all —
+// no /auth/* routes exist there, so navigating to the sign-in link 404s.
+// /openapi.json is always public (see public_access_baseline.py), on every
+// service regardless of auth state, so probing it here is a reliable,
+// backend-agnostic way to tell whether *this* service can handle login.
+let _authAvailableCache = null;
+async function isAuthAvailable() {
+    if (_authAvailableCache !== null) return _authAvailableCache;
+    try {
+        const res = await fetch(`${apiRoot()}/openapi.json`);
+        const spec = res.ok ? await res.json() : null;
+        _authAvailableCache = !!spec && Object.keys(spec.paths || {}).some(p => p.startsWith('/auth/'));
+    } catch (e) {
+        _authAvailableCache = false;
+    }
+    return _authAvailableCache;
+}
+
+function catalogWebUrl() {
+    // Local dev convention: the catalog gateway (the only service with IAM
+    // mounted) runs on port 8080; non-auth services run on other ports of
+    // the same host. Swap only the port so this resolves on any dev host/IP.
+    return `${window.location.protocol}//${window.location.hostname}:8080/web/`;
+}
+
+function showLoginBlockedModal() {
+    const modal = document.getElementById('login-blocked-modal');
+    if (!modal) return;
+    document.getElementById('login-blocked-catalog-link').href = catalogWebUrl();
+    modal.classList.remove('hidden');
+    setTimeout(() => {
+        modal.classList.remove('opacity-0');
+        modal.querySelector('.glass-panel').classList.remove('scale-95');
+        modal.querySelector('.glass-panel').classList.add('scale-100');
+    }, 10);
+}
+
+function hideLoginBlockedModal() {
+    const modal = document.getElementById('login-blocked-modal');
+    if (!modal) return;
+    modal.classList.add('opacity-0');
+    modal.querySelector('.glass-panel').classList.remove('scale-100');
+    modal.querySelector('.glass-panel').classList.add('scale-95');
+    setTimeout(() => modal.classList.add('hidden'), 300);
+}
+
+async function handleSignInClick(event) {
+    event.preventDefault();
+    // currentTarget is only valid during synchronous dispatch -- capture the
+    // href now, before the await, or it reads back as null once resolved.
+    const signInHref = event.currentTarget.href;
+    if (await isAuthAvailable()) {
+        window.location.href = signInHref;
+    } else {
+        showLoginBlockedModal();
+    }
+    return false;
+}
+
 // --- I18n & Interface Logic ---
 function toggleLangDropdown() {
     const dd = document.getElementById('lang-dropdown');
